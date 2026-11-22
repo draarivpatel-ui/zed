@@ -11668,6 +11668,10 @@ impl Side1 {
 // meter is spent. The lazy projections of `by_halves_general` (the second part of the proof)
 // gained the same charge, `None` where the meter is spent and refused the same way, and a
 // second half now takes its parent's system rather than copying it, which no later leaf reads.
+// Added 2026-11-22 (PRES-growth-ladder-bytes): (8) without a log, before any elimination, the
+// atoms outside `keep` that equations of two unit terms make equal to another atom are written
+// by it in every row (`merged_equal_atoms`, its proof there): step (3) for those equations at
+// once, each atom written being outside `keep`, and a row so made checked by `tidy`, step (2).
 pub(super) fn shadow(rows: &[Con], keep: &dyn Fn(&Atom) -> bool, dark: bool) -> Option<Vec<Con>> {
     shadow_logged(&mut rows.iter(), keep, dark, false, false, None)
 }
@@ -11764,6 +11768,194 @@ fn tidy(lin: Lin, rel: Rel) -> Result<Option<Con>, ()> {
         }
     };
     Ok(Some(Con { lin, rel }))
+}
+
+/// `rows` with the atoms that equations of two terms make equal written as one atom, each a
+/// row tidied ([`tidy`]); `None` where a row so written holds at no integer point. An equation
+/// is a row `a·x + b·y + k == 0`, or two rows `a·x + b·y + k >= 0` and `-a·x - b·y - k >= 0`,
+/// with `a` and `b` each 1 or -1; it gives `x = s·y + c` with `s = -a·b` and `c = -a·k`. The
+/// atoms are joined in classes (union-find, each atom holding its sign `s` and offset `c` from
+/// its parent, so that the root of its class gives its value), and each atom whose root is
+/// another is written in every row as `s·root + c`. A class holds at most one atom of `keep`,
+/// which is its root: two classes that each hold one are not joined, and their equation stays a
+/// row. Rows that name no atom so written are returned as they are, untidied.
+///
+/// Proof that the integer points on the atoms of `keep` are those of `rows` (step (8) of
+/// PROOF-shadow-exact, [`shadow`]): each atom written is outside `keep` and equals `s·root + c`
+/// at every integer point of `rows`, by the chain of equations that joined it to the root
+/// (composed: `x = s₁·y + c₁` and `y = s₂·r + c₂` give `x = s₁s₂·r + s₁c₂ + c₁`, integers
+/// with `s₁s₂` 1 or -1). So a point of `rows` is a point of the rows written, on the atoms
+/// left; and a point of the rows written gives each atom written the value `s·root + c`, an
+/// integer, which makes every row of `rows` hold, since each was written from it by putting
+/// in a value it then has; the equations themselves are written to `0 == 0` or `0 >= 0`,
+/// which `tidy` drops, or to a false row without atoms, which shows no point. This is step (3),
+/// substituting an equation whose atom has coefficient 1 or -1, done for every such equation
+/// at once. A row never gains a term: each term becomes one term, possibly joining another.
+///
+/// Complexity tradeoff: naive version, each such atom eliminated by the queue of
+/// [`shadow_logged`], one at a time, by its equation or by Fourier-Motzkin on its two halves;
+/// each elimination writes again every row of the atom, so k atoms `w{i} == b{i}` in one row
+/// of k terms cost Θ(k²) terms (`l01_38_presburger::bench::ladder`
+/// `products_whose_factors_one_sum_joins_scale`: 13.69 times the instructions at 8n from 90).
+/// Used: one pass to find the equations (a map of the `>=` rows of two terms, O(1) a row),
+/// union by size with path compression, and one pass writing each term by its root, O(T log
+/// T) for T terms of `rows` (the terms are held in ordered maps); never more rows or terms
+/// than `rows`.
+fn merged_equal_atoms(rows: &[&Con], keep: &dyn Fn(&Atom) -> bool) -> Option<Vec<Con>> {
+    let as_is = || rows.iter().map(|c| (*c).clone()).collect();
+    let two_units = |c: &&&Con| c.lin.terms.len() == 2 && c.lin.terms.values().all(Int::is_unit);
+    let mut ge: HashMap<&BTreeMap<Atom, Int>, Vec<&Int>> = HashMap::new();
+    for c in rows.iter().filter(|c| c.rel == Rel::Ge).filter(two_units) {
+        ge.entry(&c.lin.terms).or_default().push(&c.lin.constant);
+    }
+    let mut eqs: Vec<&Lin> = Vec::new();
+    for c in rows.iter().filter(two_units) {
+        let equation = c.rel == Rel::Eq || {
+            let neg: BTreeMap<Atom, Int> =
+                (c.lin.terms.iter()).map(|(a, k)| (a.clone(), -k)).collect();
+            ge.get(&neg)
+                .is_some_and(|ks| ks.iter().any(|k| (*k + &c.lin.constant).is_zero()))
+        };
+        if equation {
+            eqs.push(&c.lin);
+        }
+    }
+    if eqs.is_empty() {
+        return Some(as_is());
+    }
+    // `val(i) = ±val(up) + off`, `neg` the sign; `kept`, at a root, whether its class holds an
+    // atom of `keep` (then the root itself).
+    struct Node {
+        up: usize,
+        neg: bool,
+        off: Int,
+        kept: bool,
+        size: usize,
+    }
+    // The root of `i`, with `val(i) = ±val(root) + off`, every node of the path then pointing
+    // at the root directly.
+    fn find(nodes: &mut [Node], i: usize) -> (usize, bool, Int) {
+        let mut path = Vec::new();
+        let mut r = i;
+        while nodes[r].up != r {
+            path.push(r);
+            r = nodes[r].up;
+        }
+        // From the node nearest the root down, so that each parent already points at the root.
+        for &j in path.iter().rev() {
+            let p = nodes[j].up;
+            if p != r {
+                let (np, op) = (nodes[p].neg, nodes[p].off.clone());
+                let n = &mut nodes[j];
+                n.off = if n.neg { &n.off - &op } else { &n.off + &op };
+                n.neg ^= np;
+                n.up = r;
+            }
+        }
+        if r == i {
+            (r, false, Int::ZERO)
+        } else {
+            (r, nodes[i].neg, nodes[i].off.clone())
+        }
+    }
+    let mut at: HashMap<&Atom, usize> = HashMap::new();
+    let mut atoms: Vec<&Atom> = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    for e in &eqs {
+        for a in e.terms.keys() {
+            at.entry(a).or_insert_with(|| {
+                nodes.push(Node {
+                    up: atoms.len(),
+                    neg: false,
+                    off: Int::ZERO,
+                    kept: keep(a),
+                    size: 1,
+                });
+                atoms.push(a);
+                atoms.len() - 1
+            });
+        }
+    }
+    for e in &eqs {
+        let mut t = e.terms.iter();
+        let ((x, a), (y, b)) = (t.next().expect("two terms"), t.next().expect("two terms"));
+        // `x = s·y + c`: `s = -a·b`, negative when `a` and `b` have one sign; `c = -a·k`.
+        let ns = a.is_positive() == b.is_positive();
+        let c = if a.is_positive() {
+            -&e.constant
+        } else {
+            e.constant.clone()
+        };
+        let (rx, nx, ox) = find(&mut nodes, at[x]);
+        let (ry, ny, oy) = find(&mut nodes, at[y]);
+        if rx == ry || nodes[rx].kept && nodes[ry].kept {
+            continue;
+        }
+        // `x = ±rx + ox` and `y = ±ry + oy` give `rx = t·ry + o`, `t` negative when an odd
+        // number of `nx`, `ns`, `ny` are, `o = ±x(s·oy + c - ox)`.
+        let nt = nx ^ ns ^ ny;
+        let s_oy = if ns { -&oy } else { oy };
+        let inner = &(&s_oy + &c) - &ox;
+        let o = if nx { -&inner } else { inner };
+        // A root of `keep` stays a root; otherwise the smaller class goes under the larger.
+        let under_ry = !nodes[rx].kept && (nodes[ry].kept || nodes[rx].size <= nodes[ry].size);
+        if under_ry {
+            nodes[ry].size += nodes[rx].size;
+            nodes[rx] = Node {
+                up: ry,
+                neg: nt,
+                off: o,
+                kept: false,
+                size: 0,
+            };
+        } else {
+            // `ry = t·(rx - o) = t·rx - t·o`.
+            nodes[rx].size += nodes[ry].size;
+            nodes[ry] = Node {
+                up: rx,
+                neg: nt,
+                off: if nt { o } else { -&o },
+                kept: false,
+                size: 0,
+            };
+        }
+    }
+    let roots: Vec<(usize, bool, Int)> = (0..atoms.len()).map(|i| find(&mut nodes, i)).collect();
+    let moved = |a: &Atom| at.get(a).is_some_and(|&i| roots[i].0 != i);
+    let mut out = Vec::with_capacity(rows.len());
+    for c in rows {
+        if !c.lin.terms.keys().any(moved) {
+            out.push((*c).clone());
+            continue;
+        }
+        let mut lin = Lin::constant(0);
+        lin.constant = c.lin.constant.clone();
+        for (a, k) in &c.lin.terms {
+            let term = match at.get(a) {
+                Some(&i) if roots[i].0 != i => {
+                    let (r, neg, off) = &roots[i];
+                    lin.constant = &lin.constant + &(k * off);
+                    (atoms[*r], if *neg { -k } else { k.clone() })
+                }
+                _ => (a, k.clone()),
+            };
+            let v = lin
+                .terms
+                .get(term.0)
+                .map_or_else(|| term.1.clone(), |o| o + &term.1);
+            if v.is_zero() {
+                lin.terms.remove(term.0);
+            } else {
+                lin.terms.insert(term.0.clone(), v);
+            }
+        }
+        match tidy(lin, c.rel) {
+            Err(()) => return None,
+            Ok(None) => {}
+            Ok(Some(c)) => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// [`shadow`] of the rows `rows` yields, each elimination written to `log` in turn when there
@@ -11892,8 +12084,19 @@ fn shadow_logged<'a>(
             }
         }};
     }
-    for c in rows {
-        put!(c.clone());
+    // Without a log, the atoms that equations of two terms make equal are written as one first
+    // ([`merged_equal_atoms`], its proof and tradeoff there): one pass where the queue below
+    // would write each row of k such atoms again k times. With a log each atom eliminated must
+    // be logged with its rows ([`point_of`]), so the queue does it as before.
+    if log.is_none() {
+        let rows: Vec<&Con> = rows.collect();
+        for c in merged_equal_atoms(&rows, keep)? {
+            put!(c);
+        }
+    } else {
+        for c in rows {
+            put!(c.clone());
+        }
     }
     while let Some(x) = queue.pop_front() {
         // With `charged`, each atom taken from the queue is charged one step: the checks below
@@ -33230,6 +33433,92 @@ mod dark_shadow {
         ];
         let out = shadow(&rows, &|x| *x != a("r"), true).expect("a point");
         assert!(points(&out, 4, 0) && !points(&out, 2, 0), "{out:?}");
+    }
+
+    /// An equation `s₁·u + s₂·v + c == 0` with `s₁`, `s₂` each 1 or -1, as one row or as its
+    /// two halves `>= 0`.
+    fn tie(u: &str, v: &str, s1: i128, s2: i128, c: i128, halves: bool) -> Vec<Con> {
+        let lin = Lin::atom(a(u))
+            .times(s1)
+            .plus(&Lin::atom(a(v)).times(s2))
+            .plus(&Lin::constant(c));
+        if halves {
+            vec![
+                Con::ge(&lin, &Lin::default()),
+                Con::ge(&Lin::default(), &lin),
+            ]
+        } else {
+            vec![Con { lin, rel: Rel::Eq }]
+        }
+    }
+
+    /// Equations of two terms, between `r` and `y` (written as one atom before any elimination,
+    /// [`merged_equal_atoms`]) and between the kept `y` and `z` (two kept atoms, not joined),
+    /// with any signs and constants, as one row or two halves, beside random rows: the integer
+    /// points of the projection on `y` and `z` are those of the system, and `r` is gone.
+    #[test]
+    fn equations_of_two_terms_are_merged_keeping_the_integer_points() {
+        let (mut rng, _) =
+            Rng::fresh("equations_of_two_terms_are_merged_keeping_the_integer_points");
+        let sign = |rng: &mut Rng| if rng.below(2) == 0 { 1 } else { -1 };
+        for _ in 0..200 {
+            let mut rows = vec![
+                Con::ge(&Lin::atom(a("r")), &Lin::constant(-4)),
+                Con::ge(&Lin::constant(4), &Lin::atom(a("r"))),
+            ];
+            let (s1, s2, c) = (sign(&mut rng), sign(&mut rng), rng.int_i128(-3, 3));
+            let halves = rng.below(2) == 0;
+            rows.extend(tie("r", "y", s1, s2, c, halves));
+            if rng.below(2) == 0 {
+                let (s1, s2, c) = (sign(&mut rng), sign(&mut rng), rng.int_i128(-3, 3));
+                rows.extend(tie("y", "z", s1, s2, c, rng.below(2) == 0));
+            }
+            for _ in 0..rng.below(3) {
+                let k = |rng: &mut Rng, n: i128| rng.int_i128(-n, n);
+                let lin = Lin::atom(a("r"))
+                    .times(k(&mut rng, 4))
+                    .plus(&Lin::atom(a("z")).times(k(&mut rng, 2)))
+                    .plus(&Lin::constant(k(&mut rng, 6)));
+                rows.push(Con::ge(&lin, &Lin::default()));
+            }
+            let gone = dark_shadow_checked(&rows);
+            assert!(gone != Some(false), "{rows:?}: `r` is kept");
+        }
+    }
+
+    /// A sum of `k` atoms `w{i}`, each tied to a kept `b{i}` by `w{i} == b{i}` or
+    /// `w{i} == 2 - b{i}`, is projected to the one row of the sum written on the `b{i}`
+    /// (`l01_38_presburger::ladder::one_sum_joins`, where the queue wrote the sum again at
+    /// each `w{i}`).
+    #[test]
+    fn a_sum_of_atoms_tied_to_kept_atoms_is_written_on_them() {
+        let k = 12;
+        let mut rows = Vec::new();
+        let mut sum = Lin::constant(10);
+        let mut want = Lin::constant(10);
+        for i in 0..k {
+            let (w, b) = (format!("w{i}"), format!("b{i}"));
+            let flip = i % 3 == 0;
+            // `w - b == 0`, or `w + b - 2 == 0`.
+            rows.extend(tie(
+                &w,
+                &b,
+                1,
+                if flip { 1 } else { -1 },
+                if flip { -2 } else { 0 },
+                i % 2 == 0,
+            ));
+            sum = sum.plus(&Lin::atom(a(&w)));
+            want = if flip {
+                want.plus(&Lin::constant(2)).minus(&Lin::atom(a(&b)))
+            } else {
+                want.plus(&Lin::atom(a(&b)))
+            };
+        }
+        rows.push(Con::ge(&sum, &Lin::default()));
+        let keep = |x: &Atom| matches!(x, Atom::Sym(s) if s.starts_with('b'));
+        let out = shadow(&rows, &keep, true).expect("a point");
+        assert_eq!(out, vec![Con::ge(&want, &Lin::default())], "{rows:?}");
     }
 }
 
