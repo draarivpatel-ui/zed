@@ -5442,27 +5442,33 @@ impl Split {
         }
         let mut next = self.clone();
         let mut eqs_changed = false;
+        let was_small = self.eligible_count < 2;
+        let mut base_changed = false;
         for g in removed {
-            next.remove_one(g, &mut eqs_changed);
+            next.remove_one(g, &mut eqs_changed, &mut base_changed);
         }
         for g in added {
-            next.add_one(g, &mut eqs_changed);
+            next.add_one(g, &mut eqs_changed, &mut base_changed);
         }
         if eqs_changed {
             let eqs: Vec<Con> = next.eqs_set.iter().cloned().collect();
             next.eqs = eqs.into();
         }
         next.least = cons.get_min().cloned();
-        let base = Arc::new(next.rebuild_base(cons));
-        next.base_syms = syms(&base).into();
-        next.base = base;
+        if base_changed || was_small || next.eligible_count < 2 {
+            let base = Arc::new(next.rebuild_base(cons));
+            next.base_syms = syms(&base).into();
+            next.base = base;
+        }
         next.ver = next_split_ver();
         next
     }
 
-    fn add_one(&mut self, g: &Arc<Formula>, eqs_changed: &mut bool) {
+    fn add_one(&mut self, g: &Arc<Formula>, eqs_changed: &mut bool, base_changed: &mut bool) {
         let Formula::Con(c) = &**g else {
-            self.base_other.insert(g.clone());
+            if self.base_other.insert(g.clone()).is_none() {
+                *base_changed = true;
+            }
             return;
         };
         if c.rel == Rel::Eq && self.eqs_set.insert(c.clone()).is_none() {
@@ -5471,11 +5477,16 @@ impl Split {
         self.on.entry(unsigned(c)).or_default().insert(c.clone());
         if let Some(key) = extreme_bucket_key(c) {
             let set = self.base_buckets.entry(key).or_default();
+            let extends_end =
+                set.get_min().is_none_or(|lo| c < lo) || set.get_max().is_none_or(|hi| c > hi);
             if set.insert(c.clone()).is_none() {
                 self.eligible_count += 1;
+                if extends_end {
+                    *base_changed = true;
+                }
             }
-        } else {
-            self.base_other.insert(g.clone());
+        } else if self.base_other.insert(g.clone()).is_none() {
+            *base_changed = true;
         }
         let fs: Vec<Factor> = factors_of(c.lin.terms.keys()).into_iter().collect();
         if fs.is_empty() {
@@ -5524,9 +5535,11 @@ impl Split {
         self.groups.get_mut(&target).unwrap().1.insert(c.clone());
     }
 
-    fn remove_one(&mut self, g: &Arc<Formula>, eqs_changed: &mut bool) {
+    fn remove_one(&mut self, g: &Arc<Formula>, eqs_changed: &mut bool, base_changed: &mut bool) {
         let Formula::Con(c) = &**g else {
-            self.base_other.remove(g);
+            if self.base_other.remove(g).is_some() {
+                *base_changed = true;
+            }
             return;
         };
         if c.rel == Rel::Eq && self.eqs_set.remove(c).is_some() {
@@ -5542,16 +5555,20 @@ impl Split {
         if let Some(key) = extreme_bucket_key(c) {
             let mut empty_bucket = false;
             if let Some(set) = self.base_buckets.get_mut(&key) {
+                let at_end = set.get_min() == Some(c) || set.get_max() == Some(c);
                 if set.remove(c).is_some() {
                     self.eligible_count -= 1;
+                    if at_end {
+                        *base_changed = true;
+                    }
                 }
                 empty_bucket = set.is_empty();
             }
             if empty_bucket {
                 self.base_buckets.remove(&key);
             }
-        } else {
-            self.base_other.remove(g);
+        } else if self.base_other.remove(g).is_some() {
+            *base_changed = true;
         }
         let fs: Vec<Factor> = factors_of(c.lin.terms.keys()).into_iter().collect();
         if fs.is_empty() {
@@ -6313,6 +6330,9 @@ struct Block {
     /// The conjuncts each of which shows that the core is no threshold-implication component
     /// while it stays ([`Block::unshaped`]).
     unshaped: imbl::OrdSet<Arc<Formula>>,
+    /// The result of reading the core as a threshold component. Only changes to
+    /// the set of core formulas invalidate it, not changes to the names' bounds.
+    threshold_shape: Option<Arc<Option<threshold::Shape>>>,
     /// The constraints among the conjuncts, and their context ([`Block::reframe`]).
     cons: imbl::OrdSet<Arc<Formula>>,
     split: Arc<Split>,
@@ -6467,6 +6487,7 @@ impl Block {
             leaf,
             core: imbl::OrdMap::new(),
             unshaped: imbl::OrdSet::new(),
+            threshold_shape: None,
             outer_cons: cons.clone(),
             cons,
             outer: split.clone(),
@@ -6662,6 +6683,7 @@ impl Block {
         if *count != k {
             return None;
         }
+        self.threshold_shape = None;
         if Block::unshaped(g) {
             self.unshaped.insert(g.clone());
         }
@@ -6690,6 +6712,7 @@ impl Block {
             return;
         }
         self.core.remove(g);
+        self.threshold_shape = None;
         self.unshaped.remove(g);
         if self.cons.remove(g).is_some() {
             self.ray_least.take();
@@ -16385,8 +16408,30 @@ impl Scope {
         // the wholly covered shape uses the persistent O(log k) threshold queries above.
         let all_stairs = covered.is_some() && b.roles.keys().all(|r| *r == Role::Stair);
         if b.unshaped.is_empty() && !all_stairs {
-            let core: Vec<Arc<Formula>> = b.core.keys().cloned().collect();
-            if let Some(shape) = &threshold::shape(&core) {
+            let shape = b.threshold_shape.get_or_insert_with(|| {
+                let core: Vec<Arc<Formula>> =
+                    if b.split.eligible_count == b.core.len() && b.split.base_buckets.len() == 1 {
+                        let bucket = b
+                            .split
+                            .base_buckets
+                            .values()
+                            .next()
+                            .expect("one threshold bucket");
+                        let lo = bucket.get_min().expect("a nonempty threshold bucket");
+                        let hi = bucket.get_max().expect("a nonempty threshold bucket");
+                        let first = Arc::new(Formula::Con(lo.clone()));
+                        if lo == hi {
+                            vec![first]
+                        } else {
+                            vec![first, Arc::new(Formula::Con(hi.clone()))]
+                        }
+                    } else {
+                        b.core.keys().cloned().collect()
+                    };
+                Arc::new(threshold::shape(&core))
+            });
+            let shape = shape.clone();
+            if let Some(shape) = shape.as_ref() {
                 let shaped: Vec<Arc<str>> = shape.names.iter().chain(&shape.hub).cloned().collect();
                 let plain = |s: &Self| shaped.iter().all(|n| !classed(&s.get(n)));
                 let unclassed = plain(self);
@@ -17686,14 +17731,44 @@ impl Scope {
                     return None;
                 }
             }
-            for g in hubs
+            let mut compressed = false;
+            let blocks = relation.blocks();
+            let non_empty: Vec<&imbl::OrdSet<Arc<Formula>>> = hubs
                 .iter()
-                .flat_map(|h| relation.free_set(h).into_iter().flatten())
+                .filter_map(|h| relation.free_set(h).filter(|s| !s.is_empty()))
+                .collect();
+            if let Some(&first_set) = non_empty.first()
+                && let Some(first_g) = first_set.get_min()
+                && let Some(bid) = blocks.of(first_g)
+                && let Some(ms) = blocks.member_set(bid)
+                && let Some(kept) = self.seen.blocks.get(&bid)
+                && !kept.apart
+                && kept.members.ptr_eq(ms)
+                && kept.split.eligible_count == kept.members.len()
+                && kept.split.base_buckets.len() == 1
+                && non_empty.iter().all(|set| {
+                    set.len() == kept.members.len()
+                        && set.get_min().and_then(|g| blocks.of(g)) == Some(bid)
+                })
+                && let Some(bucket) = kept.split.base_buckets.values().next()
+                && let (Some(lo), Some(hi)) = (bucket.get_min(), bucket.get_max())
             {
-                if !exact(g) {
-                    return None;
+                core.insert(Arc::new(Formula::Con(lo.clone())));
+                if lo != hi {
+                    core.insert(Arc::new(Formula::Con(hi.clone())));
                 }
-                core.insert(g.clone());
+                compressed = true;
+            }
+            if !compressed {
+                for g in hubs
+                    .iter()
+                    .flat_map(|h| relation.free_set(h).into_iter().flatten())
+                {
+                    if !exact(g) {
+                        return None;
+                    }
+                    core.insert(g.clone());
+                }
             }
         }
         let core: Vec<Arc<Formula>> = core.into_iter().collect();

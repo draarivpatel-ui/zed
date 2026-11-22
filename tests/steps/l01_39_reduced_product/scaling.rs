@@ -600,6 +600,25 @@ fn distinct_disjunctions_among_the_hubs_of_a_star(k: usize) -> (Scope, Vec<Term>
     (ints(&names), tests)
 }
 
+/// The tests of [`distinct_disjunctions_among_the_hubs_of_a_star`] at size `k` with `x` and
+/// `y` within `0..=4*k`, then `x >= i` for `i` = 1 to `k` (row PERF-star-block-hub-move).
+fn hub_bounds_after_entailed_constraints_in_a_nonnegative_box(k: usize) -> (Scope, Vec<Term>) {
+    let p = Premises::new();
+    let names: Vec<Arc<str>> = ["a", "x", "y"].into_iter().map(Arc::from).collect();
+    let top = 4 * k as i64;
+    let start = ["x", "y"].iter().fold(ints(&names), |s, h| {
+        let within = prim(
+            Prim::And,
+            prim(Prim::Ge, var(h), int(0)),
+            prim(Prim::Le, var(h), int(top)),
+        );
+        s.assume(&within, true, &p)
+    });
+    let (_, mut tests) = distinct_disjunctions_among_the_hubs_of_a_star(k);
+    tests.extend((1..=k as i64).map(|i| prim(Prim::Ge, var("x"), int(i))));
+    (start, tests)
+}
+
 /// The scope of `a` and `b` within `0..=100000`, with `a + b <= 150000` and the disjunction
 /// `a < 3 || b > 7`, and the `k` tests of [`changes_of_one_block_hold_bounded_memory`]: each
 /// tightens `a - b <= c`, and every fourth is followed by an `if a + 2 * b == c` whose arms
