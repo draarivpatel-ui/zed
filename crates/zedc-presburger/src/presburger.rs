@@ -12087,8 +12087,11 @@ fn shadow_logged<'a>(
     // Without a log, the atoms that equations of two terms make equal are written as one first
     // ([`merged_equal_atoms`], its proof and tradeoff there): one pass where the queue below
     // would write each row of k such atoms again k times. With a log each atom eliminated must
-    // be logged with its rows ([`point_of`]), so the queue does it as before.
-    if log.is_none() {
+    // be logged with its rows ([`point_of`]), so the queue does it as before. With `charged`
+    // the queue's steps are the cover's metered work: a merge there would answer uncharged
+    // where the meter must refuse (exact::tests `a_small_shadow_charges_its_generated_rows`,
+    // `reduced_is_refused_past_the_limit`), so the metered path keeps the queue as well.
+    if log.is_none() && !charged {
         let rows: Vec<&Con> = rows.collect();
         for c in merged_equal_atoms(&rows, keep)? {
             put!(c);
