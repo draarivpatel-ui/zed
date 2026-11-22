@@ -3929,7 +3929,13 @@ impl<'t, 'a> Ck<'t, 'a> {
             // A refused `-k` is walked on, and its literal `k` reports the refusal, once.
             Err(_) if matches!(e.kind, ExprKind::Unary(..)) => {}
             Err(r) => {
-                self.error(e.span, unread_literal(&r));
+                // `read_literal` reads only an `int` literal and a float literal.
+                let cast = match &e.kind {
+                    ExprKind::Float { forced: Some(f), .. } => f.name(),
+                    ExprKind::Float { .. } => "f64",
+                    _ => "int",
+                };
+                self.error(e.span, unread_literal(&r, cast));
                 return m.ty(Ty::empty());
             }
         }
@@ -4003,7 +4009,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                     m.ty(Ty::lit(&v))
                 }
                 Err(r) => {
-                    self.error(e.span, unread_literal(&r));
+                    self.error(e.span, unread_literal(&r, "rat"));
                     m.ty(Ty::empty())
                 }
             },

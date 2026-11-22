@@ -442,7 +442,7 @@ fn leaves(
             (Tok::Rat(s), _) => (
                 Ty::lit(&Value::rat(
                     Rat::decimal(s)
-                        .map_err(|e| refused(text, &e))?
+                        .map_err(|e| refused(text, &e, "rat"))?
                         .ok_or_else(|| format!("`{text}`: the rational `{s}`"))?,
                 )),
                 1,
@@ -521,14 +521,14 @@ fn power_product(text: &str, tokens: &[lex::Token]) -> Result<Option<(Value, usi
     }
     Value::power_product(negative, &factors)
         .map(|v| Some((v, j)))
-        .map_err(|e| refused(text, &e))
+        .map_err(|e| refused(text, &e, "int"))
 }
 
 /// The integer of `digits` in `radix`, negated when `negative`, read in memory the system
 /// gives first; the type text `text` names it in an error.
 fn int(radix: u32, digits: &str, negative: bool, text: &str) -> Result<Value, String> {
     let n = Value::int_text(digits, radix)
-        .map_err(|e| refused(text, &e))?
+        .map_err(|e| refused(text, &e, "int"))?
         .ok_or_else(|| format!("the digits `{digits}` in base {radix}"))?;
     Ok(match negative {
         true => Value::integer(n.as_integer().expect("an integer literal is an int").neg()),
@@ -537,7 +537,13 @@ fn int(radix: u32, digits: &str, negative: bool, text: &str) -> Result<Value, St
 }
 
 /// The message for a number in the type text `text` whose value does not fit in the memory the
-/// system gives.
-fn refused(text: &str, e: &TooLarge) -> String {
-    format!("Number too large for memory: `{text}` needs {}", e.number())
+/// system gives, with its repair written as code (DESIGN.md sec:diagnostics): the literal type
+/// replaced by its carrier `carrier`, `int` or `rat`, a type that holds the number and needs no
+/// memory for its digits.
+fn refused(text: &str, e: &TooLarge, carrier: &str) -> String {
+    format!(
+        "Number too large for memory: `{text}` needs {}. Write `{carrier}` in place of the \
+         literal type.",
+        e.number()
+    )
 }
