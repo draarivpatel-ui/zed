@@ -32,6 +32,26 @@ fn sums_of_quotients_scale() {
     });
 }
 
+/// [`solve_modular_or_scaled`] on [`bench_coprime_sums`] with `k = n` and `8n` rows over the
+/// first odd primes, and two sums of all their quotients modulo 2 with no common point
+/// (PRES-sum-of-quotients-period-product, part 1): the residues of `x` the sums' literals
+/// become number `2 prod_i p_i`, exponential in `k` ([`sum_residues`], which declines once
+/// that passes a word, and then the formula went unanswered); decided over the 4 tuples of
+/// the sums' remainders ([`sumset`]), the work is linear in `k`.
+#[test]
+fn sums_over_many_coprime_moduli_scale() {
+    let inputs = scaling::inputs(N_COPRIME, |n| bench_coprime_sums(n, false).2);
+    scaling::check_order("two sums over k coprime moduli", N_COPRIME, 1, |n| {
+        assert!(matches!(
+            solve_modular_or_scaled(&inputs[&n], false),
+            Some(None)
+        ))
+    });
+}
+
+/// The size of [`sums_over_many_coprime_moduli_scale`].
+const N_COPRIME: usize = 200;
+
 /// The size of [`sums_of_quotients_scale`].
 const N_SUM: usize = 2_000;
 
