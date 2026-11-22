@@ -267,8 +267,11 @@ fn products_whose_factors_one_sum_joins_scale() {
     // (C2-local-tier). Through the cluster's block-cut tree each link is its own block, and the
     // sides are found in one pass over the blocks. The sum is on atoms tied to `b{i}`, not on
     // `b{i}`: a sum on the factors themselves is
-    // `products_whose_factors_one_sum_on_the_factors_joins_scale` (C2-pairs-long-row).
-    let n = 8;
+    // `products_whose_factors_one_sum_on_the_factors_joins_scale` (C2-pairs-long-row). Each
+    // tie `w{i} == b{i}` is written in one pass before the projection eliminates any atom
+    // (`merged_equal_atoms`, PRES-growth-ladder-bytes): the queue had written the k-term sum
+    // again at each `w{i}`, 13.69 times the instructions at 8n from 90.
+    let n = 90;
     let built = scaling::inputs(n, one_sum_joins);
     let measure = move || {
         scaling::check("a sum of products whose factors one sum joins", n, |k| {
