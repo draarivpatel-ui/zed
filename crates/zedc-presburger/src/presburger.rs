@@ -11763,7 +11763,8 @@ fn tidy(lin: Lin, rel: Rel) -> Result<Option<Con>, ()> {
 /// its parent, so that the root of its class gives its value), and each atom whose root is
 /// another is written in every row as `s·root + c`. A class holds at most one atom of `keep`,
 /// which is its root: two classes that each hold one are not joined, and their equation stays a
-/// row. Rows that name no atom so written are returned as they are, untidied.
+/// row. Rows that name no atom so written are returned as they are, untidied. With `charged`
+/// the work is charged to the meter of the cover's work, `None` where it is spent.
 ///
 /// Proof that the integer points on the atoms of `keep` are those of `rows` (step (8) of
 /// PROOF-shadow-exact, [`shadow`]): each atom written is outside `keep` and equals `s·root + c`
@@ -11786,7 +11787,11 @@ fn tidy(lin: Lin, rel: Rel) -> Result<Option<Con>, ()> {
 /// union by size with path compression, and one pass writing each term by its root, O(T log
 /// T) for T terms of `rows` (the terms are held in ordered maps); never more rows or terms
 /// than `rows`.
-fn merged_equal_atoms(rows: &[&Con], keep: &dyn Fn(&Atom) -> bool) -> Option<Vec<Con>> {
+fn merged_equal_atoms(
+    rows: &[&Con],
+    keep: &dyn Fn(&Atom) -> bool,
+    charged: bool,
+) -> Option<Vec<Con>> {
     let as_is = || rows.iter().map(|c| (*c).clone()).collect();
     let two_units = |c: &&&Con| c.lin.terms.len() == 2 && c.lin.terms.values().all(Int::is_unit);
     let mut ge: HashMap<&BTreeMap<Atom, Int>, Vec<&Int>> = HashMap::new();
@@ -11906,12 +11911,24 @@ fn merged_equal_atoms(rows: &[&Con], keep: &dyn Fn(&Atom) -> bool) -> Option<Vec
         }
     }
     let roots: Vec<(usize, bool, Int)> = (0..atoms.len()).map(|i| find(&mut nodes, i)).collect();
+    // With `charged`, the meter is charged in the units of the queue of [`shadow_logged`] for
+    // the same work: one for each atom eliminated (the queue's one for each atom taken) and one
+    // for each row written again (the queue's one for each row an equation is put into). A row
+    // that holds several atoms eliminated is written once here, so this is at most the queue's
+    // charge for those atoms. A spent meter gives `None`, as in the queue.
+    if charged {
+        let gone = (0..atoms.len()).filter(|&i| roots[i].0 != i).count();
+        meter::charge(gone as u64).ok()?;
+    }
     let moved = |a: &Atom| at.get(a).is_some_and(|&i| roots[i].0 != i);
     let mut out = Vec::with_capacity(rows.len());
     for c in rows {
         if !c.lin.terms.keys().any(moved) {
             out.push((*c).clone());
             continue;
+        }
+        if charged {
+            meter::charge(1).ok()?;
         }
         let mut lin = Lin::constant(0);
         lin.constant = c.lin.constant.clone();
@@ -12073,12 +12090,12 @@ fn shadow_logged<'a>(
     // ([`merged_equal_atoms`], its proof and tradeoff there): one pass where the queue below
     // would write each row of k such atoms again k times. With a log each atom eliminated must
     // be logged with its rows ([`point_of`]), so the queue does it as before. With `charged`
-    // the queue's steps are the cover's metered work: a merge there would answer uncharged
-    // where the meter must refuse (exact::tests `a_small_shadow_charges_its_generated_rows`,
-    // `reduced_is_refused_past_the_limit`), so the metered path keeps the queue as well.
-    if log.is_none() && !charged {
+    // the merge charges the meter in the queue's units for the same work, so a metered run
+    // takes the same route as an unmetered one (exact::tests
+    // `a_small_shadow_charges_its_generated_rows`, `reduced_is_refused_past_the_limit`).
+    if log.is_none() {
         let rows: Vec<&Con> = rows.collect();
-        for c in merged_equal_atoms(&rows, keep)? {
+        for c in merged_equal_atoms(&rows, keep, charged)? {
             put!(c);
         }
     } else {
