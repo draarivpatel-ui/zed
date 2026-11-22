@@ -476,7 +476,16 @@ mod tests {
     /// machine in mode 1, as the test machines are.
     #[test]
     fn a_request_past_memory_and_swap_is_refused_unasked() {
-        let Some(most) = memory_and_swap() else {
+        let most = memory_and_swap();
+        // Linux always writes both fields in `/proc/meminfo` (a machine without swap writes
+        // `SwapTotal: 0 kB`, read as 0), so there the test may not skip; elsewhere there is no
+        // limit to test (TEST-room-skip-without-meminfo).
+        #[cfg(target_os = "linux")]
+        assert!(
+            most.is_some(),
+            "MemTotal or SwapTotal of /proc/meminfo not read"
+        );
+        let Some(most) = most else {
             return;
         };
         let past = (BigUint::from(most) + 1u32) << 3u32;
