@@ -99,11 +99,20 @@ pub fn check_with<'a>(t: &Tables<'a>, unit: &'a [Stmt]) -> Info {
     // a port given to `len` among them, would offer repairs that read the port.
     let ports = super::ports::ports(t);
     let stop = !ports.errors.is_empty() || !ports.not_ports.is_empty();
+    // Two pushes to one port that may both run in one run (step L1.19), counted only where the
+    // ports are used rightly, since the count reads which parameters are ports.
+    let twice = match stop {
+        false => super::twice::twice(t, &ports),
+        true => Vec::new(),
+    };
     for (span, message, notes) in ports.errors {
         ck.error_with(span, message, notes);
     }
     for (span, message, notes) in ports.not_ports {
         ck.rejects_with(Row::PushToNameNotPort, span, message, notes);
+    }
+    for (span, message, notes) in twice {
+        ck.error_with(span, message, notes);
     }
     ck.port_params = ports.params;
     ck.port_writers = ports.writers;
@@ -4734,7 +4743,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                         out_sig.keys = None;
                     }
                     out_sig.word = None;
-                    out_sig.needs = Vec::new();
+                    out_sig.needs = Default::default();
                     out_sig.note_held();
                     out = out.union(&Ty::func(Arc::new(out_sig)));
                 }
@@ -15220,7 +15229,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         let ordered = self.r10_merge_direct_and_kept_needs(&kept_fids, needs);
         let (kept, merged) = self.share_alike(ordered);
         let kept = self.r10_n4_expand_if_merged(kept, &merged, level, &mut own, &mut done);
-        sig.needs = kept;
+        sig.needs = kept.into();
         // Only the classes listed for this level are replaced here, not every class `sig`
         // holds. A type variable keeps its class's name `$k` until `finish`, so a function
         // around does not rewrite the signatures inside it at each depth (CHK-curried);
@@ -15279,9 +15288,11 @@ impl<'t, 'a> Ck<'t, 'a> {
                 })
             })
         {
-            let needs = std::mem::take(&mut sig.needs);
+            let needs = std::mem::take(&mut sig.needs).into_vec();
             let mut no_done = Vec::new();
-            sig.needs = self.r10_expand_kept_fwds(needs, level, &mut own, &mut no_done);
+            sig.needs = self
+                .r10_expand_kept_fwds(needs, level, &mut own, &mut no_done)
+                .into();
             sig.facts = Default::default();
         }
         // The names the declaration wrote for its classes, which both namings below keep.
@@ -15455,7 +15466,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         // search, over `own` for one in the value, is O(v) a need, O(p·v) for p needs over v
         // variables.
         let own_set: HashSet<&str> = own.iter().map(|v| &**v).collect();
-        let needs = std::mem::take(&mut sig.needs);
+        let needs = std::mem::take(&mut sig.needs).into_vec();
         for mut n in needs {
             let NeedKind::Push {
                 port,
@@ -23366,7 +23377,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             // A word applied to fewer arguments than its arity is not the word: `min` and `max`
             // take two tuples only when both are given (sec:reduction, item 5).
             word: None,
-            needs,
+            needs: needs.into(),
             // The needs left are decoded from `sig`'s compact forwards ([`Self::replay`]), so
             // the results those forwards make inside are the rest's own, as the flat signature
             // lists them, and their classes are made and named above
@@ -25218,7 +25229,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             dense: Dense::No,
             keys: None,
             word: None,
-            needs: Vec::new(),
+            needs: Default::default(),
             own: Default::default(),
             held: Default::default(),
             named: 0,
@@ -25335,7 +25346,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             .filter(|n| range_need_of(s, n).is_none())
             .cloned()
             .collect();
-        unranged.needs = needs_in_order(&rest, from);
+        unranged.needs = needs_in_order(&rest, from).into();
         unranged.facts = Default::default();
         let unranged = Arc::new(unranged);
         let what = format!("`{name}`");
@@ -29573,7 +29584,14 @@ impl<'t, 'a> Ck<'t, 'a> {
         let mut left =
             match self.r10_try_admit(what, sig, arrow, args, partial, &mut binds, &defer, span) {
                 Some(l) => l,
-                None => self.replay(what, &sig.needs, &mut binds, &sig.bounds, defer, span),
+                None => self.replay(
+                    what,
+                    sig.needs.as_slice(),
+                    &mut binds,
+                    &sig.bounds,
+                    defer,
+                    span,
+                ),
             };
         let frame = self.call_frames.pop();
         // Each bounded variable's binding is within its bound, and of one carrier, or of
@@ -33893,7 +33911,7 @@ pub(super) fn permuted_sig(s: &Sig, e: &Sig, from: &[usize], inv: &[usize]) -> (
         dense: s.dense,
         keys: s.keys.clone(),
         word: s.word.clone(),
-        needs: needs_in_order(&kept, from),
+        needs: needs_in_order(&kept, from).into(),
         own,
         held: s.held.clone(),
         named: s.named,
@@ -34007,7 +34025,7 @@ fn without_needs(s: &Sig) -> Sig {
         let changed = !g.needs.is_empty() || fns().any(|f| done[&Arc::as_ptr(f)].is_some());
         let bare = changed.then(|| {
             let mut b = g.clone();
-            b.needs = Vec::new();
+            b.needs = Default::default();
             for a in &mut b.arrows {
                 a.result.fns = (a.result.fns.iter())
                     .map(|f| done[&Arc::as_ptr(f)].as_ref().unwrap_or(f).clone())
@@ -34091,7 +34109,7 @@ fn param_alone(sig: &Sig, j: usize) -> Sig {
         dense: sig.dense,
         keys: sig.keys.clone(),
         word: None,
-        needs: Vec::new(),
+        needs: Default::default(),
         own,
         held: BTreeSet::new(),
         named: sig.named,
@@ -34783,7 +34801,7 @@ mod tests {
             dense: Dense::No,
             keys: None,
             word: None,
-            needs: Vec::new(),
+            needs: Default::default(),
             own: BTreeSet::new(),
             held: BTreeSet::new(),
             named: 0,
