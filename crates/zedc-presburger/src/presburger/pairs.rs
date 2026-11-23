@@ -35,12 +35,22 @@ thread_local! {
     /// it finds a pair or not), and each row whose list of pairs is entered (counted whether
     /// the list is empty or not).
     pub(super) static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Tests only: the entries made in the lists of the pairs each pair blocked ([`kept`]).
+    pub(super) static WATCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Counts one read ([`READS`]), in tests; nothing otherwise.
 fn read() {
     #[cfg(test)]
     READS.with(|n| n.set(n.get() + 1));
+}
+
+/// Enters the pair `e` in the list of the pair `f` that blocks one of its atoms, to test `e`
+/// again when `f` goes; counted ([`WATCHED`]) in tests.
+fn watch_on(watch: &mut [Vec<usize>], f: usize, e: usize) {
+    #[cfg(test)]
+    WATCHED.with(|n| n.set(n.get() + 1));
+    watch[f].push(e);
 }
 
 /// Whether each of `pairs`, the unordered pairs of indices into `rows`, is kept: the pairs left
@@ -54,10 +64,11 @@ fn read() {
 /// each round of drops, O(rounds × Σ |p| × |q|). Here no product is expanded. The test of a
 /// pair `{p, q}`, `|q| <= |p|`, tries each `w` of `q`, those on the fewest pairs first, and
 /// stops at the first that frees an atom; for one `w` it costs O(|q| × log) for the atoms that
-/// cancel inside `p ⊗ q`, O(min(|p|, partners of w) × log) for those mentioned, and for each
-/// live pair `{r, s}` with `r` holding `w`, O(log) when `s` is `p` and `p` does not hold `w`
-/// (then `r ⊗ p` holds every `w * z`), and otherwise O(min(|s|, |p|) × log) for the variables
-/// `s` and `p` share; or, when the variables of `p` not yet known to be blocked are on fewer
+/// cancel inside `p ⊗ q`, O(min(|p|, partners of w) × log) for those mentioned, and, for each
+/// row `r` holding `w`, O(log P + min(|r|, |p|) × log) to look up a live pair `{r, p}` that
+/// holds every `w * z` (when `p` does not hold `w`, or `r` and `p` share only `w`), and failing
+/// that, for each live pair `{r, s}`, O(min(|s|, |p|) × log) for the variables `s` and `p`
+/// share; or, when the variables of `p` not yet known to be blocked are on fewer
 /// pairs than `w` is, for each such `z` O(log) for each live pair on a row holding `z`; or, for
 /// each such `z`, O(log) for each row holding `w` and row holding `z`, the pair of the two
 /// found by binary search (see the comment in [`Index::frees`]), whichever reads fewest
@@ -87,16 +98,22 @@ fn read() {
 /// a graph of m edges in almost linear time, against Conjecture 4 of Abboud and Vassilevska
 /// Williams, "Popular conjectures imply strong lower bounds for dynamic problems" (FOCS 2014,
 /// arXiv:1402.0054): "any algorithm requires m^{1+\delta-o(1)} time in expectation to detect
-/// whether an m edge graph contains a triangle"; the best known algorithm is
-/// O(min(m^1.41, n^omega)) (same paper). Searched for a near-linear test of the pairs that alone
-/// hold an atom under deletions (paperclip, 8 searches of 227 to 245 results each, 2026-11-22):
-/// none found. Gemini's grid family, where the reads grow as Θ(k^{3/2}), cannot reach this
-/// function as written (its parallel rows are one row each after `Formula::and`); on its
-/// variant with no two rows parallel, from m = 16 to 32 the products made grow 4 times (512 to
-/// 2,048), the terms they hold 7.1 times (5,328 to 37,792) and the reads 13.2 times (14,866 to
-/// 195,874), near the square of the products, not within a constant of the terms
-/// (`tests::the_grid_family_reads_grow_at_most_as_its_products_squared`; plan row
-/// PRES-pairs-grid-reads). Tests:
+/// whether an m edge graph contains a triangle". That paper gives O(min(m^1.41, n^omega)) as
+/// the fastest algorithm in 2014; Dumitrescu, "A Strongly Subcubic Combinatorial Algorithm for
+/// Triangle Detection with Applications" (arXiv:2403.01085, 2024, a preprint), reports a
+/// randomized algorithm "running in O(n^{7/3}) time, or alternatively in O(m^{4/3}) time" with
+/// error at most 10^-30, still above near-linear. The reduction is conditional and holds for
+/// `kept` on arbitrary rows; it says nothing about a restricted family such as the grid below.
+/// Searched for a near-linear test of the pairs that alone hold an atom under deletions
+/// (paperclip, 8 searches of 227 to 245 results each, 2026-11-22): none found. Gemini's grid
+/// family, as written, cannot reach this function (its parallel rows are one row each after
+/// `Formula::and`); on Gemini's extraction the reads grew 19.62 times at 7.83 times the pairs
+/// (about k^1.45, two points). Its variant with no two rows parallel does reach it: from
+/// m = 16 to 32 the products made grow 4 times (512 to 2,048), the terms they hold 7.1 times
+/// (5,328 to 37,792) and the reads 13.2 times (14,473 to 191,505, about k^1.86), near the
+/// square of the products, not within a constant of the terms, past the scaling limit
+/// (`tests::the_grid_family_reads_are_counted_exactly`; plan row PRES-pairs-grid-reads, open).
+/// Tests:
 /// `tests::the_pairs_kept_are_those_left_by_expanding_every_product` (against the naive
 /// method) and
 /// `l01_38_presburger::ladder::products_whose_factors_one_sum_on_the_factors_joins_scale`.
@@ -262,6 +279,17 @@ impl<'a> Index<'a> {
             .collect()
     }
 
+    /// Whether the rows `r` and `p` share no variable but `w`, read through the shorter of the
+    /// two and stopping at the first other: O(min(|r|, |p|) log).
+    fn meets_only_at(&self, r: usize, p: usize, w: usize) -> bool {
+        let (short, long) = if self.vars[r].len() <= self.vars[p].len() {
+            (r, p)
+        } else {
+            (p, r)
+        };
+        (self.vars[short].iter()).all(|&(v, _)| v == w || self.coef(long, v).is_none())
+    }
+
     /// Whether the live pair `e` alone holds an atom `w * z` that the formulas do not mention,
     /// against the live pairs `live`; when it does not, `e` is entered in `watch` under each
     /// pair found to hold one of its atoms.
@@ -366,7 +394,7 @@ impl<'a> Index<'a> {
                     let Some(f) = blocker else {
                         return true;
                     };
-                    watch[f].push(e);
+                    watch_on(watch, f, e);
                 }
                 continue 'w;
             }
@@ -382,11 +410,38 @@ impl<'a> Index<'a> {
                     let Some(f) = blocker else {
                         return true;
                     };
-                    watch[f].push(e);
+                    watch_on(watch, f, e);
                 }
                 continue 'w;
             }
+            // First, a live pair `{r, p}` other than `e` with `r` holding `w` that holds every
+            // `w * z` of `p` at once: when `p` does not hold `w`, or `r` and `p` share no
+            // variable but `w`. Proof: the coefficient of `w * z` in `r ⊗ p` is
+            // `r_w p_z + r_z p_w` for `z != w` and `r_w p_w` for `z = w`; for `z != w` on `p`,
+            // `r_z p_w` is 0 in both cases (`p_w = 0`, or `r_z = 0` as `z` is not shared), so
+            // the coefficient is `r_w p_z != 0`, and for `z = w` (then `p` holds `w`) it is
+            // `r_w p_w != 0`. QED. That pair blocks `w` alone, and is watched once. The pair of
+            // each `r` with `p` is found by binary search ([`Index::pairs_of`]), O(log P) per
+            // row holding `w`, and the shared variables are read through the shorter row and
+            // stop at the first other ([`Index::meets_only_at`]). Complexity tradeoff: found
+            // instead in the scan below, among the pairs of each `r`, with an entry in `watch`
+            // for each `z` put into `not`, a sum `x + z + w0 + ... + w{k-1}` paired with itself
+            // and with k rows `x + (j + 1) y` under the goal `x * z` read the k pairs of the sum's
+            // row for each of the k pairs and entered each pair k times in `watch`: Θ(k²), 60.3
+            // times the reads and 62.9 times the entries at 8k (XR-presburger4 round 3, Gemini:
+            // 60.8 times). Test `tests::a_sum_holding_the_goal_reads_few_pairs`.
             let p_holds_w = self.coef(p, w).is_some();
+            for &r in &self.holding[w] {
+                let other_live = |f: usize| f != e && live[f];
+                if let Some(f) = self.pairs_of(r, p).find(|&f| other_live(f))
+                    && (!p_holds_w || self.meets_only_at(r, p, w))
+                {
+                    watch_on(watch, f, e);
+                    continue 'w;
+                }
+            }
+            // No pair `{r, p}` blocks every `z` (above), so each pair read blocks only the `z`
+            // that its rows share with `p`, and is watched once whatever their number.
             for &r in &self.holding[w] {
                 read();
                 for &(s, f) in &self.opp[r] {
@@ -394,15 +449,14 @@ impl<'a> Index<'a> {
                     if f == e || !live[f] {
                         continue;
                     }
-                    if s == p && !p_holds_w {
-                        // `r ⊗ p` holds `w * z` with the coefficient `r_w p_z` for every `z`.
-                        watch[f].push(e);
-                        continue 'w;
-                    }
+                    let mut entered = false;
                     for z in self.shared(s, p) {
                         if !not.contains(&z) && self.holds(r, s, w, z) {
                             not.insert(z);
-                            watch[f].push(e);
+                            if !entered {
+                                watch_on(watch, f, e);
+                                entered = true;
+                            }
                             if not.len() == width {
                                 continue 'w;
                             }
@@ -676,11 +730,14 @@ mod tests {
     /// lists of the rows `z + u{j}`: Θ(k²). That dropping those rows from `holding` changes no
     /// pair kept is checked against `expanded` by
     /// `the_pairs_kept_are_those_left_by_expanding_every_product`, whose random pairs leave
-    /// some rows on no pair.
+    /// some rows on no pair. Red with the change removed: 63,002 and 4,004,002 reads (VM hm1,
+    /// job 38). On the round-2 commit 2e4a53cd0 it passes (251 and 2,001), not because round
+    /// 2 skipped those lists: it entered the k empty lists in each of the k tests too, but its
+    /// counter counted only pairs read, not lists entered (XR-presburger4 round 3, Claude and
+    /// Codex: counted, 63,002 and 4,004,002 there as well).
     #[test]
     fn a_premise_of_rows_on_no_pair_reads_few_lists() {
         let ((small, made), large) = (reads_through_products(250), reads_through_products(2000).0);
-        eprintln!("rows on no pair: {small} reads at k = 250, {large} at k = 2000");
         assert!(!made.is_empty(), "no product made at k = 250");
         assert!(small > 0, "no read counted at k = 250");
         assert!(small <= 20 * 250, "{small} reads at k = 250");
@@ -742,34 +799,72 @@ mod tests {
         (super::READS.with(std::cell::Cell::get), made.len(), n)
     }
 
-    /// XR-presburger4 round 2, L6 (Gemini): on the grid family ([`grid_through_products`]) the
-    /// reads of [`kept`] grow as Θ(k^{3/2}) (19.62 times at 7.83 times the pairs on Gemini's
-    /// extraction), past the scaling limit. As Gemini wrote it, `products` cannot build it:
-    /// its parallel rows are one row each by then, and no product is made. Its variant with no
-    /// two rows parallel is built (at least m² products). No method below Θ(k^{3/2}) is known
-    /// for it in general: triangle detection reduces to [`kept`] in linear size (the comment at
-    /// [`kept`]). Measured on hm1 (job 38): from m = 16 to 32 the products made grow 4 times
-    /// (512 to 2,048), the terms they hold 7.1 times (5,328 to 37,792), and the reads 13.2
-    /// times (14,866 to 195,874; on round 2, 13,266 to 186,786, 14.1 times), so the reads are
-    /// not within a constant of the terms (the round-3 draft of this test claimed so and failed
-    /// at m = 32: 5.18 reads a term against 2.79 at m = 16). Held here: the reads grow at most
-    /// as the square of the products made; the counts are deterministic. Whether a method reads
-    /// fewer on this family is plan row PRES-pairs-grid-reads.
+    /// XR-presburger4 round 2, L6 (Gemini): the grid family ([`grid_through_products`]). As
+    /// Gemini wrote it, `products` cannot build it: its parallel rows are one row each by then,
+    /// and no product is made. Its variant with no two rows parallel is built (at least m²
+    /// products), and there the reads of [`kept`] grow past the scaling limit: from m = 16 to 32
+    /// the products made grow 4 times (512 to 2,048), the terms they hold 7.1 times (5,328 to
+    /// 37,792), and the reads 13.2 times (14,473 to 191,505; 14,866 to 195,874 before the
+    /// lookup of a pair `{r, p}` blocking every `w * z` in [`Index::frees`]; on round 2, 13,266
+    /// to 186,786). This test records the counts, which are deterministic, exactly (XR-presburger4
+    /// round 3, Claude: a ratio held here let a method reading Θ(products²) pass); it does not
+    /// hold the scaling limit, which this family fails, and any change of the reads, up or
+    /// down, must update it. Whether a method reads O((products + terms) log) on this family,
+    /// or the family needs more, is plan row PRES-pairs-grid-reads (open).
     #[test]
-    fn the_grid_family_reads_grow_at_most_as_its_products_squared() {
+    fn the_grid_family_reads_are_counted_exactly() {
         let mut counts = Vec::new();
         for m in [16, 32] {
             let (_, made, _) = grid_through_products(m, false);
             assert_eq!(made, 0, "m = {m}: products made from parallel rows");
-            let (reads, made, terms) = grid_through_products(m, true);
-            eprintln!("grid m = {m}: {reads} reads, {made} products, {terms} terms");
-            assert!(made >= m * m, "m = {m}: {made} products made");
-            counts.push((reads, made as u64));
+            counts.push(grid_through_products(m, true));
         }
-        let ((r16, p16), (r32, p32)) = (counts[0], counts[1]);
+        assert_eq!(counts, [(14_473, 512, 5_328), (191_505, 2_048, 37_792)]);
+    }
+
+    /// Gemini's family (XR-presburger4 round 3) through [`super::super::products`]: the row
+    /// `x + z + w0 + ... + w{k-1} >= 0`, the k rows `x + (j + 1) y >= 0` and the goal
+    /// `x * z >= 0`, so the pairs are the sum with itself and with each row `x + (j + 1) y`.
+    /// The reads, the entries made in the lists of blockers ([`super::WATCHED`]) and the
+    /// products made.
+    fn sum_holding_the_goal(k: usize) -> (u64, u64, usize) {
+        use super::super::formula::{Con, Formula};
+        use super::super::{Relation, Tier, products};
+        let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
+        let w: Vec<String> = (0..k).map(|j| format!("w{j}")).collect();
+        let mut sum: Vec<(i64, &str)> = vec![(1, "x"), (1, "z")];
+        sum.extend(w.iter().map(|v| (1, v.as_str())));
+        let mut premise = vec![ge0(row(0, &sum))];
+        for j in 0..k {
+            premise.push(ge0(row(0, &[(1, "x"), (j as i64 + 1, "y")])));
+        }
+        let xz = Lin::atom(Atom::product(&"x".into(), &"z".into()));
+        let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(xz)));
+        super::READS.with(|n| n.set(0));
+        super::WATCHED.with(|n| n.set(0));
+        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        let reads = super::READS.with(std::cell::Cell::get);
+        (reads, super::WATCHED.with(std::cell::Cell::get), made.len())
+    }
+
+    /// XR-presburger4 round 3 (Gemini): on [`sum_holding_the_goal`] the reads, the entries in
+    /// the lists of blockers and the products made grow by at most 9 times at 8 times `k`, and
+    /// are exact (deterministic). Before the lookup of a pair `{r, p}` blocking every `w * z`
+    /// in [`Index::frees`], the test of each pair of the sum read the k pairs of the sum's row
+    /// and entered its blocker once for each `z`: 10,706 and 645,606 reads (60.3 times), 10,201
+    /// and 641,601 entries (62.9 times), red here (VM v5e2, job 42); with the entries made once
+    /// a blocker but no lookup, the entries were 301 and 2,401 and the reads unchanged, also
+    /// red. The same products are made either way.
+    #[test]
+    fn a_sum_holding_the_goal_reads_few_pairs() {
+        let (small, large) = (sum_holding_the_goal(100), sum_holding_the_goal(800));
+        assert_eq!((small, large), ((708, 201, 100), (5_608, 1_601, 800)));
+        assert!(large.0 <= 9 * small.0, "reads {} and {}", small.0, large.0);
         assert!(
-            r32 * p16 * p16 <= r16 * p32 * p32,
-            "reads {r16} and {r32}, products {p16} and {p32}"
+            large.1 <= 9 * small.1,
+            "entries {} and {}",
+            small.1,
+            large.1
         );
     }
 }
