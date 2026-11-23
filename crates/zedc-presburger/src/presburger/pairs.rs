@@ -30,11 +30,14 @@ use super::formula::{Factor, Lin};
 
 #[cfg(test)]
 thread_local! {
-    /// Tests only: the pairs [`Index::frees`] read on this thread, by any of its three ways.
-    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Tests only: what [`Index::frees`] read on this thread, by any of its three ways: each
+    /// pair read, each lookup of the pairs of two rows ([`Index::pairs_of`], counted whether
+    /// it finds a pair or not), and each row whose list of pairs is entered (counted whether
+    /// the list is empty or not).
+    pub(super) static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Counts one pair read, in tests; nothing otherwise.
+/// Counts one read ([`READS`]), in tests; nothing otherwise.
 fn read() {
     #[cfg(test)]
     READS.with(|n| n.set(n.get() + 1));
@@ -71,7 +74,29 @@ fn read() {
 /// looks up the one pair of `x - 1` with each row on `w{j}`, O(log k), not the k pairs of the
 /// sum (`products_beside_a_sum_whose_atoms_have_products_scale`). In general it is not
 /// O(n log n): many long rows that share variables cost O(|s| × |p|) for each pair read, and
-/// no bound better than the products themselves is known for that case. Tests:
+/// none is likely. Triangle detection reduces to this function in linear size (XR-presburger4
+/// round 2, L6): for a graph of n vertices and M edges, take the rows `u{a}` and
+/// `S{c} = sum of u{d} over the neighbors d of c`, the pairs `{u{a}, S{c}}` for each ordered
+/// edge `(a, c)` and `{u{a}, u{b}}` for each edge, and the mentioned atoms `u{a} * u{a}`.
+/// Proof: an atom `u{a} * u{d}` of `{u{a}, S{c}}`, `d != a`, is also held by `{u{d}, S{c}}`
+/// (all coefficients 1, so nothing cancels), so the first such pair to be dropped would hold no
+/// atom alone, and none is; `{u{a}, u{b}}` holds only `u{a} * u{b}`, also held exactly by the
+/// pairs `{u{a}, S{c}}` and `{u{b}, S{c}}` with `c` adjacent to both, so it is kept exactly
+/// when the edge `ab` lies in a triangle. QED. Checked against a naive fixpoint on 201 graphs
+/// (scratch program, not committed). So an O(k polylog k) method here would detect triangles in
+/// a graph of m edges in almost linear time, against Conjecture 4 of Abboud and Vassilevska
+/// Williams, "Popular conjectures imply strong lower bounds for dynamic problems" (FOCS 2014,
+/// arXiv:1402.0054): "any algorithm requires m^{1+\delta-o(1)} time in expectation to detect
+/// whether an m edge graph contains a triangle"; the best known algorithm is
+/// O(min(m^1.41, n^omega)) (same paper). Searched for a near-linear test of the pairs that alone
+/// hold an atom under deletions (paperclip, 8 searches of 227 to 245 results each, 2026-11-22):
+/// none found. Gemini's grid family, where the reads grow as Θ(k^{3/2}), cannot reach this
+/// function as written (its parallel rows are one row each after `Formula::and`); on its
+/// variant with no two rows parallel, from m = 16 to 32 the products made grow 4 times (512 to
+/// 2,048), the terms they hold 7.1 times (5,328 to 37,792) and the reads 13.2 times (14,866 to
+/// 195,874), near the square of the products, not within a constant of the terms
+/// (`tests::the_grid_family_reads_grow_at_most_as_its_products_squared`; plan row
+/// PRES-pairs-grid-reads). Tests:
 /// `tests::the_pairs_kept_are_those_left_by_expanding_every_product` (against the naive
 /// method) and
 /// `l01_38_presburger::ladder::products_whose_factors_one_sum_on_the_factors_joins_scale`.
@@ -156,6 +181,18 @@ impl<'a> Index<'a> {
                 opp[q].push((p, e));
             }
         }
+        // Each variable's rows are kept only when they are on a pair (XR-presburger4 round 2,
+        // L1). Every use of `holding` looks for pairs on its rows, and a row on no pair has
+        // none, so no answer changes: a pair `{r, s}` that holds `w * z` has a row holding `w`
+        // and a row holding `z` (its coefficient is `r_w s_z + r_z s_w`, or `r_w s_w` for
+        // `z = w`), and both rows are on that pair, so both stay. What changes is the cost:
+        // with k rows `z + u{j}` on no pair beside k rows `y + j z` each paired with `x - 1`,
+        // the test of each pair `{x - 1, y + j z}` walked the k rows on no pair among the rows
+        // holding `z`, whose `weight` (the pairs on them, 0) did not count them: Θ(k²) for the k
+        // pairs (Codex, round 2). Test `a_premise_of_rows_on_no_pair_reads_few_lists`.
+        for rs in &mut holding {
+            rs.retain(|&r| !opp[r].is_empty());
+        }
         let weight = holding
             .iter()
             .map(|rs| rs.iter().map(|&r| opp[r].len()).sum())
@@ -183,7 +220,9 @@ impl<'a> Index<'a> {
     }
 
     /// The pairs of the rows `r` and `s`, by binary search in `at`: O(log P + found) for P pairs.
+    /// Each call is counted as a read ([`READS`]), and so is each pair found.
     fn pairs_of(&self, r: usize, s: usize) -> impl Iterator<Item = usize> + '_ {
+        read();
         let key = (r.min(s), r.max(s));
         let from = self.at.partition_point(|&(k, _)| k < key);
         (self.at[from..].iter())
@@ -269,10 +308,16 @@ impl<'a> Index<'a> {
             // `w` by one exactly when it does by another; for each `z` put in through a pair,
             // one blocking pair is watched, which is all `kept` needs (a pair is tested again
             // when a pair that blocked one of its atoms goes; while the watched blocker of `z`
-            // stays, `z` stays blocked). The way taken is the one that reads fewest pairs,
-            // `weight[w]` against the sums over the open `z` of `weight[z]` and of
-            // `|holding[w]| × |holding[z]|`, summed only until both pass `weight[w]` (each
-            // term is at least 1, as `z` is on `p`, which is on `e`, and `w` is on `q`).
+            // stays, `z` stays blocked). The way taken is the one that reads fewest pairs.
+            // Their costs, for P pairs: from `w`, `weight[w]` pairs, each O(log), and for each
+            // live pair `{r, s}` read, O(min(|s|, |p|) × log) for the variables `s` shares with
+            // `p` (`shared`); from the open `z`, the sum over them of `weight[z]` pairs, each
+            // O(log), and one entry into the list of each row holding such a `z`; by rows, the
+            // sum over them of `|holding[w]| × |holding[z]|` lookups, each O(log P). The
+            // estimate compares `weight[w]` with the two sums, summed only until both pass
+            // `weight[w]` (each term is at least 1, as `z` is on `p`, which is on `e`, and `w`
+            // is on `q`; a row entered has a pair, as `holding` keeps only rows on a pair), in
+            // saturating arithmetic, so that a sum past a word cannot wrap to a small one.
             // Choosing costs O(|not| + min(weight[w], open z)):
             // the scan of `p`'s variables passes over the `z` already in `not` on its way to
             // the open ones (XR-presburger4 round 1 B5), and each of those was put into `not`
@@ -304,15 +349,14 @@ impl<'a> Index<'a> {
             let (mut by_z, mut by_rows) = (0usize, 0usize);
             let held_w = self.holding[w].len();
             for z in open() {
-                by_z += self.weight[z];
-                by_rows += held_w * self.holding[z].len();
+                by_z = by_z.saturating_add(self.weight[z]);
+                by_rows = by_rows.saturating_add(held_w.saturating_mul(self.holding[z].len()));
                 if by_z > self.weight[w] && by_rows > self.weight[w] {
                     break;
                 }
             }
             if by_rows <= self.weight[w] && by_rows <= by_z {
-                let open: Vec<usize> = open().collect();
-                for z in open {
+                for z in open() {
                     let blocker = (self.holding[w].iter()).find_map(|&r| {
                         (self.holding[z].iter()).find_map(|&s| {
                             self.pairs_of(r, s)
@@ -327,9 +371,9 @@ impl<'a> Index<'a> {
                 continue 'w;
             }
             if by_z <= self.weight[w] {
-                let open: Vec<usize> = open().collect();
-                for z in open {
+                for z in open() {
                     let blocker = (self.holding[z].iter()).find_map(|&s| {
+                        read();
                         (self.opp[s].iter())
                             .inspect(|_| read())
                             .find(|&&(r, f)| f != e && live[f] && self.holds(r, s, w, z))
@@ -344,6 +388,7 @@ impl<'a> Index<'a> {
             }
             let p_holds_w = self.coef(p, w).is_some();
             for &r in &self.holding[w] {
+                read();
                 for &(s, f) in &self.opp[r] {
                     read();
                     if f == e || !live[f] {
@@ -596,6 +641,135 @@ mod tests {
         assert!(
             9 * small >= large,
             "{small} and {large} pairs read at k = 250 and 2000"
+        );
+    }
+
+    /// The reads ([`super::READS`]) of [`super::super::products`], the producer of the rows
+    /// and pairs of [`kept`], on `x - 1 >= 0`, `y >= 0`, the k rows `z + u{j} >= 0`, on no
+    /// pair, and after them the k rows `y + (j + 1) z >= 0`, each paired with `x - 1` for the
+    /// goal's `x * y`; with the products made. The rows on no pair come first, so a search of
+    /// the rows holding `z` that walks them meets all k before the first row on a pair
+    /// (`Formula::and` keeps the order of its parts); interleaved, it met one.
+    fn reads_through_products(k: usize) -> (u64, Vec<super::super::formula::Formula>) {
+        use super::super::formula::{Con, Formula};
+        use super::super::{Relation, Tier, products};
+        let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
+        let mut premise = vec![ge0(row(-1, &[(1, "x")])), ge0(row(0, &[(1, "y")]))];
+        for j in 0..k {
+            let u = format!("u{j}");
+            premise.push(ge0(row(0, &[(1, "z"), (1, u.as_str())])));
+        }
+        for j in 0..k {
+            premise.push(ge0(row(0, &[(1, "y"), (j as i64 + 1, "z")])));
+        }
+        let xy = Lin::atom(Atom::product(&"x".into(), &"y".into()));
+        let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(xy)));
+        super::READS.with(|n| n.set(0));
+        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        (super::READS.with(std::cell::Cell::get), made)
+    }
+
+    /// XR-presburger4 round 2, L1 (Codex): through `products`, the rows on no pair among the
+    /// rows holding `z` are not walked, so the reads (pairs, lookups and lists entered, empty
+    /// lists too) at k and 8k grow by at most 9 times and stay under 20 a row. With every row
+    /// kept in `holding`, the test of each pair `{x - 1, y + (j + 1) z}` entered the k empty
+    /// lists of the rows `z + u{j}`: Θ(k²). That dropping those rows from `holding` changes no
+    /// pair kept is checked against `expanded` by
+    /// `the_pairs_kept_are_those_left_by_expanding_every_product`, whose random pairs leave
+    /// some rows on no pair.
+    #[test]
+    fn a_premise_of_rows_on_no_pair_reads_few_lists() {
+        let ((small, made), large) = (reads_through_products(250), reads_through_products(2000).0);
+        eprintln!("rows on no pair: {small} reads at k = 250, {large} at k = 2000");
+        assert!(!made.is_empty(), "no product made at k = 250");
+        assert!(small > 0, "no read counted at k = 250");
+        assert!(small <= 20 * 250, "{small} reads at k = 250");
+        assert!(large <= 20 * 2000, "{large} reads at k = 2000");
+        assert!(
+            9 * small >= large,
+            "{small} and {large} reads at k = 250 and 2000"
+        );
+    }
+
+    /// Gemini's grid family (XR-presburger4 round 2, L6) through [`super::super::products`]:
+    /// for each `i < m` the rows `x - i >= 0`, `y - w{i} >= 0`, `c{i} >= 0` and
+    /// `w0 + ... + w{m-1} - i >= 0`, and the goal `x * y + sum_i w{i} * c{i} >= 0`. As written
+    /// the rows `x - i` are parallel, and so are the sums: `Formula::and` keeps the tightest
+    /// of each, so `x * w{j}` and `w{l} * c{j}` each have one holder and no pair is kept. With
+    /// `fresh`, the rows are `x + i s >= 0` and `w0 + ... + w{m-1} + i t >= 0`, `s` and `t`
+    /// fresh, no two parallel (the reviewer's variant): the pairs are the bicliques of the rows
+    /// on `x` and `y` and of those on each `w{i}` and `c{i}`, Θ(m²) = Θ(k) for the input size
+    /// `k`, and the kept products hold Θ(m³) = Θ(k^{3/2}) terms. The reads, the products made
+    /// and their terms.
+    fn grid_through_products(m: usize, fresh: bool) -> (u64, usize, usize) {
+        use super::super::formula::{Con, Formula};
+        use super::super::{Relation, Tier, products};
+        let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
+        let mut premise = Vec::new();
+        let mut goal = Lin::atom(Atom::product(&"x".into(), &"y".into()));
+        let w: Vec<String> = (0..m).map(|i| format!("w{i}")).collect();
+        let sum: Vec<(i64, &str)> = w.iter().map(|v| (1, v.as_str())).collect();
+        for (i, wi) in w.iter().enumerate() {
+            let ci = format!("c{i}");
+            let k = i as i64;
+            let (xi, gi) = match (fresh, i) {
+                (true, 0) | (false, _) => (row(-k, &[(1, "x")]), row(-k, &sum)),
+                (true, _) => (
+                    row(0, &[(1, "x"), (k, "s")]),
+                    row(0, &sum).plus(&row(0, &[(k, "t")])),
+                ),
+            };
+            premise.push(ge0(xi));
+            premise.push(ge0(row(0, &[(1, "y"), (-1, wi.as_str())])));
+            premise.push(ge0(row(0, &[(1, ci.as_str())])));
+            premise.push(ge0(gi));
+            goal = goal.plus(&Lin::atom(Atom::product(
+                &wi.as_str().into(),
+                &ci.as_str().into(),
+            )));
+        }
+        let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(goal)));
+        super::READS.with(|n| n.set(0));
+        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        fn terms(f: &Formula) -> usize {
+            match f {
+                Formula::Con(c) => c.lin.terms.len(),
+                Formula::Not(g) => terms(g),
+                Formula::And(fs) | Formula::Or(fs) => fs.iter().map(terms).sum(),
+            }
+        }
+        let n = made.iter().map(terms).sum();
+        (super::READS.with(std::cell::Cell::get), made.len(), n)
+    }
+
+    /// XR-presburger4 round 2, L6 (Gemini): on the grid family ([`grid_through_products`]) the
+    /// reads of [`kept`] grow as Θ(k^{3/2}) (19.62 times at 7.83 times the pairs on Gemini's
+    /// extraction), past the scaling limit. As Gemini wrote it, `products` cannot build it:
+    /// its parallel rows are one row each by then, and no product is made. Its variant with no
+    /// two rows parallel is built (at least m² products). No method below Θ(k^{3/2}) is known
+    /// for it in general: triangle detection reduces to [`kept`] in linear size (the comment at
+    /// [`kept`]). Measured on hm1 (job 38): from m = 16 to 32 the products made grow 4 times
+    /// (512 to 2,048), the terms they hold 7.1 times (5,328 to 37,792), and the reads 13.2
+    /// times (14,866 to 195,874; on round 2, 13,266 to 186,786, 14.1 times), so the reads are
+    /// not within a constant of the terms (the round-3 draft of this test claimed so and failed
+    /// at m = 32: 5.18 reads a term against 2.79 at m = 16). Held here: the reads grow at most
+    /// as the square of the products made; the counts are deterministic. Whether a method reads
+    /// fewer on this family is plan row PRES-pairs-grid-reads.
+    #[test]
+    fn the_grid_family_reads_grow_at_most_as_its_products_squared() {
+        let mut counts = Vec::new();
+        for m in [16, 32] {
+            let (_, made, _) = grid_through_products(m, false);
+            assert_eq!(made, 0, "m = {m}: products made from parallel rows");
+            let (reads, made, terms) = grid_through_products(m, true);
+            eprintln!("grid m = {m}: {reads} reads, {made} products, {terms} terms");
+            assert!(made >= m * m, "m = {m}: {made} products made");
+            counts.push((reads, made as u64));
+        }
+        let ((r16, p16), (r32, p32)) = (counts[0], counts[1]);
+        assert!(
+            r32 * p16 * p16 <= r16 * p32 * p32,
+            "reads {r16} and {r32}, products {p16} and {p32}"
         );
     }
 }

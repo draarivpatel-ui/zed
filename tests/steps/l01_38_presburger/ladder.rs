@@ -1477,6 +1477,22 @@ pub(super) fn one_sum_of_atoms_in_no_product(k: usize) -> (Relation, Relation) {
     (rs.pop().expect("two relations"), g)
 }
 
+/// `x >= 1`, `y >= 0`, the k rows `z + u{j} >= 0`, on no pair, and after them the k rows
+/// `y + (j + 1) z >= 0`, each paired with `x - 1` for the goal `x * y >= 0` (XR-presburger4
+/// round 2, L1): the rows holding `z` are k on no pair, first, and k on one pair each.
+pub(super) fn rows_on_no_pair_beside_paired_rows(k: usize) -> (Relation, Relation) {
+    let names: Vec<String> = (0..k).map(|j| format!("u{j}: int")).collect();
+    let head = format!("ok(x: int, y: int, z: int, {})", names.join(", "));
+    let mut premise = vec!["x >= 1".to_string(), "y >= 0".to_string()];
+    premise.extend((0..k).map(|j| format!("z + u{j} >= 0")));
+    premise.extend((0..k).map(|j| format!("y + {} * z >= 0", j + 1)));
+    let (ps, p) = function(&format!("{head} = {};", premise.join(" && ")));
+    let (_, g) = function(&format!("{head} = x * y >= 0;"));
+    let mut rs = relations(&[&p, &g], &ps, true).expect("in the domain");
+    let g = rs.pop().expect("two relations");
+    (rs.pop().expect("two relations"), g)
+}
+
 /// `x >= 1`, `y >= 0`, the rows `y >= w{j}`, `c{j} >= 0` and `w{j} * c{j} >= 0`, and the sum
 /// `w0 + ... + w{k-1} >= 0`, with the goal `x * y >= 0`: each `w{j}` is on the sum, which is
 /// paired with each `c{j}` for `w{j} * c{j}`, and on `y - w{j}`, which is paired with `x - 1`

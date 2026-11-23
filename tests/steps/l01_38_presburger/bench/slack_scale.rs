@@ -418,14 +418,21 @@ fn sat_half_project_each_scales_past_512() {
 fn many_linked_rows_project_each_scales_by_the_solver_alone() {
     let k = 64;
     let y0 = [sym("y0")];
-    let (s, l) = (build_many_linked(k), build_many_linked(scaling::FACTOR * k));
-    // The solver alone, set on the thread each run is measured on: the join of row sums (module
-    // `row_sums`) makes this family near linear, as
-    // `many_linked_rows_project_each_scales_with_the_method` checks.
-    scaling::check_instructions_only("project_each: many linked rows", k, 1, |m| {
+    // Distinct weights at both sizes ([`squares_mod`], as in the test below): with
+    // [`weights`], which repeat from `i = 496`, only the large size had ties, and the two
+    // sizes took two paths (XR-presburger4 round 2, Gemini F3).
+    let build = |n: usize| build_many_linked_by(&squares_mod(n, 1000, 16001));
+    let (s, l) = (build(k), build(scaling::FACTOR * k));
+    // The join of row sums (module `row_sums`) is turned off on the thread each run is
+    // measured on, so that the solver alone runs; it is near linear here by
+    // `merged_equal_atoms` (PRES-growth-ladder-bytes), and the join alone is checked by
+    // `many_linked_rows_project_each_scales_with_the_method`. The first row forces
+    // `y0 = 1000`, as there.
+    scaling::check_order("project_each: many linked rows", k, 1, |m| {
         ROW_SUMS_OFF.with(|o| o.set(true));
-        drop(project_each_solver(if m == k { &s } else { &l }, &y0));
+        let got = project_each_solver(if m == k { &s } else { &l }, &y0);
         ROW_SUMS_OFF.with(|o| o.set(false));
+        assert_eq!(got.expect("projection").0[0], Ok(pt_set(&[1000])));
     });
 }
 

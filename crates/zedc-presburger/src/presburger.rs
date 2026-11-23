@@ -11885,8 +11885,11 @@ fn merged_equal_atoms(
     // With `charged`, the meter is charged in the units of the queue of [`shadow_logged`] for
     // the same work: one for each atom eliminated (the queue's one for each atom taken) and one
     // for each row written again (the queue's one for each row an equation is put into). A row
-    // that holds several atoms eliminated is written once here, so this is at most the queue's
-    // charge for those atoms. A spent meter gives `None`, as in the queue.
+    // that holds several atoms eliminated is written once here; but the rows of the equations
+    // themselves are written again here too, where the queue writes no equation into itself,
+    // so this is at most the queue's charge for those atoms plus one for each equation (a lone
+    // `x == y` is charged 2 here and 1 by the queue; XR-presburger4 round 2, Gemini T2). A
+    // spent meter gives `None`, as in the queue.
     if charged {
         let gone = (0..atoms.len()).filter(|&i| roots[i].0 != i).count();
         meter::charge(gone as u64).ok()?;
@@ -11938,9 +11941,17 @@ thread_local! {
 }
 
 /// A constant of [`merged_equal_atoms`]' sets, ordered as the constant; the tests count its
-/// comparisons (`COMPARED`), and nothing else is added to them.
-#[derive(PartialEq, Eq)]
+/// comparisons, `==` and orderings alike (`COMPARED`), and nothing else is added to them.
+#[derive(Eq)]
 struct Counted<'a>(Cow<'a, Int>);
+
+impl PartialEq for Counted<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        COMPARED.with(|n| n.set(n.get() + 1));
+        self.0 == other.0
+    }
+}
 
 impl Ord for Counted<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -20679,11 +20690,17 @@ impl Omega {
     /// the two, the rows held are those of `flush` for the rows written and the rows not yet
     /// written for the rest. Of the steps between, only these read the rest, and none writes
     /// it: [`Omega::deferred`], whose test `clear` keeps every elimination off a row that holds
-    /// a pending variable, and whose [`System::least_unfilled`] reads only the ranks, which
-    /// count the terms of a row not yet written with its pending terms (so they can choose
-    /// another variable than after `flush`, the change of order the assumption at
+    /// a pending variable, and whose [`System::least_unfilled`] reads the ranks, which count
+    /// the terms of a row not yet written with its pending terms (so they can choose another
+    /// variable than after `flush`, the change of order the assumption at
     /// [`Omega::read_pending`] covers, and `clear` declines the choice when one of its rows
-    /// holds a pending variable); and [`Omega::fix`], which reads the bounds (rows of one
+    /// holds a pending variable), and, at a fill of at most 0, the rows of its least class,
+    /// through [`System::tie`], to find two of its variables that share a row: whether two
+    /// variables share a row is the same before and after a row is written, as a value adds or
+    /// removes no term of a variable not pending (and the class holds none pending, as they
+    /// are out of the ranks), and a tie found makes `deferred` decline, so the constants of the
+    /// rows it lists, which differ before and after, are read by no step; and [`Omega::fix`],
+    /// which reads the bounds (rows of one
     /// variable, none of them holding a pending variable, as the variable fixed is not
     /// pending) and the counts of `Sides::fixable`, where a row not yet written has two or
     /// more variables not pending and pulls each of them the same way before and after it is
@@ -33891,9 +33908,14 @@ mod dark_shadow {
     /// n rows `a - b + i >= 0` and n rows `b - a + i >= 0`, no two of them halves of one
     /// equation: [`merged_equal_atoms`] compares O(n log n) constants to find that, not the
     /// Θ(n²) of a scan of each group's constants (XR-presburger4 round 1 A2, Codex's two term
-    /// signatures), at n and at 8n.
+    /// signatures), at n and at 8n. The comparisons counted (`==` too, XR-presburger4 round 2
+    /// L5) must be some, so that a counter removed fails the test, and grow from n to 8n by at
+    /// most `8 log₂(8n) / log₂(n)` times with a margin, the growth of `K n log n` for any
+    /// constant `K`, so that the bound holds for any ordered set taking O(log n) comparisons
+    /// an operation and not only for the node size of the B-tree today; a scan grows 64 times.
     #[test]
     fn opposite_halves_are_found_in_logarithmic_comparisons() {
+        let mut counts = Vec::new();
         for n in [200_i128, 1600] {
             let (ab, ba) = (
                 Lin::atom(a("a")).minus(&Lin::atom(a("b"))),
@@ -33909,14 +33931,17 @@ mod dark_shadow {
             let out = merged_equal_atoms(&refs, &|_| false, false).expect("rows as they are");
             assert_eq!(out, rows);
             let compared = COMPARED.with(Cell::get);
-            // 2n rows, each an insertion or a lookup in a set of n: a B-tree compares at most
-            // 2B - 1 = 11 keys a level over ⌈log_B n⌉ + 1 levels, B = 6, under 4·log₂(n) + 11.
-            let bound = 2 * n as u64 * (4 * (n as u64).ilog2() as u64 + 11);
-            assert!(
-                compared <= bound,
-                "n = {n}: {compared} comparisons, over {bound}"
-            );
+            assert!(compared > 0, "n = {n}: no comparison counted");
+            counts.push(compared);
         }
+        // 4n operations: the 2n rows inserted into two sets of n, then 2n lookups. Their
+        // growth from n = 200 to 1600 for `K n log n`: 8 × log₂ 1600 / log₂ 200 = 11.2; the
+        // margin 13 is far under the 64 of a scan.
+        let (small, large) = (counts[0], counts[1]);
+        assert!(
+            large <= 13 * small,
+            "{small} and {large} comparisons at n = 200 and 1600"
+        );
     }
 
     /// The rows of 16 atoms `w{i}` joined by equations of every sign and offset, pairs then
