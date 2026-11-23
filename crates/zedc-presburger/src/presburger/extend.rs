@@ -126,6 +126,13 @@ pub struct Extending {
     known: HashMap<Id, Known>,
     sums: Summaries,
     faces: Faces,
+    /// The conjunction of one row made once for each definition that is one constraint
+    /// ([`Extending::defined_with`], SOUND-extend-bare-definition).
+    bare: HashMap<Con, Formula>,
+    /// Tests only: the `fails` branches skip the [`given`] check, the negative control of
+    /// `xr_face_local_atoms_f4b_fails_without_given` and `..._f4c_miss_without_given`.
+    #[cfg(test)]
+    unguarded: bool,
 }
 
 /// The definitions a definition reaches, projected exactly ([`Summary`]): by the definition (the
@@ -184,6 +191,15 @@ impl Extending {
     /// An empty memory.
     pub fn new() -> Extending {
         Extending::default()
+    }
+
+    /// [`given`], skipped in the negative control of the `fails` branches' tests.
+    fn given(&self, closure: &Atoms, m: &Point, f: &Formula) -> bool {
+        #[cfg(test)]
+        if self.unguarded {
+            return true;
+        }
+        given(closure, m, f)
     }
 
     /// [`Extending::defined`] of a formula with no auxiliary variable, or whose auxiliary
@@ -279,6 +295,28 @@ impl Extending {
         def: &dyn Fn(u32) -> Formula,
         iface: Interface,
     ) -> Answers {
+        // A definition that is one constraint is read as the conjunction of that one row.
+        // The summaries and faces key each definition by its part (`Id::any`, as in `Def::of`
+        // and `ScalarImages::ensure`), and a constraint has no part: `Formula::and` of one
+        // element gives the element itself, so the translator gives a bare constraint for
+        // `(if 1 < 2 { x } else { 0 }) == 5`, whose guard folds to true, and `Id::any` stopped
+        // at its `unreachable!` (SOUND-extend-bare-definition; tests
+        // `l01_38_omega_test::one_scope::a_definition_of_one_row_*`). Wrapping, not a key of
+        // a constraint by its own value: a key by value would make `Id` an identity for
+        // compound parts and a value for constraints, and every map keyed by `Id` relies on
+        // equal ids naming one part. The wrap is made once for each constraint and kept,
+        // so every `def(n)` of it, in this call and later ones, gives the same part and the
+        // same key, and a quotient and remainder that share a definition keep sharing it.
+        // O(1) expected time for each `def(n)` of a constraint, nothing for a compound one.
+        let bare = std::cell::RefCell::new(std::mem::take(&mut self.bare));
+        let compound = |n: u32| {
+            let d = def(n);
+            let Formula::Con(c) = &d else { return d };
+            (bare.borrow_mut().entry(c.clone()))
+                .or_insert_with(|| Formula::And(Shared::new(vec![d.clone()])))
+                .clone()
+        };
+        let def: &dyn Fn(u32) -> Formula = &compound;
         // The kept conjunctions under `f` not yet known, each decided after every one it holds
         // (LOAD-chain-affine: `q(x: x) && p(x: x + 1)` holds two), so that the largest is kept:
         // an explicit stack, since the conjunctions nest as deep as the chain of calls. The
@@ -304,13 +342,15 @@ impl Extending {
             todo.extend(kids.into_iter().rev().map(|h| (h, false)));
         }
 
-        match f {
+        let answers = match f {
             Formula::And(_) => self.known[&Id::any(f)].answers.clone(),
             _ => Answers {
                 holds: decide_defined(&mut self.sums, f.clone(), def),
                 fails: decide_defined(&mut self.sums, Formula::negate(f.clone()), def),
             },
-        }
+        };
+        self.bare = bare.into_inner();
+        answers
     }
 
     /// The answers of the conjunction `g`, from those of its kept part when it has one: the
@@ -467,10 +507,21 @@ impl Extending {
             // each binding gives the part's atoms one value at any point of the whole's own
             // atoms, and the part's definitions hold there for some value of their variables.
             // Otherwise it is decided whole.
+            // A point of the part may give no value to an atom the part reads (a point found
+            // through a face, `Faces::free`, [`unread`]); meeting it there would take the
+            // solver's value of that atom, which the part's definitions need not hold at, so
+            // each point is met only where it gives every atom of the part the question reads
+            // ([`given`]), and the question is decided with the definitions otherwise
+            // (SOUND-extend-fails-partial-point-given; XR-sound-extend-face-local-atoms
+            // round 1, F4; test
+            // `presburger::extend::tests::xr_face_local_atoms_f4b_fails_without_given`).
+            // A `decide` that finds no point needs no such check: an atom the point leaves out
+            // is free in the question, so no point there means none at any of its values.
             Ok(true) => {
                 let extended = (part.miss.as_ref()).and_then(|m| {
-                    met(m, &with(&reached_past(&rest, def, m), Formula::top()))
-                        .ok()
+                    let f = with(&reached_past(&rest, def, m), Formula::top());
+                    self.given(&part.closure, m, &f)
+                        .then(|| met(m, &f).ok().flatten())
                         .flatten()
                 });
                 match extended {
@@ -486,7 +537,10 @@ impl Extending {
                     let f = new(&not, m);
                     match decide(&f) {
                         Ok(false) => Some((false, None)),
-                        _ => met(m, &f).ok().flatten().map(|p| (true, Some(p))),
+                        _ if self.given(&part.closure, m, &f) => {
+                            met(m, &f).ok().flatten().map(|p| (true, Some(p)))
+                        }
+                        _ => None,
                     }
                 });
                 match short {
@@ -607,6 +661,10 @@ struct Faces {
     by: HashMap<Id, Option<Face>>,
 }
 
+/// What [`Faces::read`] gives: the question, the holes of the faces read, and the atoms those
+/// faces project out.
+type Read<'s> = (Formula, Vec<(&'s Atom, &'s Holes)>, HashSet<Atom>);
+
 impl Faces {
     /// The faces of the kept parts among `roots` and of the kept parts under them, each made
     /// once, after those of its own kept parts: an explicit stack, since the parts nest as deep
@@ -716,9 +774,20 @@ impl Faces {
         if own.iter().any(|a| matches!(a, Atom::Product(..))) {
             return None;
         }
+        // A part's face stands for it only where nothing beside it reads an atom it projects
+        // out: `g`'s own atoms, and the atoms `g`'s caller reads (`keep`), which this face keeps
+        // and so gives values. Checking `own` alone let `wrap = part0 && x >= 8`, whose caller
+        // reads `[x, q0]`, keep `q0` from `part0`'s face, which binds `q0` inside a clause and so
+        // gives it no value `part0` holds at; `wrap && x >= 9 && q0 <= 2` then held, where `9
+        // div 2` is 4 (XR-sound-extend-face-local-atoms round 1, F3; test
+        // `presburger::extend::tests::xr_face_local_atoms_f3_an_interface_atom_hidden_below`).
+        // No Zed form is known to reach it: a call's interface holds the callee's parameters,
+        // which its kept parts' faces keep, and an argument `y: x div 2` binds the parameter
+        // `y`, not the quotient (tried: `l01_38_omega_test::one_scope::xr_face_f3_unclaimed_call`
+        // and `xr_face_f3_a_quotient_passed_and_read`). O(|keep|) lookups more a part.
         for (i, &(p, face)) in parts.iter().enumerate() {
             let others = (parts.iter().enumerate()).filter(|&(j, _)| j != i);
-            if own.iter().any(|a| hidden(p, face, a))
+            if own.iter().chain(&keep).any(|a| hidden(p, face, a))
                 || others
                     .into_iter()
                     .any(|(_, (o, _))| !apart(&o.closure, p, face))
@@ -745,10 +814,11 @@ impl Faces {
         }
         if ors.is_empty() {
             let rows = shadow(&rows, &|a| keep.contains(a), true)?;
-            return Some(Face::of(rows, Vec::new(), &keep, holes));
+            return Some(Face::of(rows, Vec::new(), &keep, &HashSet::new(), holes));
         }
-        let (rows, clauses) = projected(rows, ors, &mut keep)?;
-        Some(Face::of(rows, clauses, &keep, holes))
+        let mut inside = HashSet::new();
+        let (rows, clauses) = projected(rows, ors, &mut keep, &mut inside)?;
+        Some(Face::of(rows, clauses, &keep, &inside, holes))
     }
 
     /// A point of the conjunction `g` (whose parts are `kids`) that extends the point `m` of its
@@ -768,12 +838,12 @@ impl Faces {
         def: &dyn Fn(u32) -> Formula,
     ) -> Option<Result<Option<Point>, Refusal>> {
         let kj = &known[&Id::any(&kids[j])];
-        let (f, holes) = self.read(known, kids, Some(j), m, def)?;
+        let (f, holes, gone) = self.read(known, kids, Some(j), m, def)?;
         let read = |a: &Atom| !kj.closure.contains(a) || m.contains_key(a);
         if !given(&kj.closure, m, &f) || !holes.iter().all(|(a, _)| read(a)) {
             return Some(Ok(None));
         }
-        Some(met_outside(m, &f, &holes))
+        Some(met_outside(m, &f, &holes).map(|p| p.map(|p| unread(p, &gone))))
     }
 
     /// A point of the conjunction `g` (whose parts are `kids`) found with each kept part that
@@ -813,7 +883,7 @@ impl Faces {
         kids: &[Formula],
         def: &dyn Fn(u32) -> Formula,
     ) -> Option<(Result<bool, Refusal>, Option<Point>)> {
-        let (f, holes) = self.read(known, kids, None, &Point::new(), def)?;
+        let (f, holes, gone) = self.read(known, kids, None, &Point::new(), def)?;
         let within = match residues::read(&f, &holes) {
             Reading::Empty => return Some((Ok(false), None)),
             Reading::Within(within) => within,
@@ -821,7 +891,7 @@ impl Faces {
         if !within.is_empty() {
             let narrow = Formula::and(std::iter::once(f.clone()).chain(within).collect());
             if let Ok(Some(p)) = point(&narrow) {
-                return Some((Ok(true), Some(p)));
+                return Some((Ok(true), Some(unread(p, &gone))));
             }
         }
         let mut written = vec![f];
@@ -829,7 +899,7 @@ impl Faces {
             written.extend(h.clauses(a));
         }
         match point(&Formula::and(written)) {
-            Ok(Some(p)) => Some((Ok(true), Some(p))),
+            Ok(Some(p)) => Some((Ok(true), Some(unread(p, &gone)))),
             Ok(None) => Some((Ok(false), None)),
             Err(_) => None,
         }
@@ -837,7 +907,8 @@ impl Faces {
 
     /// The question of the conjunction whose parts are `kids`, each kept part but `kids[j]`
     /// that has a face read through it, with the definitions it reaches past `m` and those
-    /// faces' parts, and the holes of those faces: `None` when no part has a face, or an atom a
+    /// faces' parts, the holes of those faces, and the atoms of the faces they project out
+    /// ([`unread`]): `None` when no part has a face, or an atom a
     /// face projects out is read beside it. Time of the faces, the other parts and the
     /// definitions reached, and, for each part read through its face, of the smaller of its
     /// atoms and each other part's.
@@ -848,7 +919,7 @@ impl Faces {
         j: Option<usize>,
         m: &Point,
         def: &dyn Fn(u32) -> Formula,
-    ) -> Option<(Formula, Vec<(&'s Atom, &'s Holes)>)> {
+    ) -> Option<Read<'s>> {
         let mut faced: Vec<(&Known, &Face)> = Vec::new();
         let mut whole: Vec<&Known> = j.map(|j| &known[&Id::any(&kids[j])]).into_iter().collect();
         let mut rows: Vec<Formula> = Vec::new();
@@ -896,7 +967,18 @@ impl Faces {
         let holes = (faced.iter())
             .flat_map(|(_, face)| face.holes.iter())
             .collect();
-        Some((with(&defs, base), holes))
+        // The atoms of the faces' rows and clauses that the faces project out, as the quotient a
+        // clause alone reads: the solver gives each a value at a point of the question, but not
+        // one its part holds at, since its definition is not read (`past`).
+        let gone = (faced.iter())
+            .flat_map(|(_, face)| {
+                (face.rows.iter())
+                    .flat_map(|c| c.lin.terms.keys().cloned())
+                    .chain(face.clauses.iter().flat_map(Formula::atoms))
+                    .filter(|a| !face.atoms.contains(a))
+            })
+            .collect();
+        Some((with(&defs, base), holes, gone))
     }
 }
 
@@ -905,11 +987,13 @@ impl Face {
     /// each row once, each congruence once ([`congruences_once`]), each clause once
     /// ([`clauses_once`]), and the rows and clauses of each group linked by shared atoms that
     /// reads none of `keep` dropped, since the conjunction holds and so each such group holds
-    /// somewhere apart. Time of the rows and clauses, near linear.
+    /// somewhere apart. The atoms of `inside`, kept inside a disjunct ([`project`]), are left
+    /// out of its atoms. Time of the rows and clauses, near linear.
     fn of(
         rows: Vec<Con>,
         clauses: Vec<Formula>,
         keep: &HashSet<Atom>,
+        inside: &HashSet<Atom>,
         holes: BTreeMap<Atom, Holes>,
     ) -> Face {
         let rows: Vec<Con> = (rows.into_iter())
@@ -994,15 +1078,24 @@ impl Face {
         // and `hole_of` above). Were one read by a row too, leaving it out would still be sound:
         // `hidden` and `apart` read `atoms` only to decline a face, so a smaller set declines
         // more often and never answers otherwise.
-        let local: HashSet<Atom> = (clauses.iter())
-            .flat_map(Formula::atoms)
-            .filter(|a| !keep.contains(a))
-            .collect();
+        // An atom of `inside` is one `project` added to `keep` inside a disjunct, as `q1` shared
+        // by two disjunctions of `D1` in `(D1 || D2) && 2 <= x <= 9`: the clause holds through
+        // `D2` whatever `q1` is, and a disjunct projected before `q1` was added projected it out,
+        // so the face is exact on it in no disjunct but its own, and it is left out as a local
+        // atom is. Counted, it let `(D1 || D2) && 2 <= x <= 9 && q1 == 0` hold at `x = 2`, `q1 =
+        // 0`, where `2 mod 3` is 2 (XR-sound-extend-face-local-atoms round 1, L1; test
+        // `l01_38_omega_test::extend::a_quotient_kept_inside_one_disjunct_is_not_read_beside_the_face`).
+        // An atom added at the top level stays: there it lies in one group, whose disjunctions
+        // are each projected with it kept, so the face is exact on it.
+        // The clauses' atoms are listed once and read by both filters.
+        let in_clauses: Vec<Atom> = clauses.iter().flat_map(Formula::atoms).collect();
+        let local: HashSet<&Atom> = (in_clauses.iter()).filter(|a| !keep.contains(*a)).collect();
         let atoms = (rows.iter())
-            .flat_map(|c| c.lin.terms.keys().cloned())
-            .chain(clauses.iter().flat_map(Formula::atoms))
-            .chain(holes.keys().cloned())
-            .filter(|a| !local.contains(a))
+            .flat_map(|c| c.lin.terms.keys())
+            .chain(&in_clauses)
+            .chain(holes.keys())
+            .filter(|a| !local.contains(a) && !inside.contains(*a))
+            .cloned()
             .collect();
         Face {
             rows,
@@ -1355,12 +1448,13 @@ fn projected(
     rows: Vec<Con>,
     ors: Vec<Formula>,
     keep: &mut HashSet<Atom>,
+    inside: &mut HashSet<Atom>,
 ) -> Option<(Vec<Con>, Vec<Formula>)> {
     let items: Vec<Formula> = (rows.into_iter().map(Formula::Con))
         .chain(ors.iter().map(|h| nnf(h, true)))
         .collect();
     let (mut rows, mut clauses) = (Vec::new(), Vec::new());
-    let mut todo = vec![project(items, keep)];
+    let mut todo = vec![project(items, keep, inside)];
     while let Some(h) = todo.pop() {
         match h {
             Formula::Con(ref c) => rows.push(c.clone()),
@@ -1397,18 +1491,25 @@ fn projected(
 // `l01_38_omega_test::one_scope::each_answer_of_a_random_disjunctive_chain_is_the_answer_of_the_relation_whole`.
 // COMPLEXITY.md row LOAD-disj-residue. A complete solution needs a projection that keeps such
 // disjunctions in a shared form, a decision diagram over their cases.
-fn project(items: Vec<Formula>, keep: &mut HashSet<Atom>) -> Formula {
+// `keep` is one set for every disjunct, so an atom one disjunct adds is kept by the disjuncts
+// projected after it, and not by those projected before: the face is not exact on it, and
+// `inside` gathers it, for the face to leave out ([`Face::of`]). Why one set and not a copy for
+// each disjunct: a copy changes what the later disjuncts keep, and so the face of every
+// disjunction a disjunct shares an atom with, answers that are right now among them, and costs
+// O(|keep|) a disjunct. XR-sound-extend-face-local-atoms round 1, L1.
+fn project(items: Vec<Formula>, keep: &mut HashSet<Atom>, inside: &mut HashSet<Atom>) -> Formula {
     enum Step {
-        Split(Vec<Formula>),
+        /// Parts to split, and whether they lie inside a disjunct.
+        Split(Vec<Formula>, bool),
         /// The conjunction of these parts and the results of the next `n` steps.
         And(usize, Vec<Formula>),
         /// The disjunction of the results of the next `n` steps.
         Or(usize),
     }
-    let mut steps = vec![Step::Split(items)];
+    let mut steps = vec![Step::Split(items, false)];
     let mut out: Vec<Formula> = Vec::new();
     while let Some(step) = steps.pop() {
-        let items = match step {
+        let (items, nested) = match step {
             Step::And(n, mut own) => {
                 own.extend(out.split_off(out.len() - n));
                 out.push(Formula::and(own));
@@ -1419,9 +1520,9 @@ fn project(items: Vec<Formula>, keep: &mut HashSet<Atom>) -> Formula {
                 out.push(Formula::or(ds));
                 continue;
             }
-            Step::Split(items) => items,
+            Step::Split(items, nested) => (items, nested),
         };
-        let Some((own, groups)) = split(items, keep) else {
+        let Some((own, groups)) = split(items, keep, nested.then_some(&mut *inside)) else {
             out.push(Formula::bottom());
             continue;
         };
@@ -1433,10 +1534,10 @@ fn project(items: Vec<Formula>, keep: &mut HashSet<Atom>) -> Formula {
                     for d in ds {
                         let mut items = rows.clone();
                         items.push(d);
-                        steps.push(Step::Split(items));
+                        steps.push(Step::Split(items, true));
                     }
                 }
-                Group::Again(items) => steps.push(Step::Split(items)),
+                Group::Again(items) => steps.push(Step::Split(items, nested)),
             }
         }
     }
@@ -1457,8 +1558,13 @@ enum Group {
 /// and a two-term equality among the rows sets with coefficient 1 or -1 (`x@3 == x@4 + 3`, the
 /// binding of a call's argument) is first replaced in the disjunctions by what it equals, which
 /// the rows make the same, so that a callee's clauses read the caller's atom and not the bound
-/// one. `None` where the rows hold nowhere. Time of the items, near linear, and of [`shadow`].
-fn split(items: Vec<Formula>, keep: &mut HashSet<Atom>) -> Option<(Vec<Formula>, Vec<Group>)> {
+/// one. Each atom it adds to `keep` is added to `inside` too, where given. `None` where the rows
+/// hold nowhere. Time of the items, near linear, and of [`shadow`].
+fn split(
+    items: Vec<Formula>,
+    keep: &mut HashSet<Atom>,
+    mut inside: Option<&mut HashSet<Atom>>,
+) -> Option<(Vec<Formula>, Vec<Group>)> {
     let (mut rows, mut ors): (Vec<Con>, Vec<Formula>) = (Vec::new(), Vec::new());
     let mut flat = items;
     while let Some(f) = flat.pop() {
@@ -1596,11 +1702,14 @@ fn split(items: Vec<Formula>, keep: &mut HashSet<Atom>) -> Option<(Vec<Formula>,
                         e.1 |= i >= rows.len();
                     }
                 }
-                keep.extend(
-                    (by.into_iter())
-                        .filter(|&(_, (n, or))| n >= 2 && or)
-                        .map(|(a, _)| a.clone()),
-                );
+                let shared = (by.into_iter()).filter(|&(_, (n, or))| n >= 2 && or);
+                for (a, _) in shared {
+                    if keep.insert(a.clone())
+                        && let Some(inside) = inside.as_deref_mut()
+                    {
+                        inside.insert(a.clone());
+                    }
+                }
                 let mut items = rows_of(&rs);
                 items.extend(os.iter().map(|&i| ors[i - rows.len()].clone()));
                 left.push(Group::Again(items));
@@ -1809,6 +1918,21 @@ fn given(closure: &Atoms, m: &Point, f: &Formula) -> bool {
             .chain(factors)
             .all(|b| !closure.contains(&b) || m.contains_key(&b))
     })
+}
+
+/// `p` with no value for the atoms of `gone`, those the faces read to find it project out
+/// ([`Faces::read`]), so that it gives none, as [`Known`] says, and a later question that reads
+/// one fails [`given`] and is not met at a value its part does not hold at. Before, `free` kept
+/// the solver's value of `q0` at `x = 9` for `p1 = q && x >= 9`, `q` binding `q0` inside a clause,
+/// and `p2 = p1 && q0 <= 2` held there, where `9 div 2` is 4 (XR-sound-extend-face-local-atoms
+/// round 1, L2; test
+/// `l01_38_omega_test::extend::a_point_stored_through_a_face_is_not_read_at_a_quotient_the_face_projects_out`).
+/// O(|gone| log |p|).
+fn unread(mut p: Point, gone: &HashSet<Atom>) -> Point {
+    for a in gone {
+        p.remove(a);
+    }
+    p
 }
 
 /// The definitions `f` reaches: those of its auxiliary variables, and of theirs. Time of `f`
@@ -8432,5 +8556,349 @@ mod tests {
             merge_pieces(BTreeSet::from([impossible.clone()])),
             vec![impossible]
         );
+    }
+
+    // XR-sound-extend-face-local-atoms round 1: L1 (F2), L2 (F1) and F3, reproduced on the
+    // code before the fixes SOUND-extend-face-disjunct-keep, SOUND-extend-face-point-unread and
+    // SOUND-extend-face-hidden-keep, and the positive control.
+
+    fn xs(name: &str) -> Lin {
+        Lin::atom(Atom::Sym(name.into()))
+    }
+
+    fn xq(n: u32) -> Lin {
+        Lin::atom(Atom::Aux(n))
+    }
+
+    fn xge(a: Lin, b: Lin) -> Formula {
+        Formula::Con(Con::ge(&a, &b))
+    }
+
+    fn xeq(a: Lin, b: Lin) -> Formula {
+        Formula::Con(Con::eq(&a, &b))
+    }
+
+    /// `x == m * q{n} + q{n+1}`, `0 <= q{n+1} <= m - 1`.
+    fn xpair(m: i64, n: u32) -> Formula {
+        Formula::and(vec![
+            xeq(xs("x"), xq(n).times(m).plus(&xq(n + 1))),
+            xge(xq(n + 1), Lin::constant(0)),
+            xge(Lin::constant(m - 1), xq(n + 1)),
+        ])
+    }
+
+    fn xextend(part: &Formula, rest: Vec<Formula>) -> Formula {
+        let mut fs = vec![part.clone()];
+        fs.extend(rest);
+        Formula::and_keeping(fs, |i| i == 0)
+    }
+
+    /// The answers `decide` gives `f` and its negation beside `defs`.
+    fn xwant(defs: &[Formula], f: &Formula) -> Answers {
+        let with = |g: Formula| Formula::and(defs.iter().cloned().chain([g]).collect());
+        Answers {
+            holds: decide(&with(f.clone())),
+            fails: decide(&with(Formula::negate(f.clone()))),
+        }
+    }
+
+    /// Every stored point (and point of negation) of `e` at which an `Aux` atom it gives a
+    /// value, with every atom of its definition given one, does not satisfy that definition.
+    fn xbad_points(e: &Extending, def: &dyn Fn(u32) -> Formula) -> Vec<String> {
+        let mut bad = Vec::new();
+        for k in e.known.values() {
+            for (what, p) in [("point", &k.point), ("miss", &k.miss)] {
+                let Some(p) = p else { continue };
+                let m: Model = p.iter().map(|(a, v)| (a.clone(), v.clone())).collect();
+                for a in p.keys() {
+                    let Atom::Aux(n) = a else { continue };
+                    let d = def(*n);
+                    if d.atoms().iter().all(|b| m.contains_key(b)) && !d.holds(&m) {
+                        bad.push(format!("{what} {m:?}: {d} fails"));
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    /// L1 (F2), L2 (F1) and the existing face unit, by hand: each answer against `decide`, and
+    /// the general check that no stored point gives a quotient a value its definition does not
+    /// give at that point.
+    #[test]
+    fn xr_face_local_atoms_points_satisfy_their_definitions() {
+        let (x, k) = (xs("x"), Lin::constant);
+        let iface = |g: &Formula| matches!(g, Formula::And(_)).then(|| vec![Atom::Sym("x".into())]);
+        let mut cases: Vec<(&str, Vec<Formula>, Vec<Formula>)> = Vec::new();
+        // L1, both orders.
+        let d1 = Formula::and(vec![
+            xge(x.clone(), k(0)),
+            Formula::or(vec![xeq(xq(1), k(0)), xge(k(-1), x.clone())]),
+            Formula::or(vec![xeq(xq(1), k(1)), xge(x.clone(), k(51))]),
+        ]);
+        let d2 = Formula::and(vec![xge(xq(0), k(0)), xeq(xq(1), k(2))]);
+        for (name, ds) in [
+            ("L1", vec![d1.clone(), d2.clone()]),
+            ("L1 swapped", vec![d2, d1]),
+        ] {
+            let part = Formula::and(vec![
+                Formula::or(ds),
+                xge(x.clone(), k(2)),
+                xge(k(9), x.clone()),
+            ]);
+            let whole = xextend(&part, vec![xeq(xq(1), k(0))]);
+            cases.push((name, vec![xpair(3, 0)], vec![part, whole]));
+        }
+        // L2 and its mirror.
+        for (name, lo, hi, link) in [
+            ("L2", 2, 9, xge(x.clone(), k(9))),
+            ("L2 mirror", 9, 17, xge(k(9), x.clone())),
+        ] {
+            let part = Formula::and(vec![
+                Formula::or(vec![Formula::negate(xeq(xq(1), k(1))), xeq(xq(3), k(1))]),
+                xge(x.clone(), k(lo)),
+                xge(k(hi), x.clone()),
+            ]);
+            let p1 = xextend(&part, vec![link]);
+            let p2 = xextend(&p1, vec![xge(k(2), xq(0))]);
+            cases.push((name, vec![xpair(2, 0), xpair(4, 2)], vec![part, p1, p2]));
+        }
+        let mut failures = Vec::new();
+        for (name, defs, links) in &cases {
+            let def = |n: u32| defs[n as usize / 2].clone();
+            let mut e = Extending::new();
+            for f in links {
+                let got = e.defined_with(f, &def, &iface);
+                let want = xwant(defs, f);
+                if got != want {
+                    failures.push(format!("{name}: {f}: got {got:?}, want {want:?}"));
+                }
+            }
+            for b in xbad_points(&e, &def) {
+                failures.push(format!("{name}: {b}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// F3: a caller's interface holds `q0`, which the face of the part it extends hides.
+    #[test]
+    fn xr_face_local_atoms_f3_an_interface_atom_hidden_below() {
+        let (x, k) = (xs("x"), Lin::constant);
+        let defs = [xpair(2, 0), xpair(4, 2)];
+        let def = |n: u32| defs[n as usize / 2].clone();
+        let part0 = Formula::and(vec![
+            Formula::or(vec![Formula::negate(xeq(xq(1), k(1))), xeq(xq(3), k(1))]),
+            xge(x.clone(), k(2)),
+            xge(k(9), x.clone()),
+        ]);
+        let wrap = xextend(&part0, vec![xge(x.clone(), k(8))]);
+        let whole = xextend(&wrap, vec![xge(x.clone(), k(9)), xge(k(2), xq(0))]);
+        let iface = |g: &Formula| {
+            if *g == wrap {
+                Some(vec![Atom::Sym("x".into()), Atom::Aux(0)])
+            } else {
+                matches!(g, Formula::And(_)).then(|| vec![Atom::Sym("x".into())])
+            }
+        };
+        let mut e = Extending::new();
+        let mut failures = Vec::new();
+        for f in [&part0, &wrap, &whole] {
+            let got = e.defined_with(f, &def, &iface);
+            let want = xwant(&defs, f);
+            if got != want {
+                failures.push(format!("{f}: got {got:?}, want {want:?}"));
+            }
+        }
+        failures.extend(xbad_points(&e, &def));
+        assert_eq!(xwant(&defs, &whole).holds, Ok(false));
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// `q0 == x`, `q1 == q0 + 1`, each a definition of one row kept as a conjunction, and
+    /// `sub = q1 >= q0 && q0 >= x`, which holds everywhere with them and which `Formula` does
+    /// not fold.
+    fn xf4_defs() -> ([Formula; 2], Formula) {
+        let (x, k) = (xs("x"), Lin::constant);
+        let one = |f: Formula| Formula::And(Shared::new(vec![f]));
+        let defs = [
+            one(xeq(xq(0), x.clone())),
+            one(xeq(xq(1), xq(0).plus(&k(1)))),
+        ];
+        (defs, Formula::and(vec![xge(xq(1), xq(0)), xge(xq(0), x)]))
+    }
+
+    /// Decides `parts` in order, sets the stored point (`miss` false) or point of negation
+    /// (`miss` true) of the last to `{q1: 6}`, the shape [`Faces::free`] stores for a part
+    /// whose face keeps `q1` alone, then decides `whole`; the failures against [`xwant`] and
+    /// [`xbad_points`].
+    /// `unguarded` skips the [`given`] check (the negative control).
+    fn xf4_run(
+        defs: &[Formula],
+        parts: &[&Formula],
+        whole: &Formula,
+        miss: bool,
+        unguarded: bool,
+    ) -> Vec<String> {
+        let def = |n: u32| defs[n as usize].clone();
+        let mut e = Extending::new();
+        e.unguarded = unguarded;
+        let mut failures = Vec::new();
+        for f in parts {
+            let got = e.defined(f, &def);
+            let want = xwant(defs, f);
+            if got != want {
+                failures.push(format!("{f}: got {got:?}, want {want:?}"));
+            }
+        }
+        let at = Some(Point::new().update(Atom::Aux(1), Int::from(6)));
+        let last = parts.last().expect("a part");
+        if let Some(kp) = e.known.get_mut(&Id::any(last)) {
+            match miss {
+                false => kp.point = at,
+                true => kp.miss = at,
+            }
+        }
+        let got = e.defined(whole, &def);
+        let want = xwant(defs, whole);
+        if got != want {
+            failures.push(format!("{whole}: got {got:?}, want {want:?}"));
+        }
+        failures.extend(xbad_points(&e, &def));
+        failures
+    }
+
+    /// F4 (SOUND-extend-fails-partial-point-given): the `fails` branch for a part that never
+    /// fails met the part's point with no [`given`] check. `part = sub && q1 >= x` never fails
+    /// with the definitions ([`xf4_defs`]); the whole adds `!(q1 == 6 && q0 == 3)`, which never
+    /// fails either. With the part's point `{q1: 6}`, which gives `q0` no value, `met` took a
+    /// `q0` that breaks `q1 == q0 + 1` and answered that the whole fails. Branch-level: the
+    /// route by which `Faces::free` itself stores such a point needs the part's kept part to
+    /// have no point (a refusal in [`Extending::fill`]); no Zed form was found that reaches it
+    /// (tried: the `xr_face_*` forms of `l01_38_omega_test::one_scope`, whose parts' points
+    /// are found whole, and, 2026-11-23 on main without the guard, four forms in which a part
+    /// that never fails, a call of `(x mod 2 != 1 || x mod 4 == 1) && x > 1 && x < 10` or a
+    /// wider one, is read beside a condition on the callee's `x div 2`, e.g.
+    /// `p1(x) = q(x: x) || x <= 1 || x >= 10; s(x) = p1(x: x) && !(x div 2 == 3 && x mod 2 == 1)`:
+    /// all answered as the relation whole). Red before the guard, green after.
+    #[test]
+    fn xr_face_local_atoms_f4b_fails_without_given() {
+        let failures = xf4_case(false, false);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The other `fails` branch, a part that fails somewhere (`part = sub && x <= 5`), with
+    /// the part's point of negation `{q1: 6}`: the definitions the whole's other parts reach
+    /// past it are met there only where it gives each atom of the part they read a value, or
+    /// the miss stored would give `q0` a value that breaks `q1 == q0 + 1`
+    /// (SOUND-extend-fails-partial-point-given).
+    #[test]
+    fn xr_face_local_atoms_f4c_miss_without_given() {
+        let failures = xf4_case(true, false);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The negative control of the two above: with the [`given`] check skipped, each fails.
+    #[test]
+    fn xr_face_local_atoms_f4_cases_fail_unguarded() {
+        for fails_somewhere in [false, true] {
+            assert!(
+                !xf4_case(fails_somewhere, true).is_empty(),
+                "case {fails_somewhere}: no failure with the check skipped"
+            );
+        }
+    }
+
+    /// The case of F4 ([`xr_face_local_atoms_f4b_fails_without_given`], `fails_somewhere`
+    /// false) or its mirror ([`xr_face_local_atoms_f4c_miss_without_given`], true): its
+    /// failures, with the [`given`] check skipped when `unguarded`.
+    fn xf4_case(fails_somewhere: bool, unguarded: bool) -> Vec<String> {
+        let (defs, sub) = xf4_defs();
+        let (x, k) = (xs("x"), Lin::constant);
+        let row = match fails_somewhere {
+            false => xge(xq(1), x),
+            true => xge(k(5), x),
+        };
+        let part = xextend(&sub, vec![row]);
+        let whole = xextend(
+            &part,
+            vec![Formula::negate(Formula::and(vec![
+                xeq(xq(1), k(6)),
+                xeq(xq(0), k(3)),
+            ]))],
+        );
+        xf4_run(&defs, &[&sub, &part], &whole, fails_somewhere, unguarded)
+    }
+
+    /// Definitions that are one constraint each, as `Formula::and` of one row gives them, are
+    /// read as the conjunctions of their row (SOUND-extend-bare-definition): before, the
+    /// summaries' `Id::any` of such a definition stopped at its `unreachable!`.
+    #[test]
+    fn a_definition_of_one_row_is_read_as_its_conjunction() {
+        let (x, k) = (xs("x"), Lin::constant);
+        let defs = [xeq(xq(0), x.clone()), xeq(xq(1), xq(0).plus(&k(1)))];
+        let def = |n: u32| defs[n as usize].clone();
+        let sub = Formula::and(vec![xge(xq(1), xq(0)), xge(xq(0), x.clone())]);
+        let part = xextend(&sub, vec![xge(k(5), x.clone())]);
+        let whole = xextend(&part, vec![xge(xq(1), k(3))]);
+        let lone = Formula::and(vec![xge(xq(1), k(3)), xge(k(9), xq(0))]);
+        let mut e = Extending::new();
+        let mut failures = Vec::new();
+        for f in [&sub, &part, &whole, &lone, &whole] {
+            let got = e.defined(f, &def);
+            let want = xwant(&defs, f);
+            if got != want {
+                failures.push(format!("{f}: got {got:?}, want {want:?}"));
+            }
+        }
+        failures.extend(xbad_points(&e, &def));
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The positive control: a face keeps a quotient two top-level clauses share, and drops one
+    /// a clause alone reads.
+    #[test]
+    fn xr_face_local_atoms_positive_control() {
+        let (x, k) = (xs("x"), Lin::constant);
+        let iface = |g: &Formula| matches!(g, Formula::And(_)).then(|| vec![Atom::Sym("x".into())]);
+        // Two clauses sharing q1 (x == 3 q0 + q1).
+        let defs = [xpair(3, 0)];
+        let def = |n: u32| defs[n as usize / 2].clone();
+        let shared = Formula::and(vec![
+            Formula::or(vec![xeq(xq(1), k(0)), xge(x.clone(), k(50))]),
+            Formula::or(vec![xeq(xq(1), k(1)), xge(k(-50), x.clone())]),
+            xge(x.clone(), k(-100)),
+            xge(k(100), x.clone()),
+        ]);
+        let link = xextend(&shared, vec![xge(x.clone(), k(97)), xge(k(97), x.clone())]);
+        let mut e = Extending::new();
+        e.defined_with(&shared, &def, &iface);
+        e.defined_with(&link, &def, &iface);
+        let atoms =
+            (e.faces.by.get(&Id::any(&shared))).and_then(|f| f.as_ref().map(|f| f.atoms.clone()));
+        assert!(
+            atoms.as_ref().is_some_and(|a| a.contains(&Atom::Aux(1))),
+            "shared: {atoms:?}"
+        );
+        assert_eq!(xbad_points(&e, &def), Vec::<String>::new(), "shared");
+        // One clause alone reading q0 (x == 2 q0 + q1, x == 4 q2 + q3).
+        let defs = [xpair(2, 0), xpair(4, 2)];
+        let def = |n: u32| defs[n as usize / 2].clone();
+        let lone = Formula::and(vec![
+            Formula::or(vec![Formula::negate(xeq(xq(1), k(1))), xeq(xq(3), k(1))]),
+            xge(x.clone(), k(2)),
+            xge(k(9), x.clone()),
+        ]);
+        let link = xextend(&lone, vec![xge(x.clone(), k(9))]);
+        let mut e = Extending::new();
+        e.defined_with(&lone, &def, &iface);
+        e.defined_with(&link, &def, &iface);
+        let atoms =
+            (e.faces.by.get(&Id::any(&lone))).and_then(|f| f.as_ref().map(|f| f.atoms.clone()));
+        assert!(
+            atoms.as_ref().is_some_and(|a| !a.contains(&Atom::Aux(0))),
+            "lone: {atoms:?}"
+        );
+        assert_eq!(xbad_points(&e, &def), Vec::<String>::new(), "lone");
     }
 }
