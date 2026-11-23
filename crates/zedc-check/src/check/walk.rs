@@ -4743,7 +4743,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                         out_sig.keys = None;
                     }
                     out_sig.word = None;
-                    out_sig.needs = Vec::new();
+                    out_sig.needs = Default::default();
                     out_sig.note_held();
                     out = out.union(&Ty::func(Arc::new(out_sig)));
                 }
@@ -10185,10 +10185,15 @@ impl<'t, 'a> Ck<'t, 'a> {
                         .into(),
                     }
                 }
+                // A value of generic literals alone, as `1.5 + 1`, has an empty set: its type
+                // is its class, shown whole, not `Never` (plan row MSG-cast-no-carrier-first).
                 None => format!(
                     "an int cast takes a number only where the checker proves it whole; \
                      `{arg}` is {}, which may hold a value that is not whole",
-                    self.show(&Ty::set(x.ty.set.clone()))
+                    match x.ty.set.lists_nothing() {
+                        true => self.show(&x.ty),
+                        false => self.show(&Ty::set(x.ty.set.clone())),
+                    }
                 )
                 .into(),
             },
@@ -10199,10 +10204,14 @@ impl<'t, 'a> Ck<'t, 'a> {
         }
         if numbers.is_empty() {
             notes.extend(self.derive(&[at]));
+            // `.isFinite` binds tighter than any operator, so an operand that is not one term
+            // is grouped there, as the formatter writes it: `(1.5 + 1).isFinite`, not
+            // `1.5 + 1.isFinite` (plan row MSG-cast-no-carrier-first).
+            let receiver = zedc_syntax::format::code_as_receiver(&arg);
             notes.push(Note {
                 span,
                 text: format!(
-                    "repair: test at run time, `r: f64 = trunc({arg}); if {arg}.isFinite && \
+                    "repair: test at run time, `r: f64 = trunc({arg}); if {receiver}.isFinite && \
                      {arg} == r {{ int({arg}) }} else {{ … }}`"
                 )
                 .into(),
@@ -15229,7 +15238,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         let ordered = self.r10_merge_direct_and_kept_needs(&kept_fids, needs);
         let (kept, merged) = self.share_alike(ordered);
         let kept = self.r10_n4_expand_if_merged(kept, &merged, level, &mut own, &mut done);
-        sig.needs = kept;
+        sig.needs = kept.into();
         // Only the classes listed for this level are replaced here, not every class `sig`
         // holds. A type variable keeps its class's name `$k` until `finish`, so a function
         // around does not rewrite the signatures inside it at each depth (CHK-curried);
@@ -15288,9 +15297,11 @@ impl<'t, 'a> Ck<'t, 'a> {
                 })
             })
         {
-            let needs = std::mem::take(&mut sig.needs);
+            let needs = std::mem::take(&mut sig.needs).into_vec();
             let mut no_done = Vec::new();
-            sig.needs = self.r10_expand_kept_fwds(needs, level, &mut own, &mut no_done);
+            sig.needs = self
+                .r10_expand_kept_fwds(needs, level, &mut own, &mut no_done)
+                .into();
             sig.facts = Default::default();
         }
         // The names the declaration wrote for its classes, which both namings below keep.
@@ -15464,7 +15475,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         // search, over `own` for one in the value, is O(v) a need, O(p·v) for p needs over v
         // variables.
         let own_set: HashSet<&str> = own.iter().map(|v| &**v).collect();
-        let needs = std::mem::take(&mut sig.needs);
+        let needs = std::mem::take(&mut sig.needs).into_vec();
         for mut n in needs {
             let NeedKind::Push {
                 port,
@@ -23375,7 +23386,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             // A word applied to fewer arguments than its arity is not the word: `min` and `max`
             // take two tuples only when both are given (sec:reduction, item 5).
             word: None,
-            needs,
+            needs: needs.into(),
             // The needs left are decoded from `sig`'s compact forwards ([`Self::replay`]), so
             // the results those forwards make inside are the rest's own, as the flat signature
             // lists them, and their classes are made and named above
@@ -25227,7 +25238,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             dense: Dense::No,
             keys: None,
             word: None,
-            needs: Vec::new(),
+            needs: Default::default(),
             own: Default::default(),
             held: Default::default(),
             named: 0,
@@ -25344,7 +25355,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             .filter(|n| range_need_of(s, n).is_none())
             .cloned()
             .collect();
-        unranged.needs = needs_in_order(&rest, from);
+        unranged.needs = needs_in_order(&rest, from).into();
         unranged.facts = Default::default();
         let unranged = Arc::new(unranged);
         let what = format!("`{name}`");
@@ -29582,7 +29593,14 @@ impl<'t, 'a> Ck<'t, 'a> {
         let mut left =
             match self.r10_try_admit(what, sig, arrow, args, partial, &mut binds, &defer, span) {
                 Some(l) => l,
-                None => self.replay(what, &sig.needs, &mut binds, &sig.bounds, defer, span),
+                None => self.replay(
+                    what,
+                    sig.needs.as_slice(),
+                    &mut binds,
+                    &sig.bounds,
+                    defer,
+                    span,
+                ),
             };
         let frame = self.call_frames.pop();
         // Each bounded variable's binding is within its bound, and of one carrier, or of
@@ -29658,6 +29676,13 @@ impl<'t, 'a> Ck<'t, 'a> {
                 && !self.flow(c, &rest, what, span, span)
             {
                 return fail(self);
+            }
+            // The carriers this call gives the variable, for the widening pass
+            // ([`Ck::own_follows`]): O(1) a bounded variable, which the loop visits anyway.
+            if !self.trying
+                && let Some(k) = class_id(v)
+            {
+                self.instances.push((k, class, kinds));
             }
             binds.insert(v.clone(), whole);
         }
@@ -29976,6 +30001,67 @@ impl<'t, 'a> Ck<'t, 'a> {
         self.reject_unfixed(&format_args!("the arguments of {what}"), found);
     }
 
+    /// The arguments of an application beside a class that list values ([`Self::readable`]),
+    /// each read at the one carrier, `f64`, `f32` or `rat`, of the parts the arguments hold
+    /// whole, as [`Self::fewest`] reads them where no class is present: in
+    /// `(if c { 1r / 2 } else { 3 }) + (if c { 1 / 2 } else { 3 })` the left `if`, of type
+    /// `rat | 3`, is read at `rat`, so its `3` is the `rat` `3r` (DESIGN.md step L1.26a: "each
+    /// keeps its own value and is fixed where the result is used"), and the class of the right
+    /// `if`'s `1 / 2` meets `rat` alone, as beside `x: rat` (plan row
+    /// MSG-branch-fix-beside-carrier-if). Each argument is retyped to what it is read as. Where
+    /// the parts held whole are of no carrier or of two, nothing is read, as before: the listed
+    /// `3` then reached the `int` arrow, which the class (no `int` for `1 / 2`) does not take,
+    /// and the application was refused. A value no read keeps, as `9007199254740993` at `f64`,
+    /// is refused by [`Self::unread_call`].
+    ///
+    /// Complexity tradeoff: one pass over the arguments for the parts held whole, O(1) per
+    /// argument (`whole_carriers`), and one read per listed argument, O(v log v) in the `v`
+    /// values its type lists ([`Self::read_adopting`]), only where some argument lists values.
+    /// The naive form, each value of the listed argument tried against the class on each
+    /// arrow, keeps the `int` path that refuses the application.
+    fn read_beside_class(
+        &mut self,
+        what: &str,
+        args: &mut [Option<Arg<'a>>],
+        span: Span,
+    ) -> Result<(), String> {
+        let listed =
+            |ck: &Self, a: &Arg| values_alone(&a.ty) && ck.readable(a) && lists_a_number(&a.ty);
+        if !args.iter().flatten().any(|a| listed(self, a)) {
+            return Ok(());
+        }
+        let whole: BTreeSet<Carrier> = (args.iter().flatten())
+            .filter(|a| a.lit.is_none() && a.branches.is_none() && a.parts.is_none())
+            .flat_map(|a| whole_carriers(&a.ty))
+            .collect();
+        let [&c @ (Carrier::F64 | Carrier::F32 | Carrier::Rat)] =
+            whole.iter().collect::<Vec<_>>()[..]
+        else {
+            return Ok(());
+        };
+        for i in 0..args.len() {
+            let Some(a) = args[i].as_ref().filter(|a| listed(self, a)) else {
+                continue;
+            };
+            let e = a.expr.expect("a call or an `if` read at a carrier");
+            let t = match self.read_adopting(a, c) {
+                Some(Ok((t, ads))) => {
+                    for (s, v) in ads {
+                        self.put(Undo::Adopt(s, Some(v)));
+                    }
+                    t
+                }
+                Some(Err(v)) => return Err(self.unread_call(what, args, a, &v, c, true)),
+                None => continue,
+            };
+            self.put_read(e.span, c, span);
+            if let Some(a) = &mut args[i] {
+                a.ty = t;
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::apply`] of a signature of several arrows, each over one carrier or a tuple:
     /// an operator, a prelude word, or a section of one. The classes of the arguments merge,
     /// since every arrow but `f32 ^ int` takes one carrier for all its parameters, and its
@@ -30016,6 +30102,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         }
         let kept: Vec<usize> = match class {
             Some(k) => {
+                self.read_beside_class(what, args, span)?;
                 // A literal joins the class, and so does each branch of an `if` of literals,
                 // which has no other operand and takes the class's carrier from a parameter
                 // of it, as a lone literal argument does ([`Lit::joining`]).
@@ -33902,7 +33989,7 @@ pub(super) fn permuted_sig(s: &Sig, e: &Sig, from: &[usize], inv: &[usize]) -> (
         dense: s.dense,
         keys: s.keys.clone(),
         word: s.word.clone(),
-        needs: needs_in_order(&kept, from),
+        needs: needs_in_order(&kept, from).into(),
         own,
         held: s.held.clone(),
         named: s.named,
@@ -34016,7 +34103,7 @@ fn without_needs(s: &Sig) -> Sig {
         let changed = !g.needs.is_empty() || fns().any(|f| done[&Arc::as_ptr(f)].is_some());
         let bare = changed.then(|| {
             let mut b = g.clone();
-            b.needs = Vec::new();
+            b.needs = Default::default();
             for a in &mut b.arrows {
                 a.result.fns = (a.result.fns.iter())
                     .map(|f| done[&Arc::as_ptr(f)].as_ref().unwrap_or(f).clone())
@@ -34100,7 +34187,7 @@ fn param_alone(sig: &Sig, j: usize) -> Sig {
         dense: sig.dense,
         keys: sig.keys.clone(),
         word: None,
-        needs: Vec::new(),
+        needs: Default::default(),
         own,
         held: BTreeSet::new(),
         named: sig.named,
@@ -34792,7 +34879,7 @@ mod tests {
             dense: Dense::No,
             keys: None,
             word: None,
-            needs: Vec::new(),
+            needs: Default::default(),
             own: BTreeSet::new(),
             held: BTreeSet::new(),
             named: 0,

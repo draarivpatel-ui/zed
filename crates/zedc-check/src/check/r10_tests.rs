@@ -155,6 +155,7 @@ fn info_eq_full(label: &str, e: &Info, d: &Info) -> Result<(), String> {
         quotients: _,
         ints: _,
         follows: _,
+        follows_own: _,
         witness: _,
         dense: _,
         brackets: _,
@@ -236,6 +237,9 @@ fn info_eq_full(label: &str, e: &Info, d: &Info) -> Result<(), String> {
     }
     if e.follows != d.follows {
         return Err(format!("{label}: follows mismatch"));
+    }
+    if e.follows_own != d.follows_own {
+        return Err(format!("{label}: follows_own mismatch"));
     }
     if e.witness != d.witness {
         return Err(format!("{label}: witness mismatch"));
@@ -576,7 +580,8 @@ fn r10_m66_neg_keep_map_lambda_and_decode_generalize() {
         }
     }
     assert_ne!(
-        e_h1.needs, decoded_broken,
+        e_h1.needs.as_slice(),
+        decoded_broken.as_slice(),
         "Control A: decoding without clearing Map.lambda must disagree with E on lambda n=2"
     );
 
@@ -1064,9 +1069,9 @@ fn r10_m31_split_memo_keeps_a_child_shared_with_a_queued_sibling() {
         },
         ..direct.clone()
     };
-    let signature = |needs| {
+    let signature = |needs: Vec<Need>| {
         let mut sig = Sig::one(vec![], vec![], Ty::empty());
-        sig.needs = needs;
+        sig.needs = needs.into();
         Arc::new(sig)
     };
     let leaf = signature(vec![direct.clone()]);
@@ -1502,7 +1507,7 @@ fn r10_exit_replaced_by_an_outer_variable_keeps_the_flat_digest() {
     let compare = |compact: &Sig| {
         let mut flat = compact.clone();
         let (needs, own) = compact.decoded_needs_and_own();
-        flat.needs = needs.into_owned();
+        flat.needs = needs.into_owned().into();
         flat.own = own.into_owned();
         flat.facts = Default::default();
         assert_eq!(compact, &flat, "compact and flat must be equal");
@@ -1599,7 +1604,7 @@ fn r10_exit_replaced_in_a_callee_keeps_the_flat_digest() {
 
     let mut flat = parent.clone();
     let (needs, own) = parent.decoded_needs_and_own();
-    flat.needs = needs.into_owned();
+    flat.needs = needs.into_owned().into();
     flat.own = own.into_owned();
     flat.facts = Default::default();
     assert_eq!(parent, flat, "compact and flat must be equal");
@@ -2140,20 +2145,15 @@ fn many_runs_wide_skip_src(n: usize) -> String {
     s
 }
 
-/// Step 1 of the closed-sibling repair: `generalize` names each internal run of a forward in
-/// one step against the signature's skip set. Reading the whole skip set at each run made n
-/// runs against n skipped names cost O(n^2); the set is now sorted once per signature.
+/// Step 1 of the closed-sibling repair at small n: n internal runs named against n skipped
+/// names check with no error. Its scaling test is
+/// `bench::r10_generalize_runs_against_a_wide_skip_set_scale`.
 #[test]
-fn r10_generalize_runs_against_a_wide_skip_set_scale() {
-    let inputs = crate::scaling::inputs(400, many_runs_wide_skip_src);
-    crate::scaling::check(
-        "generalize naming n internal runs against n skipped names",
-        400,
-        |n| {
-            let (d, _) = run_with_cfg(&inputs[&n], R10Config::default());
-            assert!(d.errors.is_empty(), "errors {:?}", d.errors);
-        },
-    );
+fn r10_generalize_runs_against_a_wide_skip_set() {
+    for n in 1..=8 {
+        let (d, _) = run_with_cfg(&many_runs_wide_skip_src(n), R10Config::default());
+        assert!(d.errors.is_empty(), "n = {n}: errors {:?}", d.errors);
+    }
 }
 
 /// Landing review round 2, Opus L2-C1 and Neon L2-B2: two closed lambdas inside one function,
@@ -2263,22 +2263,6 @@ fn r10_chain2_siblings_name_as_e_does() {
             );
         }
     }
-}
-
-/// Step 4 of the closed-sibling repair: naming n sibling forwards' runs apart against a skip
-/// set of n names cuts each run only where it meets a name given before, so the whole costs
-/// O(n log n), not one name at a time per run.
-#[test]
-fn r10_chain2_siblings_wide_skip_set_scale() {
-    let inputs = crate::scaling::inputs(200, chain2_siblings_src);
-    crate::scaling::check(
-        "finishing n sibling chain-2 forwards against n skipped names",
-        200,
-        |n| {
-            let (d, _) = run_with_cfg(&inputs[&n], R10Config::default());
-            assert!(d.errors.is_empty(), "errors {:?}", d.errors);
-        },
-    );
 }
 
 /// Landing review round 2, Opus C2: a function that holds a forward call and returns a lambda
@@ -2427,7 +2411,7 @@ fn landing4_cached_digest_must_follow_need_span() {
     let compare = |compact: &Sig| {
         let mut flat = compact.clone();
         let (needs, own) = compact.decoded_needs_and_own();
-        flat.needs = needs.into_owned();
+        flat.needs = needs.into_owned().into();
         flat.own = own.into_owned();
         assert_eq!(compact, &flat);
         (compact.digest(), flat.digest())
@@ -2481,7 +2465,7 @@ fn landing4_compound_first_appearance() {
     }
     let mut flat = compact.clone();
     let (needs, own) = compact.decoded_needs_and_own();
-    flat.needs = needs.into_owned();
+    flat.needs = needs.into_owned().into();
     flat.own = own.into_owned();
 
     let NeedKind::Fwd(fwd) = &compact.needs[0].kind else {
@@ -2572,7 +2556,7 @@ fn landing4_public_replace_reaches_hidden_results() {
         .unwrap();
     let mut flat = Sig::clone(compact);
     let (needs, own) = compact.decoded_needs_and_own();
-    flat.needs = needs.into_owned();
+    flat.needs = needs.into_owned().into();
     flat.own = own.into_owned();
     assert_eq!(**compact, flat);
     assert!(!compact.own.contains(&hidden));
@@ -2706,7 +2690,7 @@ fn landing4_direct_result_replaced_in_a_callee_keeps_the_flat_digest() {
     parent.facts = Default::default();
     let mut flat = parent.clone();
     let (needs, own) = parent.decoded_needs_and_own();
-    flat.needs = needs.into_owned();
+    flat.needs = needs.into_owned().into();
     flat.own = own.into_owned();
     flat.facts = Default::default();
     assert_eq!(parent, flat);
@@ -4554,5 +4538,6 @@ fn chain_e1_held_names_are_renamed_compared_and_listed_as_e_does() {
     );
 }
 
+mod bench;
 mod expected;
 mod landing6_battery;

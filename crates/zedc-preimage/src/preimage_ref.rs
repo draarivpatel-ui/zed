@@ -134,17 +134,19 @@
 //! restrictions waiting (`Parts1d`, REF-nested-moduli-state) 12.07 and 8.12, against
 //! state growth (label pieces reaching the chain's input) of 12.1 and 8.84. Measured
 //! T(8n)/T(n), the
-//! larger of the instruction and byte ratios, over the 48 families of the scaling tests
-//! (`l01_25_preimage_catalog::ref_memo`, load about 37 on 32 cores): at most 10.6
-//! (`normal_abs_gap` at 16 links, the log term of the path copies of the persistent inverse
-//! tree; timed at 1024 links its test measures 9.67, row REF-normal-abs-gap), 9.0 to
-//! 10.4 on six more (`normal_min_gap`, `normal_round_down`,
-//! `pathological_abs`, `normal_holey_guards`, `normal_mod_chain`, `normal_div_chain`), under 9 on
-//! the rest; `output_grid` (four values demanded, 4n pieces) 8.0 from 64 to 512 links, and with
-//! 64 and 512 values demanded at 1024 links (8 times the pieces) 5.0 times the instructions and
-//! 5.7 times the bytes; `nested_moduli_eq_4096` 4.7 from 160 to 1280 links, multiples of 10 so
-//! that both put the same constants next to the root. Main exceeds 13 on 24 of the 38 families it
-//! finishes within 60 s (17.8 to 2,965), and 10 do not finish within 60 s. Main's answer dump
+//! larger of the instruction and byte ratios, over the 55 families of the scaling tests (the
+//! 53 of `l01_25_preimage_catalog::ref_memo::FAMILIES`, `random_chains` and
+//! `nested_moduli_eq_4096_at_6`; `bench::ref_memo`, 2026-11-22, after REF-abs-split-join):
+//! at most 9.79 (`normal_abs_gap` at 1024 links, bytes; the log term of the path copies of the
+//! persistent inverse tree, row PERF-ref-abs-gap-under-9), 9.0 to 9.6 on four more
+//! (`normal_min_gap` 9.53, `normal_holey_guards` 9.33, `normal_round_down` 9.02,
+//! `normal_mod_chain` 9.01), under 9 on the other 50 (at most 8.78, `nested_moduli_eq` from
+//! 128 to 1024 links); `output_grid` (four values demanded, 4n pieces) 8.05 from 64 to 512
+//! links, and with 64 and 512 values demanded at 1024 links (8 times the pieces) 5.11 times the
+//! instructions and 5.66 times the bytes; `nested_moduli_eq_4096` 6.91 from 160 to 1280 links,
+//! multiples of 10 so that both put the same constants next to the root. On the 48 families
+//! the item started with, main exceeds 13 on 24 of the 38 it finishes within 60 s (17.8 to
+//! 2,965), and 10 do not finish within 60 s. Main's answer dump
 //! (182,747 calls): 182,327 the same, 420 finer, none coarser or unsound. Size against main:
 //! 2,547 lines added and 117 removed, this section included.
 //!
@@ -157,6 +159,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use zed_collections::index::to_u32;
 use zed_kernel::{Prim, Shared, Term, Value, eval};
@@ -5034,6 +5037,7 @@ impl<'t> Tx<'t> {
             #[cfg(feature = "counts")]
             if matches!(step.kind, StepKind::If(..)) {
                 crate::preimage::counts::note_if_tree_nodes(|| tree_nodes(&st.excl));
+                crate::preimage::counts::note_if_tree_seams(|| tree_seams(&st.excl));
             }
             let top = unbranched.contains(&u);
             let mut child = |c, next| {
@@ -5142,7 +5146,10 @@ struct PartitionNode {
     min_lo: End,
     max_hi: End,
     span: (End, End),
-    boundaries: Boundaries,
+    /// The cuts of the subtree, in the node's coordinates: made by [`node_boundaries`] when
+    /// `tree_round` first reads them, then kept through tags (`tree_apply`) and scaling
+    /// (`tree_division`) like the keys.
+    boundaries: OnceLock<Boundaries>,
     height: usize,
     data: Contents,
     lazy: ValTag,
@@ -5185,7 +5192,11 @@ impl Boundaries {
             (None, _) => other.clone(),
             (_, None) => self.clone(),
             (Some(a), Some(b)) => Self {
-                anchor: Some(a.clone()),
+                anchor: Some({
+                    #[cfg(feature = "counts")]
+                    crate::preimage::counts::note_boundary_gcds(2);
+                    a.clone()
+                }),
                 step: self.step.gcd(&other.step).gcd(&(a - b)),
             },
         }
@@ -5199,6 +5210,48 @@ impl Boundaries {
             });
         }
     }
+}
+/// The cuts of the subtree at `n`, in `n`'s coordinates: every finite `lo` and `hi + 1` of its
+/// nodes, as an anchor (one of them) and a step (the gcd of their differences). Only
+/// `tree_round` reads them, so they are made here on its first read and kept in the node
+/// (REF-boundaries-gate); a node built and never rounded takes no gcd. Before, `tree_parts`
+/// joined them at every node built, two gcds a node, on chains with no `Round` at all.
+///
+/// Proof that `tree_round` reads the same answer as with the cuts joined at every build:
+/// 1. Both describe the same set of points P: the keys of the subtree, each child's mapped
+///    through `n.lazy` (`apply`), since `tree_apply` maps a node's own key at once and its
+///    children's only through the tag it composes into `lazy`. Tags are shifts `x + s` and
+///    reflections `s + 1 - x`, scaling (`tree_division`) is `x * c`; each maps `lo` and
+///    `hi + 1` to the mapped key's `lo` and `hi + 1`, so mapping the cuts maps P.
+/// 2. `join` keeps step = gcd of all differences of P, whatever the order and grouping of the
+///    joins: gcd(step_a, step_b, a - b) for a in A, b in B is the gcd of the differences
+///    within A, within B, and between them (each difference between them is a - b plus a
+///    combination of the steps). Shifts and reflections keep every |difference|, and scaling
+///    by c multiplies each by c, as `apply` and `tree_division` do to the step.
+/// 3. The anchor is some point of P, which may differ between the two orders; `tree_round`
+///    reads it only when m divides the step, that is, when all of P is one residue mod m,
+///    and then reads only `anchor mod m`, the same for every point of P.
+/// 4. A node keeps its cuts once made, and `tree_parts` makes every changed node anew, so a
+///    kept value is never that of an older subtree.
+///
+/// Complexity tradeoff: each node instance computes its cuts at most once, from its children's
+/// kept cuts, two gcds and a tag; a node copied by `Arc::make_mut` before the first read
+/// computes them in each copy that is read. So `tree_round` costs at most what the joins at
+/// every build cost before (each node `tree_parts` built joined them once), and nothing on a
+/// chain that never rounds. Recursion is as deep as the AVL height, O(log p). Test:
+/// `ref_memo::only_a_chain_with_a_round_takes_gcds_for_the_cuts`, and the answers of every
+/// family against main's in
+/// `ref_memo::every_family_keeps_main_s_answers_through_the_inverse_tree_changes`.
+fn node_boundaries(n: &PartitionNode) -> &Boundaries {
+    n.boundaries.get_or_init(|| {
+        let mut b = Boundaries::key(&n.lo, &n.hi);
+        for c in [&n.left, &n.right].into_iter().flatten() {
+            let mut cb = node_boundaries(c).clone();
+            cb.apply(&n.lazy);
+            b = b.join(&cb);
+        }
+        b
+    })
 }
 fn ceil_grid(e: &End, m: &Num) -> End {
     match e {
@@ -5215,9 +5268,9 @@ fn tree_round(tree: Tree, m: &Num) -> Tree {
     // preserves the same grid inverse and reduces measured round-down byte R
     // from 9.70 to 9.50 (16..128), without changing the asymptotic traversal.
     let n = tree.as_ref()?;
-    if n.boundaries.step.rem_euclid(m).is_zero() {
-        let residue = n
-            .boundaries
+    let boundaries = node_boundaries(n);
+    if boundaries.step.rem_euclid(m).is_zero() {
+        let residue = boundaries
             .anchor
             .as_ref()
             .map_or(Num::ZERO, |a| a.rem_euclid(m));
@@ -5227,17 +5280,73 @@ fn tree_round(tree: Tree, m: &Num) -> Tree {
     let mut arc = tree?;
     let n = Arc::make_mut(&mut arc);
     let data = n.data.clone();
-    let left = tree_round(tree_apply(n.left.take(), &n.lazy), m);
-    let right = tree_round(tree_apply(n.right.take(), &n.lazy), m);
-    let (lo, hi) = (ceil_grid(&n.lo, m), ceil_grid(&n.hi.succ(), m).pred());
+    let mut left = tree_round(tree_apply(n.left.take(), &n.lazy), m);
+    let mut right = tree_round(tree_apply(n.right.take(), &n.lazy), m);
+    let (mut lo, mut hi) = (ceil_grid(&n.lo, m), ceil_grid(&n.hi.succ(), m).pred());
     if lo > hi {
-        tree_join(left, right)
-    } else if tree_height(&left).abs_diff(tree_height(&right)) <= 1 {
+        return tree_join_merged(left, right);
+    }
+    // Rounding widens each piece to whole grid cells and drops a piece with no grid point, so
+    // two pieces with one label that had a gap or a dropped piece between them can come to
+    // touch (REF-merge-equal-labels). By induction no such pair made by rounding is left inside
+    // either rounded subtree, so the only new pairs are this piece with the last piece of `left`
+    // and the first of `right`: two O(h) edge reads (`tree_edge`, O(p) over the whole tree),
+    // a label comparison only where the values touch, and an O(h) removal for each pair merged.
+    // Test: `ref_memo::abs_and_round_leave_no_touching_pieces_with_one_label`.
+    let before = tree_edge(&left, true)
+        .filter(|(key, label)| key.1.succ() == lo && **label == data)
+        .map(|(key, _)| key.0);
+    if let Some(start) = before {
+        lo = start;
+        left = tree_split_last(left.as_ref().expect("a last piece")).0;
+    }
+    let after = tree_edge(&right, false)
+        .filter(|(key, label)| hi.succ() == key.0 && **label == data)
+        .map(|(key, _)| key.1);
+    if let Some(end) = after {
+        hi = end;
+        right = tree_split_first(right.as_ref().expect("a first piece")).0;
+    }
+    if tree_height(&left).abs_diff(tree_height(&right)) <= 1 {
         *n = tree_parts((lo, hi), data, left, right);
         Some(arc)
     } else {
         tree_node((lo, hi), data, left, right)
     }
+}
+/// The first piece of `t` (`last` false) or its last, with its label, read through the tags on
+/// the way down as `tree_collect_at` does, copying nothing: O(h), h the AVL height of `t`.
+/// `tree_round` reads the two edges of each subtree it builds; the heights of the subtrees of a
+/// balanced tree of p nodes add up to O(p), so those reads cost O(p) in all.
+fn tree_edge(t: &Tree, last: bool) -> Option<((End, End), &Contents)> {
+    let mut tag = ValTag::id();
+    let mut n = t.as_ref()?;
+    loop {
+        // A reflecting tag reverses the order, so the edge is then in the other child.
+        let next = if last ^ tag.0 { &n.right } else { &n.left };
+        match next {
+            Some(c) => {
+                tag = tag.compose(&n.lazy);
+                n = c;
+            }
+            None => return Some((tag.map_range(&n.lo, &n.hi), &n.data)),
+        }
+    }
+}
+/// `tree_join` of two rounded trees, `left` below `right`, that makes the last piece of `left`
+/// and the first of `right` one piece when they touch and have one label (REF-merge-equal-labels):
+/// O(log p) for the two edges, the two removals and the join.
+fn tree_join_merged(left: Tree, right: Tree) -> Tree {
+    let touch = match (tree_edge(&left, true), tree_edge(&right, false)) {
+        (Some((a, la)), Some((b, lb))) if a.1.succ() == b.0 && la == lb => Some((a.0, b.1)),
+        _ => None,
+    };
+    let Some(key) = touch else {
+        return tree_join(left, right);
+    };
+    let (left, _, data) = tree_split_last(left.as_ref().expect("a last piece"));
+    let (right, _, _) = tree_split_first(right.as_ref().expect("a first piece"));
+    tree_node(key, data, left, right)
 }
 impl State1d {
     fn round(self, c: i64) -> Self {
@@ -5249,6 +5358,17 @@ impl State1d {
 
 fn tree_height(t: &Tree) -> usize {
     t.as_ref().map_or(0, |n| n.height)
+}
+/// The pairs of neighbors of `t` whose values touch (one ends at v, the next starts at v + 1)
+/// and whose input labels are equal: two nodes where one would do. O(p) node visits plus the
+/// label comparisons.
+#[cfg(feature = "counts")]
+fn tree_seams(t: &Tree) -> usize {
+    let mut v = Vec::new();
+    tree_collect(t, &mut v);
+    v.windows(2)
+        .filter(|w| w[0].1.succ() == w[1].0 && w[0].2 == w[1].2)
+        .count()
 }
 /// The nodes of `t`, O(p) for p nodes; the recursion is as deep as the AVL height, O(log p).
 #[cfg(feature = "counts")]
@@ -5280,8 +5400,10 @@ fn tree_division(t: Tree, c: &Num) -> Tree {
     n.hi = upper(&n.hi);
     n.min_lo = lower(&n.min_lo);
     n.max_hi = upper(&n.max_hi);
-    n.boundaries.anchor = n.boundaries.anchor.as_ref().map(|a| a * c);
-    n.boundaries.step = &n.boundaries.step * c;
+    if let Some(b) = n.boundaries.get_mut() {
+        b.anchor = b.anchor.as_ref().map(|a| a * c);
+        b.step = &b.step * c;
+    }
     Some(arc)
 }
 fn tree_parts((lo, hi): (End, End), data: Contents, left: Tree, right: Tree) -> PartitionNode {
@@ -5293,12 +5415,8 @@ fn tree_parts((lo, hi): (End, End), data: Contents, left: Tree, right: Tree) -> 
         xlo = xlo.min(n.span.0.clone());
         xhi = xhi.max(n.span.1.clone());
     }
-    let mut boundaries = Boundaries::key(&lo, &hi);
-    for n in [&left, &right].into_iter().flatten() {
-        boundaries = boundaries.join(&n.boundaries);
-    }
     PartitionNode {
-        boundaries,
+        boundaries: OnceLock::new(),
         min_lo: left
             .as_ref()
             .map_or_else(|| lo.clone(), |n| n.min_lo.clone()),
@@ -5324,7 +5442,9 @@ fn tree_apply(tree: Tree, tag: &ValTag) -> Tree {
     }
     let mut arc = tree?;
     let n = Arc::make_mut(&mut arc);
-    n.boundaries.apply(tag);
+    if let Some(b) = n.boundaries.get_mut() {
+        b.apply(tag);
+    }
     (n.lo, n.hi) = tag.map_range(&n.lo, &n.hi);
     (n.min_lo, n.max_hi) = tag.map_range(&n.min_lo, &n.max_hi);
     if tag.0 {
@@ -5397,16 +5517,54 @@ fn tree_single(lo: End, hi: End, data: Contents) -> Tree {
         tree_node((lo, hi), data, None, None)
     }
 }
+/// The tree of `a`'s pieces followed by `b`'s (every value of `a` below every value of `b`).
+///
+/// This is `join2` of Blelloch, Ferizovic and Sun, "Just Join for Parallel Ordered Sets",
+/// SPAA 2016, doi:10.1145/2935764.2935768, arXiv:1602.02120 (which takes out the last key of
+/// the left tree): take out the first piece of `b` when `a` is at least as tall, else the last
+/// piece of `a`, so the shorter tree loses it, and put it back as the middle key of `join`
+/// (`tree_node`), which walks down the taller tree only until the heights match,
+/// O(|h_a - h_b| + 1). Taking out a first or last piece is O(h) with O(1) work a level
+/// ([`tree_split_first`]), so the whole join is O(log p) node copies (REF-abs-split-join).
+/// Before, the join walked down the right spine of `a` and the
+/// left spine of `b` in turn to the leaves, calling `tree_node` at each level with heights that
+/// could differ by more than 2, so each level could walk again. Test: the answers of every
+/// family in `ref_memo::every_family_keeps_main_s_answers_through_the_inverse_tree_changes`,
+/// and `bench::ref_memo::normal_abs_gap_scales`.
 fn tree_join(a: Tree, b: Tree) -> Tree {
     match (a, b) {
         (None, t) | (t, None) => t,
         (Some(a), Some(b)) if a.height >= b.height => {
-            let (ad, al, ar) = tree_push(&a);
-            tree_node(a.key(), ad, al, tree_join(ar, Some(b)))
+            let (b, key, data) = tree_split_first(&b);
+            tree_node(key, data, Some(a), b)
         }
         (Some(a), Some(b)) => {
-            let (bd, bl, br) = tree_push(&b);
-            tree_node(b.key(), bd, tree_join(Some(a), bl), br)
+            let (a, key, data) = tree_split_last(&a);
+            tree_node(key, data, a, Some(b))
+        }
+    }
+}
+/// The tree at `n` without its first piece, and that piece. Each level puts back a left child
+/// at most one shorter than before beside its right child, a height difference of at most 2,
+/// so `tree_node` does O(1) work a level: O(h) in all, h the AVL height of `n`.
+fn tree_split_first(n: &PartitionNode) -> (Tree, (End, End), Contents) {
+    let (data, left, right) = tree_push(n);
+    match left {
+        None => (right, n.key(), data),
+        Some(l) => {
+            let (l, key, first) = tree_split_first(&l);
+            (tree_node(n.key(), data, l, right), key, first)
+        }
+    }
+}
+/// The tree at `n` without its last piece, and that piece; the mirror of [`tree_split_first`].
+fn tree_split_last(n: &PartitionNode) -> (Tree, (End, End), Contents) {
+    let (data, left, right) = tree_push(n);
+    match right {
+        None => (left, n.key(), data),
+        Some(r) => {
+            let (r, key, last) = tree_split_last(&r);
+            (tree_node(n.key(), data, left, r), key, last)
         }
     }
 }
@@ -5707,10 +5865,27 @@ impl State1d {
         // so the remaining inverse tree can use value order throughout.
         self.apply_tag(&ValTag::reflect(c as i128))
     }
+    /// The inverse of `abs`: the label of `u` is the label of `|u|`, so the tree is the pieces
+    /// at or above 0 (P), their reflection `-P` below, and the piece at 0, `[0, h]`, made one
+    /// piece `[-h, h]`: `join(-(P without it), [-h, h], P without it)` (REF-abs-split-join).
+    /// Each part is in value order below the next, so `tree_join` and `tree_node` (`join` of
+    /// Blelloch, Ferizovic and Sun 2016) put them together in O(log p), against the
+    /// `tree_union` of P and -P before, which walked both and cut `[0, h]` and `[-h, 0]` into
+    /// `[-h, -1]`, `[0, 0]`, `[1, h]`, three pieces with one label (REF-merge-equal-labels:
+    /// `ref_memo::abs_and_round_leave_no_touching_pieces_with_one_label`). The reflection is a
+    /// tag on the root, O(1), and shares P's nodes.
     fn abs(self) -> Self {
         let mut st = self;
+        let neg = ValTag::neg();
         let pos = tree_restrict(&st.excl, &End::of(0), &PosInf);
-        st.excl = tree_union(pos.clone(), tree_apply(pos, &ValTag::neg()));
+        st.excl = match &pos {
+            Some(p) if p.min_lo == End::of(0) => {
+                let (rest, (_, hi), data) = tree_split_first(p);
+                let below = tree_apply(rest.clone(), &neg);
+                tree_node((neg.map_end(&hi), hi), data, below, rest)
+            }
+            _ => tree_join(tree_apply(pos.clone(), &neg), pos),
+        };
         st
     }
     fn minmax(self, p: Prim, c: i64) -> Self {
