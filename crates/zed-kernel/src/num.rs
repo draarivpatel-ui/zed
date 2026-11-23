@@ -2288,8 +2288,13 @@ fn valuation_upto(n: BigInt, p: u64, cap: u64) -> (u64, BigInt) {
 /// 6,493 bits up, against 0.45 to 4.5 times at 51,998 bits (2026-11-23, Colab, the
 /// test of `zed_alloc_count::allocated` per step), so the text of `q * 3^n` allocated 18.6
 /// times the bytes at `8n` (`the_text_of_a_prime_word_times_a_power_held_as_digits_scales`).
-/// From the top, each remainder is of a number below the square of its divisor, so its
-/// memory is O(width), and the widths halve. 4096 bits, 64 words, is the division's leaf
+/// From the top, each remainder is of a number below the square of its divisor, and the
+/// widths halve, so the method's own memory is O(N); but the remainder by the widest power
+/// and the divisions by it and by `p^v` have short quotients, which `fast::div_rem` sends to
+/// num-bigint, whose Burnikel-Ziegler recursion copies the divisor's halves (plan row
+/// KERNEL-bz-short-quotient), so the valuation of `q 3^v` still allocated 10.9 times the
+/// bytes from `v = 2^15` to `2^18` (1,094,432 and 11,947,280), against 18.2 on the way up;
+/// not proved O(N) until that row is done. 4096 bits, 64 words, is the division's leaf
 /// `fast::DIV_LEAF` and lies between the two measured groups. Both ways find the same `J` and
 /// `x` (the proof at [`valuation_upto`]); tested by
 /// `valuations_from_the_top_agree_with_the_tests_on_the_way_up`.
@@ -3531,8 +3536,8 @@ mod tests {
     /// `valuation` against division by `p` one at a time, on `c p^v` for powers `v` either side
     /// of the step from the tests on the way up to those from the top (`WHOLE_TEST_BITS`, at
     /// `v` of 2048 to 4096 for `p = 3`), cofactors `c` that `p` divides and does not, and with
-    /// a cap, which keeps the tests on the way up; and the growth of the bytes it allocates
-    /// for `q 3^v` from `v` to `8v`.
+    /// a cap, which keeps the tests on the way up; and the bytes it allocates for `q 3^v`
+    /// against those of the tests on the way up.
     #[test]
     fn valuations_from_the_top_agree_with_the_tests_on_the_way_up() {
         fn by_one(mut n: BigInt, p: u64) -> (u64, BigInt) {
@@ -3572,20 +3577,26 @@ mod tests {
                 }
             }
         }
-        // The step it guards: the bytes for `q 3^v`, `q = 2^61 - 1`, at `v` and `8v` grow less
-        // than 10.5 times, where the tests on the way up allocated 18.2 times (1,178,696 and
-        // 21,410,592 bytes, 2026-11-23, Colab). Allocation counts are deterministic.
-        let q = BigInt::from(m61);
-        let bytes = [1u32 << 15, 1 << 18].map(|v| {
-            let n = &q * BigInt::from(3).pow(v);
+        // The step it guards, against the tests on the way up on the same input (a cap of
+        // `u64::MAX - 1` keeps them): `q 3^(2^18)`, `q = 2^61 - 1`, 415,550 bits, took
+        // 11,947,280 bytes from the top and 21,410,592 on the way up (2026-11-23, Colab);
+        // allocation counts are deterministic. Not held to 10.5 from `v` to `8v`: from `2^15`
+        // to `2^18` it grows 10.9 times (1,094,432 to 11,947,280), all of it in divisions with
+        // a short quotient (`r_T = n mod P_T` 10.4 times, the division of `n` by `P_T` and by
+        // `p^v` 11.9 times each), which `fast::div_rem` sends to num-bigint, whose
+        // Burnikel-Ziegler recursion copies the divisor's halves however short the quotient:
+        // plan row KERNEL-bz-short-quotient, which owns that fix in num/fast.rs. The whole
+        // text of such a number is held to 10.5 by
+        // `bench::kept_powers::the_text_of_a_prime_word_times_a_power_held_as_digits_scales`
+        // (9.8 times the bytes).
+        let n = BigInt::from(m61) * BigInt::from(3).pow(1u32 << 18);
+        let bytes = [u64::MAX, u64::MAX - 1].map(|cap| {
             let before = zed_alloc_count::allocated();
-            let (k, _) = valuation(n.clone(), 3);
-            let bytes = zed_alloc_count::allocated() - before;
-            assert_eq!(k, u64::from(v));
-            eprintln!("valuation of q 3^{v}: {bytes} bytes for {} bits", n.bits());
-            bytes
+            let (k, _) = valuation_upto(n.clone(), 3, cap);
+            assert_eq!(k, 1 << 18);
+            zed_alloc_count::allocated() - before
         });
-        assert!(bytes[1] * 2 < bytes[0] * 21, "{bytes:?}");
+        assert!(bytes[0] * 3 < bytes[1] * 2, "{bytes:?}");
     }
 
     #[test]
