@@ -261,6 +261,24 @@ fn products_whose_premise_holds_k_atoms_in_no_product_scale() {
 }
 
 #[test]
+fn products_beside_a_sum_whose_atoms_have_products_scale() {
+    // Each `w{j}` is on the sum, paired with k rows `c{j}`, and on `y - w{j}`, paired with
+    // `x - 1`: the test of `{x - 1, y - w{j}}` read k pairs from `x` or from `w{j}` (Θ(k²),
+    // 61.8 times at 8k on the port of XR-presburger4 round 1, Claude F3); it looks up the one
+    // pair of `x - 1` with each row on `w{j}` instead (`pairs::Index::frees`, A4).
+    let n = 1000;
+    let built = scaling::inputs(n, sum_beside_products_of_its_atoms);
+    let measure = move || {
+        scaling::check("a sum beside products of its atoms", n, |k| {
+            let (p, g) = &built[&k];
+            let e = entails(p, g);
+            assert!(matches!(e, Entailment::Proved(_)), "{k}: {e}");
+        });
+    };
+    scaling::on_a_thread(8 << 20, measure);
+}
+
+#[test]
 fn products_whose_factors_one_sum_joins_scale() {
     // One cluster holds all k links, so a solver search over the cluster for each open side
     // cost O(sides × cluster): 41 times the instructions at 8n with the sum on `b{i}` itself
