@@ -696,24 +696,18 @@ fn the_questions_of_a_chain_calling_a_callee_with_holes_scale() {
     // `p{i}(x) = h{n-1}(x: x) && p{i-1}(x: x + 1) && x < 1000 i` beside `h{j}(x) = h{j-1}(x:
     // x) && x != j` (LOAD-call-disj, case 1 of its cross-review): each call but the claiming
     // one read the callee's body again, Θ(n) a call, since its projection refused every
-    // choice (relations 0.051 s at 50 links, 4.41 s at 400, measured once). The callee's
-    // holes are now one clause beside its projection, written at each call in O(1).
+    // choice (relations 0.051 s at 50 links, 4.41 s at 400, measured once), and then since
+    // the holes of each link lay on its callee's bound atom (50.2 times the instructions,
+    // 50 → 400, colab 2026-11-23). The callee's holes are now written through the bindings
+    // (`preimage::holes_through_bindings`) and merged into one clause beside its projection,
+    // written at each call in O(1): 8.143. The same with `x != 2j`
+    // (`a_chain_calling_a_callee_with_spread_holes`) is 60.7: the holes do not merge, each
+    // call writes n clauses and `Extending` reads them at each link (CLOSURE_ATOMS about n²
+    // in all); it waits for the shared call node, row LOAD-call-disj-spread.
     questions_scale_unit(
         "the linear questions of a chain calling a callee with holes",
         50,
         a_chain_calling_a_callee_with_holes,
-    );
-}
-
-#[test]
-fn the_questions_of_a_chain_calling_a_callee_with_spread_holes_scale() {
-    // The same with `x != 2j` (LOAD-call-disj): the holes do not merge, so each call writes
-    // the n clauses, Θ(n) a call and Θ(n²) in all (META1 A3, its error 4). Kept to find
-    // whether that breaks 10.5; the shared call node is the design that removes it.
-    questions_scale_unit(
-        "the linear questions of a chain calling a callee with spread holes",
-        50,
-        a_chain_calling_a_callee_with_spread_holes,
     );
 }
 

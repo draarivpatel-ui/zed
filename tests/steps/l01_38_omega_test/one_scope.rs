@@ -893,7 +893,8 @@ fn xr_face_f3_unclaimed_call() {
 
 /// R2-C-zed (XR-sound-extend-face-local-atoms round 2, Claude's form): two calls of `r`, so
 /// that neither claims it and the quotient passed as `y` reaches the interface of the call.
-/// `s` holds nowhere: `x > 8` and `x div 2 < 3` conflict.
+/// `s` holds nowhere: `x > 8` and `x div 2 < 3` conflict. Red on 1ff1aed1a (`s` answered
+/// true there), green now; the same holds for the form below.
 #[test]
 fn xr_face_f3_two_calls_of_one_callee() {
     answers_are_those_of_the_whole(
@@ -3055,7 +3056,12 @@ fn the_answers_of_calls_of_a_callee_that_chooses_are_those_reading_bodies() {
 fn a_callee_that_chooses_is_projected_once_for_its_key() {
     // LOAD-call-disj: one projection for each callee and key ([`Walk::projection`], keyed by
     // the canonical body, lambda and ordered key in `Memo::projections`), whatever the number
-    // of calls: `h{n-1}` is claimed by `p1`'s call and projected once for the others.
+    // of calls: `h{n-1}` is claimed by `p1`'s call and projected once for the others; inside
+    // it each `h{j-1}` is claimed by `h{j}`'s call, so no other callee is projected, and the
+    // holes of the links, on the bound atoms, are written through the bindings
+    // (`holes_through_bindings`). Before that, each link's projection was refused and each call
+    // read the body again: n projections made, Θ(n²) reads (measured 10 at 10 links).
+    // `Scoped::relation` keeps the table from one body to the next.
     for n in [10, 40] {
         let src = a_chain_calling_a_callee_with_holes(n);
         let (stmts, tokens, unit) = (

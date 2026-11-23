@@ -4469,6 +4469,10 @@ fn conjuncts(
 /// The holes of each symbol ([`conjuncts`]) as clauses, one for each run of consecutive
 /// values `lo..=hi`: `x <= lo - 1 || x >= hi + 1`, the form `presburger::extend` reads as a
 /// hole. A chain `h{j}(x) = h{j-1}(x: x) && x != j` of n links leaves one clause, not n.
+/// A run of one value is written `!(x == lo)`, as the source writes it, so a call of a callee
+/// with one hole gives the relation reading its body gives (test
+/// `l01_38_omega_test::one_scope::
+/// a_relation_read_under_the_unit_scope_is_the_relation_of_the_closed_body`, its `u5`).
 /// Time of the holes.
 fn merged_holes(holes: &BTreeMap<Arc<str>, BTreeSet<Int>>) -> Vec<Formula> {
     use presburger::{Atom, Shared};
@@ -4483,12 +4487,109 @@ fn merged_holes(holes: &BTreeMap<Arc<str>, BTreeSet<Int>>) -> Vec<Formula> {
             }
         }
         out.extend(runs.into_iter().map(|(lo, hi)| {
+            if lo == hi {
+                let at = Formula::Con(Con::eq(&y, &Lin::constant(lo)));
+                return Formula::Not(Shared::new(at));
+            }
             let below = Con::ge(&Lin::constant(&lo - &Int::ONE), &y);
             let above = Con::ge(&y, &Lin::constant(&hi + &Int::ONE));
             Formula::Or(Shared::new(vec![Formula::Con(below), Formula::Con(above)]))
         }));
     }
     out
+}
+
+/// The holes of `holes` ([`conjuncts`]) with each bound symbol written as what it is bound to
+/// (`binds`, the bindings of the claimed calls [`projected`] reached), so that every hole reads
+/// kept symbols alone: a chain `h{j}(x) = h{j-1}(x: x) && x != j` reaches the hole of each
+/// link on the canonical atom of its callee, bound to the caller's. A hole `s != v` with `s`
+/// written `t`: where `t` is `k·x + d` over one kept symbol, the hole `x != (v - d)/k` where `k`
+/// divides `v - d` and none otherwise; where `t` is a constant, nothing where `t != v` and the
+/// row `-1 >= 0` where `t == v` (the relation is empty); otherwise the clause `!(t == v)` into
+/// `clauses`. `None` when a binding reads an atom that is neither kept nor bound (an auxiliary
+/// variable or a product), or the bindings reach a symbol again.
+/// Proof of exactness: each binding `c := a` is the row `c == a` of its definition, which is in
+/// the rows [`projected`] gathers (its step 1). Writing `c` replaces each bound symbol of `a`
+/// by its own written term, which equals it at every point of those rows (by induction on the
+/// order written), so `written(c) == c` there, and `s != v` holds exactly where `t != v` does;
+/// the three cases state `t != v`.
+/// Cost: each bound symbol is written once (a memo, and a set of the symbols open on the stack
+/// to find a cycle), in time of its term's atoms times the size of the terms it reads; then
+/// O(log) for each hole. Test: `l01_38_omega_test::one_scope::
+/// a_callee_that_chooses_is_projected_once_for_its_key` and the holes benches of
+/// `l01_38_omega_test::bench::one_scope`.
+fn holes_through_bindings(
+    holes: BTreeMap<Arc<str>, BTreeSet<Int>>,
+    binds: &HashMap<Arc<str>, &Lin>,
+    keep: &dyn Fn(&presburger::Atom) -> bool,
+    clauses: &mut Vec<Formula>,
+    rows: &mut Vec<Con>,
+) -> Option<BTreeMap<Arc<str>, BTreeSet<Int>>> {
+    use presburger::{Atom, Shared};
+    let mut written: HashMap<Arc<str>, Lin> = HashMap::new();
+    let mut out: BTreeMap<Arc<str>, BTreeSet<Int>> = BTreeMap::new();
+    for (s, vs) in holes {
+        if !binds.contains_key(&s) {
+            out.entry(s).or_default().extend(vs);
+            continue;
+        }
+        // The term of `s`, its bound symbols written first (an explicit stack, depth-first).
+        let mut stack = vec![(s.clone(), false)];
+        let mut open: HashSet<Arc<str>> = HashSet::new();
+        while let Some((c, ready)) = stack.pop() {
+            if written.contains_key(&c) {
+                continue;
+            }
+            let a = binds[&c];
+            if !ready {
+                if !open.insert(c.clone()) {
+                    return None;
+                }
+                stack.push((c, true));
+                for atom in a.terms.keys() {
+                    match atom {
+                        Atom::Sym(d) if binds.contains_key(d) => stack.push((d.clone(), false)),
+                        atom if keep(atom) => {}
+                        _ => return None,
+                    }
+                }
+                continue;
+            }
+            let mut l = Lin::constant(a.constant.clone());
+            for (atom, k) in &a.terms {
+                match atom {
+                    Atom::Sym(d) if binds.contains_key(d) => {
+                        l.plus_assign(&written[d].times(k.clone()))
+                    }
+                    _ => l.plus_assign(&Lin::atom(atom.clone()).times(k.clone())),
+                }
+            }
+            written.insert(c, l);
+        }
+        let t = &written[&s];
+        let mut terms = t.terms.iter();
+        match (terms.next(), terms.next()) {
+            (None, _) => {
+                if vs.contains(&t.constant) {
+                    rows.push(Con::ge(&Lin::constant(-1), &Lin::constant(0)));
+                }
+            }
+            (Some((Atom::Sym(x), k)), None) => {
+                for v in vs {
+                    let d = &v - &t.constant;
+                    if d.mod_floor(k).is_zero() {
+                        out.entry(x.clone()).or_default().insert(d.div_floor(k));
+                    }
+                }
+            }
+            _ => {
+                clauses.extend(vs.into_iter().map(|v| {
+                    Formula::Not(Shared::new(Formula::Con(Con::eq(t, &Lin::constant(v)))))
+                }))
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The relation `r` of a callee over the canonical atoms of the canonical key `key`
@@ -4543,7 +4644,10 @@ fn merged_holes(holes: &BTreeMap<Arc<str>, BTreeSet<Int>>) -> Vec<Formula> {
 // the rest projected. Proof of exactness: write the relation as C(x) ∧ R(x, y), y the atoms
 // eliminated. Since C does not read y, (∃y. C(x) ∧ R(x, y)) ⇔ C(x) ∧ (∃y. R(x, y)), and the
 // second conjunct is the projection made of the rows (steps 1-5 below hold for it unchanged).
-// A choice that reads another atom makes the result `None`, as before. Writing at a call
+// A choice that reads another atom makes the result `None`, as before, except a hole on a
+// bound symbol, which is written through its binding first ([`holes_through_bindings`]; before
+// that, every link of a chain of holes past the first was `None`, and each call read the
+// callee's body again, Θ(n²) reads for n links). Writing at a call
 // substitutes each canonical atom of x by its argument in C, as in the rows ([`at_arguments`],
 // which is exact for symbols). Holes: `k·x + c != 0` excludes the one value `-c/k` where k
 // divides c and no value otherwise; the set of values excluded is the union of runs of
@@ -4563,6 +4667,8 @@ fn projected(tr: &Tr, r: &Formula, key: &[Lin]) -> Option<Projection> {
         })
         .collect();
     let (mut rows, mut bound, mut seen) = (Vec::new(), HashSet::new(), HashSet::new());
+    // The argument each bound symbol is bound to, from the same definitions as `bound`.
+    let mut binds: HashMap<Arc<str>, &Lin> = HashMap::new();
     // The values each symbol may not take (`x != j`), and the other choices (LOAD-call-disj).
     let mut holes: BTreeMap<Arc<str>, BTreeSet<Int>> = BTreeMap::new();
     let mut clauses: Vec<Formula> = Vec::new();
@@ -4593,6 +4699,7 @@ fn projected(tr: &Tr, r: &Formula, key: &[Lin]) -> Option<Projection> {
                         }
                         if let What::Bind(pairs) | What::Value(_, pairs) = what {
                             bound.extend(pairs.iter().map(|(c, _)| c.clone()));
+                            binds.extend(pairs.iter().map(|(c, a)| (c.clone(), a)));
                         }
                         todo.push(def);
                     }
@@ -4610,11 +4717,11 @@ fn projected(tr: &Tr, r: &Formula, key: &[Lin]) -> Option<Projection> {
     if !clauses.is_empty() || !holes.is_empty() {
         // The tests' reference reads the body again at the call ([`Scoped::reading_bodies`]).
         if tr.bodies
-            || holes.keys().any(|s| bound.contains(s))
             || (clauses.iter().flat_map(|g| g.cons())).any(|c| c.lin.terms.keys().any(|a| !keep(a)))
         {
             return None;
         }
+        let holes = holes_through_bindings(holes, &binds, &keep, &mut clauses, &mut rows)?;
         clauses.extend(merged_holes(&holes));
     }
     let clauses: Arc<[Formula]> = clauses.into();
@@ -11676,7 +11783,7 @@ impl<'m, 't> Walk<'m, 't> {
                             })
                             .collect::<Option<Vec<_>>>()
                     });
-                    if let Some(mut parts) = at {
+                    if let Some(rows) = at {
                         // Each choice reads kept symbols alone ([`projected`]), so it is
                         // written at the arguments by substitution, O(its size) (LOAD-call-disj).
                         let written = |c: &Con| {
@@ -11684,7 +11791,13 @@ impl<'m, 't> Walk<'m, 't> {
                                 .expect("a projection's choices read symbols alone");
                             Formula::Con(Con { lin, rel: c.rel })
                         };
-                        parts.extend(p.clauses.iter().map(|g| g.map_cons(&written)));
+                        // The choices first, as the relation of a body puts its condition of
+                        // definedness before the body (`Scoped::relation`), so a call of a
+                        // callee whose one choice is that condition gives the shape reading its
+                        // body gives.
+                        let mut parts: Vec<Formula> =
+                            p.clauses.iter().map(|g| g.map_cons(&written)).collect();
+                        parts.extend(rows);
                         let f = Formula::and(parts);
                         self.tr(|tr| tr.bound(&f, &k.1));
                         return Some(f);

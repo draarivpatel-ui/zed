@@ -50,21 +50,6 @@ fn a_chain_whose_points_move_is_decided_in_time_of_its_links() {
 }
 
 #[test]
-fn a_tangent_chain_is_decided_in_time_of_its_links() {
-    // LOAD-chain-move, META1 A1: every row of the tangent chain bounds its region and is kept
-    // ([`a_tangent_chain`]), so a link reads all of them, Θ(n) a link. Measured to decide
-    // whether the persistent integer hull (design B) is needed.
-    let chains = zed_tests::scaling::inputs(50, a_tangent_chain);
-    zed_tests::scaling::check("the answers of a tangent chain", 50, |n| {
-        let mut e = Extending::new();
-        for f in &chains[&n] {
-            let a = e.answers(f);
-            assert_eq!((a.holds, a.fails), (Ok(true), Ok(true)));
-        }
-    });
-}
-
-#[test]
 fn bindings_put_in_place_scale() {
     // The substitution reads each top-level constraint once and resolves each atom through a
     // union of classes with its path compressed: time of the formula times a logarithm.

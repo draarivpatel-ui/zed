@@ -246,7 +246,7 @@ impl Extending {
     }
 
     /// [`given`], skipped in the negative control of the `fails` branches' tests.
-    fn given(&self, closure: &Atoms, m: &Point, f: &Formula) -> bool {
+    fn given_checked(&self, closure: &Atoms, m: &Point, f: &Formula) -> bool {
         #[cfg(test)]
         if self.unguarded {
             return true;
@@ -359,7 +359,8 @@ impl Extending {
         // equal ids naming one part. The wrap is made once for each constraint and kept,
         // so every `def(n)` of it, in this call and later ones, gives the same part and the
         // same key, and a quotient and remainder that share a definition keep sharing it.
-        // O(1) expected time for each `def(n)` of a constraint, nothing for a compound one.
+        // O(|c|) for each `def(n)` of a constraint `c` (hashing it), as producing it costs;
+        // nothing for a compound one.
         let bare = std::cell::RefCell::new(std::mem::take(&mut self.bare));
         let compound = |n: u32| {
             let d = def(n);
@@ -563,7 +564,8 @@ impl Extending {
         // `l01_38_omega_test::extend::a_chain_whose_points_move_keeps_few_rows`, bench
         // `l01_38_omega_test::bench::extend::a_chain_whose_points_move_is_decided_in_time_of_its_links`).
         // Complexity tradeoff: a chain whose every row bounds the region keeps all of them
-        // (the tangent chain `i x + y >= i^2`), Θ(n) a link; see [`plane`].
+        // (the tangents `y >= 2 i x - i^2` of `y = x^2`), Θ(n) a link, 38.3 times from 50 to
+        // 400 links (row LOAD-chain-move-tangent); see [`plane`].
         if holds.is_none()
             && let Some(r) = &region
         {
@@ -608,12 +610,12 @@ impl Extending {
             // (SOUND-extend-fails-partial-point-given; XR-sound-extend-face-local-atoms
             // round 1, F4; test
             // `presburger::extend::tests::xr_face_local_atoms_f4b_fails_without_given`).
-            // A `decide` that finds no point needs no such check: an atom the point leaves out
-            // is free in the question, so no point there means none at any of its values.
+            // A `decide` that finds no point needs no such check: the definitions of `f` are a
+            // subset of the question's, so no point of `f` means no point of the question.
             Ok(true) => {
                 let extended = (part.miss.as_ref()).and_then(|m| {
                     let f = with(&reached_past(&rest, def, m), Formula::top());
-                    self.given(&part.closure, m, &f)
+                    self.given_checked(&part.closure, m, &f)
                         .then(|| met(m, &f).ok().flatten())
                         .flatten()
                 });
@@ -630,7 +632,7 @@ impl Extending {
                     let f = new(&not, m);
                     match decide(&f) {
                         Ok(false) => Some((false, None)),
-                        _ if self.given(&part.closure, m, &f) => {
+                        _ if self.given_checked(&part.closure, m, &f) => {
                             met(m, &f).ok().flatten().map(|p| (true, Some(p)))
                         }
                         _ => None,
@@ -1644,6 +1646,11 @@ fn project(items: Vec<Formula>, keep: &mut HashSet<Atom>, inside: &mut HashSet<A
                         steps.push(Step::Split(items, true));
                     }
                 }
+                // `nested` passed on, though no split of an `Again` group adds an atom to `keep`:
+                // its items are those of the group, which `split` formed after substituting into
+                // them; each atom two of them read, one a disjunction, went into `keep` then;
+                // their equalities are gone, and `same_divisions` sets only atoms outside `keep`,
+                // which has grown. So the reads of the items shrink and nothing is shared anew.
                 Group::Again(items) => steps.push(Step::Split(items, nested)),
             }
         }
@@ -8835,9 +8842,11 @@ mod tests {
                 vec![part, p0, p1, p2],
             ));
         }
-        // R2-A-test (round 2, Claude A-test): the shared quotient q0 is inserted by a split
-        // of a nested group inside a disjunct, `(x == 2 q0 + q1 && (q0 >= 1 || y >= 1) && (q0
-        // <= 3 || y <= 0)) || x >= 20`, q0 outside the interface.
+        // R2-A-test (round 2, Claude A-test): the shared quotient q0 of two disjunctions inside
+        // a disjunct, `((q0 >= 1 || y >= 1) && (q0 <= 3 || y <= 0)) || x >= 20`, q0 outside the
+        // interface. The disjunct's own split puts q0 in `keep` and `inside`. Passing `nested`
+        // false for `Group::Again` leaves this test green (run 2026-11-23): no split of an
+        // `Again` group adds an atom to `keep` (the proof at `project`), so no test can tell.
         {
             let y = xs("y");
             let inner = Formula::and(vec![
