@@ -9058,7 +9058,10 @@ impl<'t, 'a> Ck<'t, 'a> {
     /// `z = 0r; if r != z { x / r }`, so the test is read as `r != 0r` and narrows `r` (row
     /// NARROW-rat-gaps; before, `z` was a name the scope held no value of, and the division
     /// kept `#divByZero`). A name bound to a literal with no suffix, as `z` in `z = 0;
-    /// r != z`, is not at `rat` and is not read here (row NARROW-rat-int-name).
+    /// r != z`, is not at `rat` and is not read here; `r != z` is refused, as no value is both
+    /// a `rat` and an `int`. A chain may pass through a cast `rat(a)` ([`Self::rat_cast_arg`]),
+    /// whose value is `a`'s at `rat`: `w` in `z = 0; w = rat(z); r != w` is `0r` (row
+    /// NARROW-rat-int-name).
     ///
     /// Complexity tradeoff: the naive read follows the chain of names to its binder on each
     /// read, O(chain) per read and O(n²) for n tests on a chain `z2 = z1; z3 = z2; …` of n
@@ -9085,18 +9088,62 @@ impl<'t, 'a> Ck<'t, 'a> {
                         None => break None,
                     }
                 }
-                _ => {
-                    break match self.rat_fact(at) {
-                        Some(RatFact::Value(v)) => Some(v),
-                        _ => None,
-                    };
-                }
+                _ => match self.rat_cast_arg(at) {
+                    Some(a) => at = a,
+                    None => {
+                        break match self.rat_fact(at) {
+                            Some(RatFact::Value(v)) => Some(v),
+                            _ => None,
+                        };
+                    }
+                },
             }
         };
         for s in chain {
             self.rat_bound_names.insert(s, value.clone());
         }
         value
+    }
+
+    /// The argument `a` of `e` where `e` is the cast `rat(a)`: a call of the prelude word `rat`
+    /// with one positional argument and nothing else, the form [`is_cast_of_literal`] reads.
+    /// O(1).
+    fn rat_cast_arg(&self, e: &'a Expr) -> Option<&'a Expr> {
+        let ExprKind::Call {
+            callee,
+            positional,
+            named,
+            curry: false,
+            ..
+        } = &e.kind
+        else {
+            return None;
+        };
+        let [a] = positional.as_slice() else {
+            return None;
+        };
+        (matches!(&callee.kind, ExprKind::Name(w) if w == "rat")
+            && matches!(self.t.res.uses.get(&callee.span), Some(Ref::Prelude(_)))
+            && named.is_empty())
+        .then_some(a)
+    }
+
+    /// The value of the cast `rat(a)` ([`Self::rat_cast_arg`]) where the text shows `a`'s
+    /// value: `a`'s value read at `rat`, `0r` for `rat(0)` and for `rat(z)` after `z = 0`
+    /// ([`Ck::known`]), or a `rat` literal or name bound to one ([`Self::rat_literal`],
+    /// [`Self::rat_bound`]). Proof that the value is right: DESIGN.md (sec:domains, "Casts are
+    /// domain proofs") gives an atom from `T(x)` only for `x` outside `T`'s range or not a
+    /// member of `T`; `rat` has no bounds, and every integer n is the rational n/1, a member,
+    /// so `rat(n)` is n/1, the `Rat` [`Value::as_rat`] reads; a `rat` is cast to itself. A
+    /// text or a float argument gives `None`: `as_rat` reads neither, and `rat("x")` or
+    /// `rat(nan)` gives an atom.
+    /// O(1) besides the reads it makes (row NARROW-rat-int-name).
+    fn rat_cast(&mut self, e: &'a Expr) -> Option<Value> {
+        let a = self.rat_cast_arg(e)?;
+        if let Some(v) = self.known(a).value {
+            return v.as_rat().map(|r| Value::rat(r.into_owned()));
+        }
+        self.rat_literal(a).or_else(|| self.rat_bound(a))
     }
 
     fn call(
@@ -12981,14 +13028,21 @@ impl<'a> Ck<'_, 'a> {
              exit status, a number from 0 to 255: this zedc does not show that `{code}` is in \
              that range"
         );
-        // A name or a literal is written as it is; anything else in parentheses, and bound to
-        // a name before a test that reads it more than once. The clamp is written as an `if`
+        // A name or a literal is written as it is; anything else is bound to a name before a
+        // test that reads it more than once. The clamp is written as an `if`
         // chain, since this zedc does not compile `.clamp` yet (DESIGN.md sec:ports offers
         // `code.clamp(0, 255)`).
         let simple = code.chars().all(|c| c.is_alphanumeric() || c == '_');
+        // The operand of `mod` is in parentheses only where the grammar needs them there
+        // (author rule P191; plan row PRINT-repair-parens-minimal): `a * b mod 256`, but
+        // `(a + b) mod 256`.
         let (operand, bind, name) = match simple {
             true => (code.to_string(), String::new(), code),
-            false => (format!("({code})"), format!("code = {code}; "), "code"),
+            false => (
+                zedc_syntax::format::code_as_operand(code, BinaryOp::Mod, false).into_owned(),
+                format!("code = {code}; "),
+                "code",
+            ),
         };
         let menu = [
             format!(
@@ -14664,6 +14718,16 @@ impl<'a> Ck<'_, 'a> {
             // `int` `0`, the test would empty `r`'s type where it holds and drop that arm, and
             // with it the `#divByZero` of `x / r + 1r` there (NARROW-ne-rat-divisor). The
             // operands of such an `x` are not visited.
+            //
+            // A cast `rat(a)` of a value the text shows is that value at `rat`
+            // ([`Self::rat_cast`]): `rat(z)` in `z = 0; r != rat(z)`, the repair the checker
+            // offers for `r != z`, is `0r` as `0r` in `r != 0r` is, so the test narrows `r`
+            // (row NARROW-rat-int-name). Read before [`Ck::known`], which gives the call no
+            // `rat` value [`Self::rat_fact`] reads.
+            if let Some(v) = self.rat_cast(x) {
+                done.push(Term::Lit(v));
+                continue;
+            }
             if let Some(v) = self.known(x).value {
                 let t = match self.carrier_here(x, true) {
                     None | Some(Carrier::Int) => Term::Lit(v),
@@ -16204,7 +16268,8 @@ impl<'t, 'a> Ck<'t, 'a> {
                 self.narrow_names.remove(&first);
             }
             if !self.trying && first != span {
-                self.same_use.push((span, first));
+                let kind = std::mem::discriminant(&key.0);
+                self.same_use.entry(first).or_default().push((span, kind));
             }
             if let (Some(later), Some(at)) = (site, at)
                 && later != at
@@ -23585,7 +23650,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 }
                 Piece::Var(_) if self.carriers_only(&p) => {
                     let shown = self.show(&p.ty());
-                    self.not_applicable(&shown, span);
+                    self.not_applicable(&shown, of, span);
                 }
                 Piece::Var(_) if let Some(k) = self.class_of(&p) => {
                     let kind = NeedKind::Index {
@@ -23601,7 +23666,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 p if p.is_atoms() => {}
                 p => {
                     let shown = self.text(&p.ty());
-                    self.not_applicable(&shown, span);
+                    self.not_applicable(&shown, of, span);
                 }
             }
         }
@@ -23612,18 +23677,36 @@ impl<'t, 'a> Ck<'t, 'a> {
     }
 
     /// The error of `v[x]` at `span`, `x` no literal, of a value of the type shown as `shown`,
-    /// which is no tuple and no function.
-    fn not_applicable(&mut self, shown: &str, span: Span) {
-        self.not_applicable_noted(shown, span, true);
+    /// which is no tuple and no function; `of` is the span of `v` as written.
+    fn not_applicable(&mut self, shown: &str, of: Option<Span>, span: Span) {
+        self.not_applicable_noted(shown, of, span, true);
     }
 
     /// [`Self::not_applicable`], with the derivation of the bracket's value only where
-    /// `derive` holds, as [`Self::not_a_function_noted`] writes a call's.
-    pub(super) fn not_applicable_noted(&mut self, shown: &str, span: Span, derive: bool) {
-        let message = format!(
-            "this value is {shown}, not a function: this call applies it to an argument, and a \
-             value of type {shown} cannot be applied"
-        );
+    /// `derive` holds, as [`Self::not_a_function_noted`] writes a call's. The value is named as
+    /// the program wrote it where that code is on one line, `` `t[1]` is 2 ``, as a call of a
+    /// name names the name (DESIGN.md sec:diagnostics, the headline in code form; plan row
+    /// MSG-value-call-code), else as "this value".
+    pub(super) fn not_applicable_noted(
+        &mut self,
+        shown: &str,
+        of: Option<Span>,
+        span: Span,
+        derive: bool,
+    ) {
+        let code = (self.code(of))
+            .filter(|c| !c.contains('\n'))
+            .map(|c| format!("`{c}`"));
+        let message = match code {
+            Some(c) => format!(
+                "{c} is {shown}, not a function: this call applies {c} to an argument, and a \
+                 value of type {shown} cannot be applied"
+            ),
+            None => format!(
+                "this value is {shown}, not a function: this call applies it to an argument, \
+                 and a value of type {shown} cannot be applied"
+            ),
+        };
         let menu =
             "repair: call a function here, or drop the argument list after the value".to_string();
         match derive {
@@ -27641,25 +27724,45 @@ impl<'t, 'a> Ck<'t, 'a> {
     /// ([`Ck::restrict_asking`], which calls this through [`Ck::refuse_taken`]), with the
     /// message the use itself gives when the restriction comes first ([`Ck::component`],
     /// [`Ck::at_index`], [`Ck::at_key`], [`Ck::call_value_step`]; row
-    /// CHECK-destructure-order). O(1) per use beside the message.
+    /// CHECK-destructure-order).
+    ///
+    /// Each later use equal to one of `taken`, which recorded no need of its own
+    /// ([`Ck::same_use`]), is refused too, with the same message at its own span: where the
+    /// restriction comes first, [`Ck::component`] and its siblings refuse each such use where
+    /// it is checked, so both written orders give one error per use (DESIGN.md sec:premise;
+    /// row CHECK-destructure-order-repeats). The later uses of one kind are deduplicated by
+    /// span: a destructuring into n names records n needs at one span, each repeated by a
+    /// later destructuring at its one span.
+    ///
+    /// O(1) per use and per repeat beside the message, plus O(m log m) to sort the m repeats
+    /// of a use.
     pub(super) fn refuse_taken_uses(&mut self, r: usize, taken: Vec<Need>) {
         let p = Piece::Var(format!("${r}").into());
         for u in taken {
-            match &u.kind {
-                NeedKind::Destructure { n, .. } => self.not_a_tuple(&p, *n, u.span),
-                NeedKind::Component { key, .. } => {
-                    let t = self.show(&p.ty());
-                    self.not_indexable_noted(&key.to_string(), &t, u.span, false);
+            let kind = std::mem::discriminant(&u.kind);
+            let mut spans: Vec<Span> = (self.same_use.get(&u.span).into_iter().flatten())
+                .filter(|&&(_, k)| k == kind)
+                .map(|&(s, _)| s)
+                .collect();
+            spans.sort_unstable();
+            spans.dedup();
+            for span in std::iter::once(u.span).chain(spans) {
+                match &u.kind {
+                    NeedKind::Destructure { n, .. } => self.not_a_tuple(&p, *n, span),
+                    NeedKind::Component { key, .. } => {
+                        let t = self.show(&p.ty());
+                        self.not_indexable_noted(&key.to_string(), &t, span, false);
+                    }
+                    NeedKind::Index { .. } => {
+                        let shown = self.show(&p.ty());
+                        self.not_applicable_noted(&shown, None, span, false);
+                    }
+                    NeedKind::Call { what, .. } => {
+                        let shown = self.show(&p.ty());
+                        self.not_a_function_noted(what, &shown, span, false);
+                    }
+                    _ => {}
                 }
-                NeedKind::Index { .. } => {
-                    let shown = self.show(&p.ty());
-                    self.not_applicable_noted(&shown, u.span, false);
-                }
-                NeedKind::Call { what, .. } => {
-                    let shown = self.show(&p.ty());
-                    self.not_a_function_noted(what, &shown, u.span, false);
-                }
-                _ => {}
             }
         }
     }
