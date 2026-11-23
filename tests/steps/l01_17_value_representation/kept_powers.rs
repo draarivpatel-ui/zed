@@ -82,6 +82,28 @@ fn an_integer_prints_alike_however_it_was_built() {
     assert_eq!(pow(2, 40).integer_text(), "2^40");
 }
 
+/// The text is a function of the value alone (plan row KEPT-print-value-canonical): `q * 3^50`,
+/// `q` a prime above 2^44, prints `q*3^50` whether `3^50` is kept beside `q` or the product is
+/// held as digits. On origin/main 80c93acf5 the digits printed as digits. `q` is the prime word
+/// `2^61 - 1` and the wider prime `2^89 - 1`.
+#[test]
+fn a_wide_prime_times_a_power_prints_one_text_however_held() {
+    let m89 = (BigInt::from(1) << 89u32) - 1;
+    for (q, text) in [
+        (BigInt::from((1i64 << 61) - 1), "2305843009213693951*3^50"),
+        (m89, "618970019642690137449562111*3^50"),
+    ] {
+        let held = Rat::int(q.clone()).mul(&pow(3, 50)).unwrap();
+        let digits = Rat::int(q * BigInt::from(3).pow(50u32));
+        // Negative control: one is held with `3^50`, the other as digits only.
+        assert_eq!(held.kept().2.len(), 1, "{:?}", held.kept());
+        assert!(digits.kept().2.is_empty(), "{:?}", digits.kept());
+        assert!(held == digits);
+        assert_eq!(held.integer_text(), text);
+        assert_eq!(digits.integer_text(), text);
+    }
+}
+
 #[test]
 fn powers_far_apart_order_with_no_build() {
     let ((lt, gt), live) = zed_alloc_count::live(|| {

@@ -84,6 +84,25 @@ fn a_product_of_two_words_costs_what_a_built_product_costs() {
     check_order("products of n and 8n pairs of hard words", n, 1, products);
 }
 
+/// The text of `q * 3^e`, `q = 2^61 - 1`, held as digits, at `e = n` and `8n`: `Rat::integer_text`
+/// takes the primes below 2^8 out of the value (one remainder by a word per group, then the
+/// valuation of 3, O(n log^2 n) at most), finds the least root of what is left, `q`, and prints
+/// `q*3^e` as it does for the value held with `3^e` kept (plan row KEPT-print-value-canonical).
+/// The work is O(n log^2 n) at most, the order of the digits' own text, held under the limit of
+/// 10.5.
+#[test]
+fn the_text_of_a_prime_word_times_a_power_held_as_digits_scales() {
+    let n = 1usize << 15;
+    let q = BigInt::from((1u64 << 61) - 1);
+    let numbers = inputs(n, |m| {
+        Rat::int(&q * BigInt::from(3).pow(u32::try_from(m).expect("a small exponent")))
+    });
+    check_order("the text of q * 3^n held as digits", n, 1, |m| {
+        let text = numbers[&m].integer_text();
+        assert_eq!(text, format!("2305843009213693951*3^{m}"));
+    });
+}
+
 /// The text of `n` and `8n` products of two hard words ([`hard_words`]), each held as digits:
 /// `Rat::integer_text` reduces each coefficient with methods of proved cost (trailing zeros,
 /// a least root, `factor` below 2^44), which find no prime here, so each prints its digits,

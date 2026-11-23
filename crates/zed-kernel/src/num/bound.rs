@@ -810,7 +810,10 @@ mod tests {
             assert_eq!(order, built, "2^{p} against 3^{q}");
             assert_eq!(cmp(&b, &a), Ok(built.reverse()), "3^{q} against 2^{p}");
             let laurent = laurent_bits(&a, &b).expect("two atoms");
-            assert!(k <= laurent, "2^{p} against 3^{q}: precision {k}, Laurent {laurent}");
+            assert!(
+                k <= laurent,
+                "2^{p} against 3^{q}: precision {k}, Laurent {laurent}"
+            );
         }
     }
 
