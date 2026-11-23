@@ -3475,34 +3475,6 @@ mod tests {
         assert_eq!(text_primes_dividing(&c), vec![3, 7, 251]);
     }
 
-    /// One value, `w * 3^50 * 1009^6 * 65537^4 * (2^61 - 1)^2` for each coefficient `w` of 1, a
-    /// prime word above 2^44 and the prime `2^89 - 1`, held with each of the 16 sets of those
-    /// primes listed and the rest in the coefficient, prints one text (plan row
-    /// KEPT-print-value-canonical).
-    #[test]
-    fn every_hold_of_one_value_prints_one_text() {
-        let m61 = (1u64 << 61) - 1;
-        let primes = [(3u64, 50u32), (1009, 6), (65537, 4), (m61, 2)];
-        let wide: BigUint = (BigUint::one() << 89u32) - 1u32;
-        let q = zed_numtheory::next_prime(1 << 44).expect("a prime word above 2^44");
-        for w in [BigUint::one(), BigUint::from(q), wide] {
-            let mut texts = Vec::new();
-            for mask in 0..16u32 {
-                let mut num = BigInt::from(w.clone());
-                let mut pows = Vec::new();
-                for (i, &(p, e)) in primes.iter().enumerate() {
-                    match mask >> i & 1 == 1 {
-                        true => pows.push((p, BigInt::from(e))),
-                        false => num *= BigInt::from(p).pow(e),
-                    }
-                }
-                let held = Rat::from_kept(num, BigInt::one(), pows).expect("a normal form");
-                texts.push(held.integer_text());
-            }
-            assert!(texts.iter().all(|t| *t == texts[0]), "{w}: {texts:?}");
-        }
-    }
-
     #[test]
     fn the_kept_form_reads_back_and_nothing_out_of_it_does() {
         // ENGINE-one: the binary form of a number writes `kept` and reads it with `from_kept`.

@@ -104,6 +104,34 @@ fn a_wide_prime_times_a_power_prints_one_text_however_held() {
     }
 }
 
+/// One value, `w * 3^50 * 1009^6 * 65537^4 * (2^61 - 1)^2` for each coefficient `w` of 1, a
+/// prime word above 2^44 and the prime `2^89 - 1`, held with each of the 16 sets of those primes
+/// listed and the rest in the coefficient, prints one text (plan row KEPT-print-value-canonical).
+/// On origin/main 80c93acf5 the holds printed different texts.
+#[test]
+fn every_hold_of_one_value_prints_one_text() {
+    let m61 = (1u64 << 61) - 1;
+    let primes = [(3u64, 50u32), (1009, 6), (65537, 4), (m61, 2)];
+    let q = zed_numtheory::next_prime(1 << 44).expect("a prime word above 2^44");
+    let wide = (BigInt::from(1) << 89u32) - 1;
+    for w in [BigInt::from(1), BigInt::from(q), wide] {
+        let mut texts = Vec::new();
+        for mask in 0..16u32 {
+            let mut num = w.clone();
+            let mut pows = Vec::new();
+            for (i, &(p, e)) in primes.iter().enumerate() {
+                match mask >> i & 1 == 1 {
+                    true => pows.push((p, BigInt::from(e))),
+                    false => num *= BigInt::from(p).pow(e),
+                }
+            }
+            let held = Rat::from_kept(num, BigInt::from(1), pows).expect("a normal form");
+            texts.push(held.integer_text());
+        }
+        assert!(texts.iter().all(|t| *t == texts[0]), "{w}: {texts:?}");
+    }
+}
+
 #[test]
 fn powers_far_apart_order_with_no_build() {
     let ((lt, gt), live) = zed_alloc_count::live(|| {
@@ -117,6 +145,37 @@ fn powers_far_apart_order_with_no_build() {
     let (lt, live) = zed_alloc_count::live(|| x < pow(3, K));
     assert!(lt);
     assert!(live.peak < 1 << 20, "peak heap {} bytes", live.peak);
+}
+
+/// `c * 3^e` and `(c + 1) * 3^e`, either side of `2^f`, with `three` = `3^e` built, `f` its bits
+/// less 1 plus `k` and `c = floor(2^f / 3^e)`, of `k` bits: `3^e` does not divide `2^f`, so
+/// `c 3^e < 2^f < (c + 1) 3^e`, and each side agrees with `2^f` to within `3^e / 2^f < 2^(1 - k)`
+/// of it, so the order reads bounds of about `k` bits (DESIGN step L1.17b: the order measured at
+/// 2^6 to 2^20 bits of precision). `k` is at least 2.
+pub(super) fn close_pair(three: &BigInt, e: u64, k: u64) -> (Rat, Rat, Rat) {
+    let f = three.bits() - 1 + k;
+    let c = (BigInt::from(1) << f) / three;
+    let kept = pow(3, e);
+    let lo = Rat::int(c.clone()).mul(&kept).expect("nothing is built");
+    let hi = Rat::int(c + 1).mul(&kept).expect("nothing is built");
+    (lo, hi, pow(2, f))
+}
+
+/// [`close_pair`] at small sizes against the built numbers, at precisions from 2 bits to past
+/// the width of `3^e`.
+#[test]
+fn close_products_order_as_the_built_numbers() {
+    for e in [1u64, 2, 40, 1000] {
+        let three = BigInt::from(3).pow(u32::try_from(e).expect("small"));
+        for k in [2u64, 3, 63, 64, 65, 1000, 4096] {
+            let (lo, hi, two) = close_pair(&three, e, k);
+            let built = |x: &Rat| x.to_integer().expect("small");
+            let (l, h, t) = (built(&lo), built(&hi), built(&two));
+            assert!(l < t && t < h, "e {e}, k {k}");
+            assert!(lo < two && two < hi && lo < hi, "e {e}, k {k}");
+            assert!(two > lo && hi > two, "e {e}, k {k}");
+        }
+    }
 }
 
 #[test]
