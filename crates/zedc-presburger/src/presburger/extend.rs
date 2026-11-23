@@ -365,7 +365,8 @@ impl Extending {
         let compound = |n: u32| {
             let d = def(n);
             let Formula::Con(c) = &d else { return d };
-            // Looked up first, so that the constraint is copied only when it is new (R2-bare-clone).
+            // Looked up first, so that the constraint is copied only when it is new
+            // (R2-bare-clone).
             if let Some(w) = bare.borrow().get(c) {
                 return w.clone();
             }

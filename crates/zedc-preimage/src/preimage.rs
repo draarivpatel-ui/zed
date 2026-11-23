@@ -4655,7 +4655,8 @@ fn holes_through_bindings(
 // projection is made once per callee and key, O(rows + holes·log holes); a call writes
 // O(rows + clauses). A chain of holes at consecutive values leaves one clause; holes at
 // spread values (`x != 2j`) leave one clause each, Θ(holes) at each call. Tests in
-// `l01_38_omega_test::one_scope`: `the_answers_of_calls_of_a_callee_that_chooses_are_those_reading_bodies`,
+// `l01_38_omega_test::one_scope`:
+// `the_answers_of_calls_of_a_callee_that_chooses_are_those_reading_bodies`,
 // `a_callee_that_chooses_is_projected_once_for_its_key`, and the benches
 // `the_questions_of_a_chain_calling_a_callee_with_holes_scale` and its twin with spread holes.
 fn projected(tr: &Tr, r: &Formula, key: &[Lin]) -> Option<Projection> {

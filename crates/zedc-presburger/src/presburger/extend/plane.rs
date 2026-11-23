@@ -28,7 +28,8 @@
 //! the tangents `y >= 2 i x - i^2` of `y = x^2` (`l01_38_omega_test::extend::a_tangent_chain`,
 //! timed by a bench that is not landed until it passes) grew 38.3 times in instructions from
 //! 50 to 400 links (colab, 2026-11-23), against the limit 10.5. Row LOAD-chain-move-tangent
-//! (open) holds design B, Harvey's incremental integer hull below, for it. (The cross-review's tangent chain `i x + y >= i^2` keeps only 2 rows: for a fixed `x`,
+//! (open) holds design B, Harvey's incremental integer hull below, for it. (The cross-review's
+//! tangent chain `i x + y >= i^2` keeps only 2 rows: for a fixed `x`,
 //! `i^2 - i x` is convex in `i`, so the rows between two others are implied.) The measured
 //! moving chain keeps at most 3 rows a link, 7.65 times from 50 to 400 links.
 //!
