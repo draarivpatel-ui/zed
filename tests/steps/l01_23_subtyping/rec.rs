@@ -208,21 +208,20 @@ fn other_rejections() {
         def("B", &[], or(vec![r(0, vec![]), ty(Type::int())])),
     ];
     assert!(msg(mutual).contains("`A` is not contractive"));
-    // Under a complement, to the right of `\`, and in a guarantee whose value type mentions the
-    // group without holding the guarantee as written (`U -> U` is admitted,
-    // GROUP-admit-precision).
+    // Under a complement and to the right of `\`. A guarantee whose value type mentions the
+    // group is admitted when that value type is inhabited wherever the guarantee is, as
+    // `type U = (U) -> (int, U)` (GROUP-admit-precision, DESIGN sec. recursive groups, spec
+    // 17f8cbc); it was rejected "in the guarantee of `U -> (int, U)`" before.
     let under_not = atom("a", vec![Expr::Not(Box::new(n()))]);
     assert!(msg(vec![def("N", &[], under_not)]).contains("under a complement"));
     let diff = Expr::Diff(Box::new(ty(Type::int())), Box::new(atom("b", vec![n()])));
     assert!(msg(vec![def("N", &[], diff)]).contains("to the right of `\\`"));
-    assert!(
-        msg(vec![def(
-            "U",
-            &[],
-            Expr::exact(n(), Expr::Tuple(vec![ty(Type::int()), n()]))
-        )])
-        .contains("in the guarantee of `U -> (int, U)`")
+    let u = def(
+        "U",
+        &[],
+        Expr::exact(n(), Expr::Tuple(vec![ty(Type::int()), n()])),
     );
+    assert!(Group::new(vec![u]).is_ok());
     // A value type that a parameter can make empty: `type F(A) = (F(A)) -> A`, and one that a
     // larger argument shrinks, `(H(A)) -> (int \ A)`.
     let p = || Expr::Param(0);
@@ -724,22 +723,26 @@ fn a_group_writes_its_trees_for_debugging() {
 /// precedence needs them. An arrow's key is a `TypeNot` (`TypeNot '->' Arrow`, author P222), so
 /// `U -> (int, U)` holds no pair and a union key keeps one, `(U | int) -> (int, U)`; a tuple
 /// key keeps one, `((U, int)) -> (int, U)`, since `Arrow` tries `ArrowParams` first and
-/// `(U, int) -> (int, U)` reads as two parameters. The value type `(int, U)` mentions the group
-/// without holding the guarantee as written, so each is refused (`U -> U` is admitted, plan row
-/// GROUP-admit-precision).
+/// `(U, int) -> (int, W)` reads as two parameters. The value type `(int, W)` mentions the group
+/// and need not be inhabited where the guarantee is (`W = (int, W)` is empty), so each is
+/// refused (`U -> U` and `U -> (int, U)` are admitted, plan row GROUP-admit-precision).
 #[test]
 fn a_group_message_parenthesizes_an_arrow_key_only_where_needed() {
     let n = || r(0, vec![]);
+    let w = || r(1, vec![]);
     for (key, text) in [
-        (n(), "U -> (int, U)"),
-        (or(vec![n(), ty(Type::int())]), "(U | int) -> (int, U)"),
+        (n(), "U -> (int, W)"),
+        (or(vec![n(), ty(Type::int())]), "(U | int) -> (int, W)"),
         (
             Expr::Tuple(vec![n(), ty(Type::int())]),
-            "((U, int)) -> (int, U)",
+            "((U, int)) -> (int, W)",
         ),
     ] {
-        let value = Expr::Tuple(vec![ty(Type::int()), n()]);
-        let message = rejected(vec![def("U", &[], Expr::exact(key, value))]);
+        let value = Expr::Tuple(vec![ty(Type::int()), w()]);
+        let message = rejected(vec![
+            def("U", &[], Expr::exact(key, value)),
+            def("W", &[], Expr::Tuple(vec![ty(Type::int()), w()])),
+        ]);
         assert!(
             message.contains(&format!("in the guarantee of `{text}`")),
             "{message}"
