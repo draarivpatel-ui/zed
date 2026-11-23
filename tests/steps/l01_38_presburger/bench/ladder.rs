@@ -279,6 +279,24 @@ fn products_beside_a_sum_whose_atoms_have_products_scale() {
 }
 
 #[test]
+fn products_beside_rows_on_no_pair_scale() {
+    // The k rows `z + u{j}` are on no pair, and with every row in `pairs::Index`'s `holding`
+    // the test of each pair `{x - 1, y + (j + 1) z}` walked them among the rows holding `z`,
+    // whose weight (the pairs on them) did not count them: Θ(k²) (XR-presburger4 round 2, L1,
+    // Codex). `holding` keeps only the rows on a pair.
+    let n = 1000;
+    let built = scaling::inputs(n, rows_on_no_pair_beside_paired_rows);
+    let measure = move || {
+        scaling::check("products beside rows on no pair", n, |k| {
+            let (p, g) = &built[&k];
+            let e = entails(p, g);
+            assert!(matches!(e, Entailment::Proved(_)), "{k}: {e}");
+        });
+    };
+    scaling::on_a_thread(8 << 20, measure);
+}
+
+#[test]
 fn products_whose_factors_one_sum_joins_scale() {
     // One cluster holds all k links, so a solver search over the cluster for each open side
     // cost O(sides × cluster): 41 times the instructions at 8n with the sum on `b{i}` itself
