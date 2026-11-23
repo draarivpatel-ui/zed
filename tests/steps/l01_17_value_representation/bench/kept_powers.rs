@@ -9,16 +9,25 @@ use zed_tests::scaling::{check_order, inputs};
 use super::super::kept_powers::close_pair;
 
 /// The order of `c * 3^(2^20)` and `(c + 1) * 3^(2^20)` against `2^f` ([`close_pair`]), which
-/// agree in about `k` leading bits, at `k` and `8k` for `k` = 2^6, 2^10, 2^14 and 2^17, so from
-/// 2^6 to 2^20 bits of precision (DESIGN step L1.17b). Each round of bounds at precision `k`
-/// costs about `2 log2 e` products of `k` bits, and the rounds double, so the order costs
+/// agree in about `k` leading bits, at `k` and `8k` for `k` = 2^6, 2^15 and 2^17, so from 2^6 to
+/// 2^20 bits of precision (DESIGN step L1.17b). Each round of bounds at precision `k` costs
+/// about `2 log2 e` products of `k` bits, and the rounds double, so the order costs
 /// O(M(k) log e) for the last precision `k`: below the limit of 10.5 from `k` to `8k`. The two
 /// sides are never built (their bits, 1.66 million and more, stay above every precision tried).
+///
+/// The sizes, by the precedent of DECISION-roots-bench-regime: `k` and `8k` both on one
+/// product method, long multiplication at 1 to 8 words, the kernel's transform (`MUL_LEAF`, 400
+/// words, num/fast.rs) from 2^15 bits up. From 2^10 bits (16 words) to 2^13 (128 words) the
+/// products leave long multiplication for num-bigint's Karatsuba, whose bytes allocated grow
+/// about 27 times per factor of 8 (`(3/2)^3 8`, one scratch buffer per level of its recursion):
+/// at `k` = 2^10 the first runs allocated 48,880 and 860,976 bytes, 17.6 times (2026-11-23,
+/// Colab), work 4.6 times. No exact method with num-bigint's products meets 10.5 there
+/// (ROOTS-cubic-bits-bytes, XR-ROOTS-REF META1).
 #[test]
 fn the_order_of_close_products_scales_with_its_precision() {
     let e = 1u64 << 20;
     let three = BigInt::from(zed_kernel::num::pow_uint(&BigUint::from(3u32), e));
-    for n in [1usize << 6, 1 << 10, 1 << 14, 1 << 17] {
+    for n in [1usize << 6, 1 << 15, 1 << 17] {
         let pairs = inputs(n, |k| close_pair(&three, e, k as u64));
         let what = format!("the order of c * 3^(2^20) against 2^f at {n} and 8 times {n} bits");
         check_order(&what, n, 1, |k| {

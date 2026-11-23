@@ -2199,6 +2199,13 @@ fn valuation(n: BigInt, p: u64) -> (u64, BigInt) {
 /// way up divide `n`, of `N` bits, by powers of `s_i = 2^(i+1) log2 p` bits, `(N / s_i) M(s_i)`
 /// each, so O(N log^2 v) in all: O(N) for a power `v` of a few factors, as most decimals have,
 /// and O(M(N) log N) = O(N log^2 N) at most, the order of reading the digits.
+///
+/// With no cap, once the next power `P_(i+1)` passes [`WHOLE_TEST_BITS`], the tests from it on
+/// are made from the top instead ([`valuation_from_the_top`]): the powers are squared up to the
+/// last `P_T` of at most `N` bits, and `r_T = |n| mod P_T`, then `r_k = r_(k+1) mod P_k` for `k`
+/// down from `T`, which is `|n| mod P_k` since `P_k` divides `P_(k+1)`. The `P_k` that divide
+/// `n` are those below the least `k` with `r_k` not zero, as in the tests on the way up, so `J`
+/// and `x` are the same.
 fn valuation_upto(n: BigInt, p: u64, cap: u64) -> (u64, BigInt) {
     if n.is_zero() || cap == 0 {
         return (0, n);
@@ -2222,10 +2229,14 @@ fn valuation_upto(n: BigInt, p: u64, cap: u64) -> (u64, BigInt) {
     let mut x = loop {
         let i = powers.len() - 1;
         let next = fast::mul(&powers[i], &powers[i]);
-        let x = match next.bits() > n.bits() {
-            true => n.magnitude().clone(),
-            false => fast::div_rem(n.magnitude(), &next).1,
-        };
+        if next.bits() > n.bits() {
+            break n.magnitude().clone();
+        }
+        if cap == u64::MAX && next.bits() > WHOLE_TEST_BITS {
+            powers.push(next);
+            break valuation_from_the_top(n.magnitude(), &mut powers);
+        }
+        let x = fast::div_rem(n.magnitude(), &next).1;
         if !x.is_zero() || i + 1 >= 64 || 2u64 << i > cap {
             break x;
         }
@@ -2263,6 +2274,67 @@ fn valuation_upto(n: BigInt, p: u64, cap: u64) -> (u64, BigInt) {
     drop(powers);
     // `pv` divides `n` and is positive, so the floor is the exact quotient.
     (v, fast::div_floor(&n, &BigInt::from(pv)))
+}
+
+/// The width in bits past which [`valuation_upto`] stops dividing the whole of `n` by each
+/// power on the way up and takes the remainders from the top ([`valuation_from_the_top`]).
+///
+/// Complexity tradeoff: the tests on the way up cost `(N / s) M(s)` time each for a power of
+/// `s` bits, below the O(M(N)) of the powers and remainders from the top, so they are kept
+/// while the power is narrow, where most valuations end (one factor of 5 in a decimal); but
+/// the bytes a test allocates grow faster than `N` once the divisor passes the division's
+/// leaf: dividing `q 3^262144` (415,550 bits, `q = 2^61 - 1`) by `3^(2^i)` allocated at most
+/// 4 times the dividend's bytes for divisors up to 3,247 bits, and 22 to 53 times them from
+/// 6,493 bits up, against 0.45 to 4.5 times at 51,998 bits (2026-11-23, Colab, the
+/// test of `zed_alloc_count::allocated` per step), so the text of `q * 3^n` allocated 18.6
+/// times the bytes at `8n` (`the_text_of_a_prime_word_times_a_power_held_as_digits_scales`).
+/// From the top, each remainder is of a number below the square of its divisor, so its
+/// memory is O(width), and the widths halve. 4096 bits, 64 words, is the division's leaf
+/// `fast::DIV_LEAF` and lies between the two measured groups. Both ways find the same `J` and
+/// `x` (the proof at [`valuation_upto`]); tested by
+/// `valuations_from_the_top_agree_with_the_tests_on_the_way_up`.
+const WHOLE_TEST_BITS: u64 = 64 * 64;
+
+/// For [`valuation_upto`]: `powers` holds `P_0 .. P_k` with `P_i = p^(2^i)`, each `P_i` for
+/// `i < k` dividing `n` and `P_k` of at most the bits of `n`. The powers are squared on to the
+/// last `P_T` of at most the bits of `n`; then the remainders `r_T = n mod P_T` and
+/// `r_j = r_(j+1) mod P_j` for `j` from `T - 1` down to `k`, each `n mod P_j` since `P_j`
+/// divides `P_(j+1)`, stop at the first zero. `P_j` divides `n` exactly when `r_j` is zero,
+/// and if `P_j` divides `n` so does each `P_i` below it, so the `P_j` that divide `n` are
+/// those below the least `j` with `r_j` not zero, the last one found. `powers` is cut to the
+/// powers that divide `n`, `P_0 .. P_J`, and the result is `x = n mod P_(J+1)`, not zero; when
+/// every `r_j` is zero, `J = T` and `x` is `n`, which is below `P_(T+1)`, wider than `n`.
+///
+/// Cost: the squarings O(M(N)) and the remainders, each of a number below the square of its
+/// divisor, O(M(N)) as the widths halve, for `n` of `N` bits.
+fn valuation_from_the_top(n: &BigUint, powers: &mut Vec<BigUint>) -> BigUint {
+    let k = powers.len() - 1;
+    loop {
+        // Unreachable: `powers` is not empty.
+        let last = powers.last().expect("P_0 at least");
+        let next = fast::mul(last, last);
+        // `p^(2^64)` has more than 2^64 bits, so the 64 powers bound no `n` held in memory.
+        if next.bits() > n.bits() || powers.len() >= 64 {
+            break;
+        }
+        powers.push(next);
+    }
+    let t = powers.len() - 1;
+    let mut r = fast::rem(n, &powers[t]);
+    if r.is_zero() {
+        return n.clone();
+    }
+    let mut j = t;
+    while j > k {
+        let below = fast::rem(&r, &powers[j - 1]);
+        if below.is_zero() {
+            break;
+        }
+        (r, j) = (below, j - 1);
+    }
+    // `r` is `r_j`, not zero, and `r_(j-1)` is zero or `j` is `k`: `P_0 .. P_(j-1)` divide `n`.
+    powers.truncate(j);
+    r
 }
 
 /// The prime powers of two numbers merged by prime, `f` combining the exponents of a prime
@@ -2317,7 +2389,7 @@ fn text_primes_dividing(c: &BigUint) -> Vec<u64> {
     let mut hits = Vec::new();
     for run in text_prime_groups() {
         let x = rem_big_u64(c, run.iter().product());
-        hits.extend(run.iter().filter(|&&t| x % t == 0));
+        hits.extend(run.iter().filter(|&&t| x.is_multiple_of(t)));
     }
     hits
 }
@@ -3454,6 +3526,66 @@ mod tests {
                 assert_eq!(BigUint::from(rem_big_u64(x, m)), x % m, "{x} mod {m}");
             }
         }
+    }
+
+    /// `valuation` against division by `p` one at a time, on `c p^v` for powers `v` either side
+    /// of the step from the tests on the way up to those from the top (`WHOLE_TEST_BITS`, at
+    /// `v` of 2048 to 4096 for `p = 3`), cofactors `c` that `p` divides and does not, and with
+    /// a cap, which keeps the tests on the way up; and the growth of the bytes it allocates
+    /// for `q 3^v` from `v` to `8v`.
+    #[test]
+    fn valuations_from_the_top_agree_with_the_tests_on_the_way_up() {
+        fn by_one(mut n: BigInt, p: u64) -> (u64, BigInt) {
+            let mut v = 0;
+            while (&n % p).is_zero() {
+                n /= p;
+                v += 1;
+            }
+            (v, n)
+        }
+        let m61 = (1u64 << 61) - 1;
+        let wide: BigInt = (BigInt::one() << 300u32) + 7;
+        for p in [3u64, 5, 1009, m61] {
+            for v in [
+                0u32, 1, 2, 1000, 2047, 2048, 2049, 4095, 4096, 5000, 8191, 8192,
+            ] {
+                if p == m61 && v > 1000 {
+                    continue;
+                }
+                for c in [
+                    BigInt::one(),
+                    BigInt::from(-2),
+                    BigInt::from(p + 1),
+                    BigInt::from(p) * (p + 1),
+                    wide.clone(),
+                    BigInt::from(7).pow(3000u32),
+                ] {
+                    let n = c * BigInt::from(p).pow(v);
+                    let want = by_one(n.clone(), p);
+                    assert_eq!(valuation(n.clone(), p), want, "p {p}, v {v}");
+                    for cap in [0u64, 1, 2047, 2048, 4097] {
+                        let (k, rest) = valuation_upto(n.clone(), p, cap);
+                        let k_want = want.0.min(cap);
+                        assert_eq!(k, k_want, "p {p}, v {v}, cap {cap}");
+                        assert_eq!(rest * BigInt::from(p).pow(k as u32), n);
+                    }
+                }
+            }
+        }
+        // The step it guards: the bytes for `q 3^v`, `q = 2^61 - 1`, at `v` and `8v` grow less
+        // than 10.5 times, where the tests on the way up allocated 18.2 times (1,178,696 and
+        // 21,410,592 bytes, 2026-11-23, Colab). Allocation counts are deterministic.
+        let q = BigInt::from(m61);
+        let bytes = [1u32 << 15, 1 << 18].map(|v| {
+            let n = &q * BigInt::from(3).pow(v);
+            let before = zed_alloc_count::allocated();
+            let (k, _) = valuation(n.clone(), 3);
+            let bytes = zed_alloc_count::allocated() - before;
+            assert_eq!(k, u64::from(v));
+            eprintln!("valuation of q 3^{v}: {bytes} bytes for {} bits", n.bits());
+            bytes
+        });
+        assert!(bytes[1] * 2 < bytes[0] * 21, "{bytes:?}");
     }
 
     #[test]
