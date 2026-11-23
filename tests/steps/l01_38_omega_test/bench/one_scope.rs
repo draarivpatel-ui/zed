@@ -673,12 +673,20 @@ fn the_relations_of_a_chain_calling_an_integer_function_scale() {
     // function's cone again, O(n) a call (0.062, 0.238, 1.082 s for the relations at 50, 100,
     // 200 links; 50 → 400: 60.2 times the bytes, 88.2 MB → 5.31 GB; measured once). Its
     // value is now written once over its argument's pairs and, at a call, at the argument: 8.1
-    // times (13.6 MB → 111 MB). Only the relations are timed: deciding these
-    // questions (`Extending::defined_with`) grows faster than n log n with the remainders
-    // along the chain (10.7 s at 400 links), which item LOAD-call-relation returns.
+    // times (13.6 MB → 111 MB).
     unit_relations_scale(
         "the relations of a chain calling an integer function",
         510,
+        a_chain_calling_an_integer_function,
+    );
+    // The questions too (LOAD-defined-with): each piece of the summary of `h{j}` kept every
+    // link's `x@j` and `x@j mod 3` below it, Θ(j) rows and Θ(j²) row tests of `lean`, until
+    // `Summaries::make` read the equal atoms and the equal divisions as one
+    // (`presburger::extend::collapsed`). Before: 10.7 s at 400 links, about 60 times the time
+    // at 50.
+    questions_scale_unit(
+        "the linear questions of a chain calling an integer function",
+        50,
         a_chain_calling_an_integer_function,
     );
 }

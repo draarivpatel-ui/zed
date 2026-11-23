@@ -1250,6 +1250,14 @@ pub struct TouchedPaths {
 }
 
 thread_local! {
+    /// The definitions of auxiliary variables the translation has made on this thread, those
+    /// of them that are the value of a call (`What::Value`), and the bindings those hold:
+    /// read by tests (LOAD-defined-with).
+    pub static DEFINITIONS_MADE: std::cell::Cell<(u64, u64, u64)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+thread_local! {
     static TOUCHED: std::cell::Cell<TouchedPaths> = const {
         std::cell::Cell::new(TouchedPaths {
             half_line: 0,
@@ -3158,6 +3166,14 @@ impl Tr {
 
     fn aux(&mut self, what: What, def: Formula) -> presburger::Atom {
         let n = to_u32(self.defs.len(), "definitions");
+        let (value, pairs) = match &what {
+            What::Value(_, pairs) => (1, pairs.len() as u64),
+            _ => (0, 0),
+        };
+        DEFINITIONS_MADE.with(|c| {
+            let (d, v, p) = c.get();
+            c.set((d + 1, v + value, p + pairs))
+        });
         self.defs.push((n, what, def));
         presburger::Atom::Aux(n)
     }

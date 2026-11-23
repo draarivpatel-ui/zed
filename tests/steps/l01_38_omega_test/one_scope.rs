@@ -2719,6 +2719,139 @@ pub(super) fn a_chain_calling_an_integer_function(n: usize) -> String {
     src
 }
 
+/// The work counts of the linear questions of `unit(n)`, each divided by the `n` links, at 50,
+/// 100, 200 and 400 links, printed: the counts of `presburger::extend::counts`, then the
+/// questions asked again whole after a refusal and their atoms (`front::ASKED_AGAIN`), then
+/// the definitions the translation made, the values of calls among them and those values'
+/// bindings (`preimage::DEFINITIONS_MADE`). A count that grows about 8 times a link from 50 to
+/// 400 links names a step that reads the chain again at each link (LOAD-defined-with).
+fn work_by_link(what: &str, unit: fn(usize) -> String, sizes: &[usize]) -> Vec<(usize, Vec<f64>)> {
+    use zedc::store::presburger::extend::counts;
+    let mut rows = Vec::new();
+    for &n in sizes {
+        let src = unit(n);
+        let (stmts, tokens, unit) = (
+            zed_tests::deep::statements(&src),
+            zedc::lex::lex_fence(&src).unwrap(),
+            elab(&src).unwrap(),
+        );
+        counts::take();
+        zedc::front::ASKED_AGAIN.with(|c| c.set((0, 0)));
+        zedc::store::preimage::DEFINITIONS_MADE.with(|c| c.set((0, 0, 0)));
+        let start = std::time::Instant::now();
+        let refused = zedc::front::linear_questions(&src, &tokens, &stmts, &unit);
+        let secs = start.elapsed().as_secs_f64();
+        let (again, again_atoms) = zedc::front::ASKED_AGAIN.with(|c| c.get());
+        let (defs, values, pairs) = zedc::store::preimage::DEFINITIONS_MADE.with(|c| c.get());
+        let row: Vec<f64> = (counts::take().into_iter())
+            .chain([again, again_atoms, defs, values, pairs])
+            .map(|c| c as f64 / n as f64)
+            .collect();
+        eprintln!(
+            "{what}: n {n}, {secs:.3} s, {} refused, per link {row:.1?}",
+            refused.len()
+        );
+        rows.push((n, row));
+    }
+    rows
+}
+
+#[test]
+fn the_work_of_each_link_of_a_chain_calling_an_integer_function_is_counted() {
+    // LOAD-defined-with, item A4 of its cross-review: which count grows with the chain.
+    use zedc::store::presburger::extend::counts;
+    let rows = work_by_link(
+        "a chain calling an integer function",
+        a_chain_calling_an_integer_function,
+        &[50, 100, 200, 400],
+    );
+    assert_eq!(rows.len(), 4);
+    // The rows the summaries make (MADE_ROWS) and those `lean` reads (LEAN_ROWS), per link,
+    // are flat from 50 to 400 links: measured 5.9 → 6.0 and 35.1 → 35.9 with the rows of a
+    // summary collapsed onto its key's atoms (`Summaries::make`), and before it 103.1 → 203.0
+    // and 13941 → 54541 from 50 to 100 links, growing with the chain. The factor 1.5 allows
+    // the first links' smaller pieces; a count read again at each link grows 8 times here.
+    let (first, last) = (&rows[0].1, &rows[3].1);
+    for (name, i) in [
+        ("MADE_ROWS", counts::MADE_ROWS),
+        ("LEAN_ROWS", counts::LEAN_ROWS),
+    ] {
+        assert!(
+            last[i] <= 1.5 * first[i].max(1.0),
+            "{name} per link grows from {} at 50 links to {} at 400",
+            first[i],
+            last[i]
+        );
+    }
+}
+
+/// [`a_chain_calling_an_integer_function`] with the call's argument `arg` (over `x`), the
+/// remainder of link `j` that of `x + shift(j)`, and `h{n-1}` bounded by `limit`: the
+/// cross-review's variants of LOAD-defined-with (its Gemini seat).
+fn an_integer_function_chain_variant(
+    n: usize,
+    arg: &str,
+    shift: fn(usize) -> usize,
+    limit: usize,
+) -> String {
+    let mut src = format!("h0(x: int) = (x + {}) mod 3;\n", shift(0));
+    for j in 1..n {
+        src.push_str(&format!(
+            "h{j}(x: int) = h{}(x: x) + (x + {}) mod 3;\n",
+            j - 1,
+            shift(j)
+        ));
+    }
+    src.push_str("p0(x: int) = x > 0;\n");
+    for i in 1..n {
+        src.push_str(&format!(
+            "p{i}(x: int) = h{}(x: {arg}) < {limit} && p{}(x: x + 1) && x < {};\n",
+            n - 1,
+            i - 1,
+            1000 * i
+        ));
+    }
+    src
+}
+
+#[test]
+fn the_answers_of_a_chain_calling_an_integer_function_are_those_reading_bodies() {
+    // LOAD-defined-with: the summaries of `h{j}` read the equal atoms and divisions of its
+    // links as one (`presburger::extend::collapsed`); each answer is still the one read with
+    // the bodies, and the one decided whole.
+    for m in [1, 2, 6, 30] {
+        answers_are_those_reading_bodies(&a_chain_calling_an_integer_function(m));
+    }
+}
+
+#[test]
+fn the_answers_of_a_chain_of_fifty_links_calling_an_integer_function_are_decided() {
+    // LOAD-defined-with: every link of the 50-link chain, against the reading of the bodies and
+    // the whole decision.
+    answers_are_those_reading_bodies(&a_chain_calling_an_integer_function(50));
+}
+
+#[test]
+fn the_answers_of_variants_of_a_chain_calling_an_integer_function_are_those_reading_bodies() {
+    // LOAD-defined-with, the Gemini seat's variants: the call at `x + 1` and at `2 * x`, a
+    // different remainder at each link (`(x + j) mod 3`, so no two divisions are one), and the
+    // bound `h{n-1} < 2n`, which `x mod 3 == 2` breaks (with `n` remainders of 2 summed), so
+    // that the tests from link 1 on hold only where `x mod 3 != 2`.
+    let same = |_: usize| 0;
+    let own = |j: usize| j;
+    for m in [1, 2, 6, 12] {
+        for src in [
+            an_integer_function_chain_variant(m, "x + 1", same, 3 * m),
+            an_integer_function_chain_variant(m, "2 * x", same, 3 * m),
+            an_integer_function_chain_variant(m, "x", own, 3 * m),
+            an_integer_function_chain_variant(m, "x", same, 2 * m),
+            an_integer_function_chain_variant(m, "x + 1", own, 2 * m),
+        ] {
+            answers_are_those_reading_bodies(&src);
+        }
+    }
+}
+
 /// The chains `g{i}` of largest values and `p{i}` of guarded increments of `m` links, both
 /// over `x`, and tests `t{i}` reading link `i` of each.
 pub(super) fn two_chains_sharing_an_input(m: usize) -> String {
