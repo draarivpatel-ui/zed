@@ -4434,7 +4434,8 @@ fn conjuncts(
         }
         match g {
             Formula::Con(c) => cons.push(c.clone()),
-            Formula::And(gs) => stack.extend(gs.iter()),
+            // Reversed, so that the parts are read in their order and written as before.
+            Formula::And(gs) => stack.extend(gs.iter().rev()),
             Formula::Not(n) => match &**n {
                 // `!(l >= 0)` is `-l - 1 >= 0`.
                 Formula::Con(c) if c.rel == Rel::Ge => {

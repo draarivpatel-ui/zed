@@ -891,6 +891,30 @@ fn xr_face_f3_unclaimed_call() {
     ));
 }
 
+/// R2-C-zed (XR-sound-extend-face-local-atoms round 2, Claude's form): two calls of `r`, so
+/// that neither claims it and the quotient passed as `y` reaches the interface of the call.
+/// `s` holds nowhere: `x > 8` and `x div 2 < 3` conflict.
+#[test]
+fn xr_face_f3_two_calls_of_one_callee() {
+    answers_are_those_of_the_whole(
+        "q(x: int) = (x mod 2 != 1 || x mod 4 == 1) && x > 1 && x < 10;\n\
+         r(x: int, y: int) = q(x: x) && x > 8;\n\
+         s(x: int) = r(x: x, y: 1) && r(x: x, y: x div 2) && x div 2 < 3;\n",
+    );
+}
+
+/// R2-C-zed (round 2, Gemini's form): `c` claims `r` first, so `s`'s call reads it through
+/// its formula and records `x div 2` in the interface.
+#[test]
+fn xr_face_f3_a_callee_claimed_elsewhere() {
+    answers_are_those_of_the_whole(
+        "q(x: int) = (x mod 2 != 1 || x mod 4 == 1) && x > 1 && x < 10;\n\
+         r(x: int, y: int) = q(x: x) && x > 8;\n\
+         c(z: int) = r(x: z + 1, y: z + 2);\n\
+         s(x: int) = r(x: x, y: x div 2) && x div 2 < 3;\n",
+    );
+}
+
 /// F3 again: the quotient is passed as `y` and read through it inside the callee; `s` holds
 /// nowhere, since `9 div 2` is 4.
 #[test]

@@ -46,6 +46,7 @@ use zedc_int::int::Int;
 mod def;
 mod holes;
 mod images;
+mod plane;
 mod residues;
 use def::{Def, free, reads};
 use holes::{Holes, hole_of};
@@ -86,8 +87,13 @@ pub mod counts {
     pub const WHOLE: usize = 6;
     /// Atoms of the formulas decided whole, their definitions included.
     pub const WHOLE_ATOMS: usize = 7;
+    /// Conjunctions decided from the rows that bound their region over Q (`plane::Plane`,
+    /// LOAD-chain-move).
+    pub const PLANE: usize = 8;
+    /// Rows kept by those regions, summed over the conjunctions decided from them.
+    pub const PLANE_ROWS: usize = 9;
     /// The number of counts.
-    pub const N: usize = 8;
+    pub const N: usize = 10;
 
     thread_local! {
         static COUNTS: [Cell<u64>; N] = const { [const { Cell::new(0) }; N] };
@@ -120,7 +126,8 @@ pub type Interface<'a> = &'a dyn Fn(&Formula) -> Option<Vec<Atom>>;
 /// definitions hold when it holds and the solver gave one. The point gives a value to every
 /// atom of the conjunction and of its definitions, so that a part added beside it, with
 /// atoms of its own, is met by giving values to those alone; but a point found with a kept
-/// part read through its face ([`Face`]) gives none to the atoms the face projects out, which a
+/// part read through its face ([`Face`]) gives none to the atoms the face projects out, nor to
+/// the atoms of its holes outside its own (XR-sound-extend-face-local-atoms round 2), which a
 /// question that reads one may not use ([`given`]).
 struct Known {
     answers: Answers,
@@ -138,6 +145,9 @@ struct Known {
     /// ([`Extending::fill`]), so that separate questions over one chain do not each read
     /// every definition they reach.
     later: bool,
+    /// Its region over Q, kept as the rows that bound it, when it is a conjunction of rows
+    /// `>=` over at most two symbols with an interior ([`plane::Plane`], LOAD-chain-move).
+    plane: Option<plane::Plane>,
 }
 
 /// A kept conjunction and the definitions it reaches, projected exactly onto the atoms its
@@ -354,6 +364,10 @@ impl Extending {
         let compound = |n: u32| {
             let d = def(n);
             let Formula::Con(c) = &d else { return d };
+            // Looked up first, so that the constraint is copied only when it is new (R2-bare-clone).
+            if let Some(w) = bare.borrow().get(c) {
+                return w.clone();
+            }
             (bare.borrow_mut().entry(c.clone()))
                 .or_insert_with(|| Formula::And(Shared::new(vec![d.clone()])))
                 .clone()
@@ -426,6 +440,20 @@ impl Extending {
         // printed before.
         let others = kids.iter().enumerate().filter(|&(i, _)| i != at);
         let rest = Formula::and(others.map(|(_, h)| h.clone()).collect());
+        // The region over Q of the whole, when the part has one and every other part is a row
+        // `>=` over its two symbols: the part's region cut by those rows, O(its kept rows) a
+        // row ([`plane::Plane`]). Anything else, an `Aux` among them, takes the paths below
+        // (LOAD-chain-move, META1 A1: the check is explicit).
+        let region = (part.plane.as_ref()).and_then(|p| {
+            let cons: Option<Vec<&Con>> = (kids.iter().enumerate())
+                .filter(|&(i, _)| i != at)
+                .map(|(_, h)| match h {
+                    Formula::Con(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            p.with(cons?)
+        });
         // The definitions the other parts reach past the auxiliary variables the part's point
         // gives a value: those it gives hold there with their own definitions, so a point that
         // extends it needs values for the new ones alone, and a link whose new constraint reads
@@ -528,6 +556,29 @@ impl Extending {
         }
         // No kept part's point extends: a point of the parts read through their faces, nothing
         // fixed, or the faces holding nowhere ([`Faces::free`]), before the whole is decided.
+        // A conjunction of rows over two symbols is decided from the rows that bound its region
+        // over Q, which have the same integer points as all of its rows: at most 3 a link on the
+        // chain `x + i y >= 1000 i` over `x >= y + 1, y >= 0`, whose whole decision grew 56.9
+        // times from 50 to 400 links (LOAD-chain-move; tests
+        // `l01_38_omega_test::extend::a_chain_whose_points_move_keeps_few_rows`, bench
+        // `l01_38_omega_test::bench::extend::a_chain_whose_points_move_is_decided_in_time_of_its_links`).
+        // Complexity tradeoff: a chain whose every row bounds the region keeps all of them
+        // (the tangent chain `i x + y >= i^2`), Θ(n) a link; see [`plane`].
+        if holds.is_none()
+            && let Some(r) = &region
+        {
+            counts::add(counts::PLANE, 1);
+            counts::add(counts::PLANE_ROWS, r.rows().count());
+            let (b, p) = found(&plane::formula(r));
+            // An axis no kept row reads is free in the region, so any value serves: 0.
+            let p = p.map(|mut p| {
+                for a in r.axes() {
+                    p.entry(a.clone()).or_default();
+                }
+                p
+            });
+            holds = Some((b, p));
+        }
         if holds.is_none() {
             self.faces.make(&self.known, kids.iter(), def, iface);
             holds = self.faces.free(&self.known, kids, def);
@@ -602,6 +653,7 @@ impl Extending {
             size: part.size + rest.atoms().len(),
             closure: Atoms::new(),
             later: false,
+            plane: region,
         }
     }
 
@@ -1021,12 +1073,15 @@ impl Faces {
             .collect();
         // The atoms of the faces' rows and clauses that the faces project out, as the quotient a
         // clause alone reads: the solver gives each a value at a point of the question, but not
-        // one its part holds at, since its definition is not read (`past`).
+        // one its part holds at, since its definition is not read (`past`). The atoms of its
+        // holes too, so that no atom a face reads is left out of the invariant whatever the
+        // holes hold (XR-sound-extend-face-local-atoms round 2, R2-holes).
         let gone = (faced.iter())
             .flat_map(|(_, face)| {
                 (face.rows.iter())
                     .flat_map(|c| c.lin.terms.keys().cloned())
                     .chain(face.clauses.iter().flat_map(Formula::atoms))
+                    .chain(face.holes.keys().cloned())
                     .filter(|a| !face.atoms.contains(a))
             })
             .collect();
@@ -2679,6 +2734,7 @@ fn whole(sums: &mut Summaries, g: &Formula, def: &dyn Fn(u32) -> Formula) -> Kno
         size: g.atoms().len(),
         closure: Atoms::new(),
         later: true,
+        plane: plane::Plane::of(g),
     }
 }
 
@@ -8761,6 +8817,42 @@ mod tests {
             let p2 = xextend(&p1, vec![xge(k(2), xq(0))]);
             cases.push((name, vec![xpair(2, 0), xpair(4, 2)], vec![part, p1, p2]));
         }
+        // R2-met-test (round 2, Gemini R2-2): two kept parts, the smaller's point at x = 9, so
+        // the point is met through `Faces::met` with `j != at`; without `unread` there, the
+        // quotient the face projects out keeps the solver's value and p2 is answered wrong.
+        {
+            let part = Formula::and(vec![
+                Formula::or(vec![Formula::negate(xeq(xq(1), k(1))), xeq(xq(3), k(1))]),
+                xge(x.clone(), k(2)),
+                xge(k(9), x.clone()),
+            ]);
+            let p0 = Formula::and(vec![xge(x.clone(), k(9)), xge(k(15), x.clone())]);
+            let p1 = Formula::and_keeping(vec![part.clone(), p0.clone()], |_| true);
+            let p2 = xextend(&p1, vec![xge(k(2), xq(0))]);
+            cases.push((
+                "met",
+                vec![xpair(2, 0), xpair(4, 2)],
+                vec![part, p0, p1, p2],
+            ));
+        }
+        // R2-A-test (round 2, Claude A-test): the shared quotient q0 is inserted by a split
+        // of a nested group inside a disjunct, `(x == 2 q0 + q1 && (q0 >= 1 || y >= 1) && (q0
+        // <= 3 || y <= 0)) || x >= 20`, q0 outside the interface.
+        {
+            let y = xs("y");
+            let inner = Formula::and(vec![
+                Formula::or(vec![xge(xq(0), k(1)), xge(y.clone(), k(1))]),
+                Formula::or(vec![xge(k(3), xq(0)), xge(k(0), y.clone())]),
+            ]);
+            let part = Formula::and(vec![
+                Formula::or(vec![inner, xge(x.clone(), k(20))]),
+                xge(x.clone(), k(0)),
+                xge(k(30), x.clone()),
+            ]);
+            let p1 = xextend(&part, vec![xge(x.clone(), k(9))]);
+            let p2 = xextend(&p1, vec![xge(k(2), xq(0))]);
+            cases.push(("nested", vec![xpair(2, 0)], vec![part, p1, p2]));
+        }
         let mut failures = Vec::new();
         for (name, defs, links) in &cases {
             let def = |n: u32| defs[n as usize / 2].clone();
@@ -8951,6 +9043,29 @@ mod tests {
         }
         failures.extend(xbad_points(&e, &def));
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+        // R2-bare-test (XR-sound-extend-face-local-atoms round 2): each wrap is made once and
+        // kept across calls, one for each constraint, whatever names it: a wrap made fresh on
+        // each call, or not kept in `bare` after the call, leaves `bare` without it; one keyed
+        // by the name gives two wraps for one constraint.
+        let con = |d: &Formula| match d {
+            Formula::Con(c) => c.clone(),
+            _ => unreachable!("each definition here is one constraint"),
+        };
+        let ids: Vec<Id> = defs.iter().map(|d| Id::any(&e.bare[&con(d)])).collect();
+        let later = Formula::and(vec![xge(xq(1), k(4)), xge(k(8), xq(0))]);
+        let _ = e.defined(&later, &def);
+        assert_eq!(e.bare.len(), defs.len());
+        let again: Vec<Id> = defs.iter().map(|d| Id::any(&e.bare[&con(d)])).collect();
+        assert_eq!(ids, again);
+        let mut one = Extending::new();
+        let same = |_: u32| defs[0].clone();
+        let both = Formula::and(vec![xge(xq(0), k(1)), xge(k(5), xq(1))]);
+        let _ = one.defined(&both, &same);
+        assert_eq!(
+            one.bare.len(),
+            1,
+            "one constraint under two names has one wrap"
+        );
     }
 
     /// The positive control: a face keeps a quotient two top-level clauses share, and drops one
