@@ -99,11 +99,20 @@ pub fn check_with<'a>(t: &Tables<'a>, unit: &'a [Stmt]) -> Info {
     // a port given to `len` among them, would offer repairs that read the port.
     let ports = super::ports::ports(t);
     let stop = !ports.errors.is_empty() || !ports.not_ports.is_empty();
+    // Two pushes to one port that may both run in one run (step L1.19), counted only where the
+    // ports are used rightly, since the count reads which parameters are ports.
+    let twice = match stop {
+        false => super::twice::twice(t, &ports),
+        true => Vec::new(),
+    };
     for (span, message, notes) in ports.errors {
         ck.error_with(span, message, notes);
     }
     for (span, message, notes) in ports.not_ports {
         ck.rejects_with(Row::PushToNameNotPort, span, message, notes);
+    }
+    for (span, message, notes) in twice {
+        ck.error_with(span, message, notes);
     }
     ck.port_params = ports.params;
     ck.port_writers = ports.writers;
@@ -2297,14 +2306,7 @@ impl<'t, 'a> Ck<'t, 'a> {
 
     /// The statements of one scope, in the order elaboration binds them; the export's type.
     fn scope(&mut self, m: &mut M<'a>, stmts: &'a [Stmt], top: bool) {
-        let mut export = None;
-        let mut items: Vec<&'a Stmt> = Vec::new();
-        for s in stmts {
-            match &s.kind {
-                StmtKind::Return(es) => export = Some(&es[..]),
-                _ => items.push(s.bare()),
-            }
-        }
+        let (items, export) = Stmt::split_export(stmts);
         // A cycle is a recursion, rejected until layer L6 (`recursion`). Every other statement
         // is still checked, one that uses a statement of a cycle among them too: stopping at the
         // cycle left the scope's other definitions with no signature and their errors
@@ -2921,8 +2923,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             LitsTake::F64 => Carrier::F64,
             LitsTake::Left => {
                 let mask = c.mask;
-                (mask & OTHER == 0 && mask.count_ones() == 1)
-                    .then(|| Carrier::of_mask(mask).next().expect("one carrier"))?
+                single_carrier(mask).then(|| Carrier::of_mask(mask).next().expect("one carrier"))?
             }
             LitsTake::Rejected(_, left) => match left.contains(&Carrier::F64) {
                 true => Carrier::F64,
@@ -33447,7 +33448,7 @@ fn domain_test(s: &Sig, ranges: Vec<Option<ParamRange>>) -> Result<Domain, (usiz
     let mut binds = Binds::new();
     for v in &vars.order {
         match s.bounds.get(v) {
-            Some(&m) if m & OTHER == 0 && m.count_ones() == 1 => {
+            Some(&m) if single_carrier(m) => {
                 binds.insert(v.clone(), Ty::of_mask(m));
             }
             Some(_) => {}
