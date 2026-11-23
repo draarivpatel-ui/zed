@@ -72,8 +72,11 @@ const COPIES_N: usize = 8000;
 /// `t{j}(x) = ra(x: x) && rb(y: x)` a pair, each joining its parameter to the first class
 /// and then refused against the second for `s`, which is neither its caller nor its callee.
 /// Looking through the smaller class at each refusal is O(n²) (eight pairs, so the place of
-/// `s` in each class's order varies less between runs); remembered, a repeated refusal is
-/// O(1).
+/// `s` in each class's order varies less between runs). Each join now costs two finds and one
+/// comparison of the lengths of the two classes' sets; no class here holds two functions of
+/// two or more parameters, so each refusal compares two inline functions (`s` on both sides)
+/// and no set is looked through: 8.00 times the instructions (DynamoRIO's zed_icount, hm2,
+/// 2026-11-22, 469,905,587 and 3,759,031,805).
 #[test]
 fn refused_joins_between_two_large_classes_scale() {
     let (small, large) = (
@@ -95,8 +98,8 @@ fn refused_joins_between_two_large_classes_scale() {
 /// The joins of item LOAD-join-disjoint: `k` chains of `k` one-parameter functions (classes
 /// `C_i`), `h` of `k` parameters joined one to each chain's head, and `k` functions `q_i`
 /// joining their parameter to chain `i`'s head and then to every other chain's head. Each
-/// join of `q_i` to chain `j` is refused (`C_i` and `C_j` share `h`, neither caller nor
-/// callee), a distinct pair of classes each time.
+/// join of `q_i` to chain `j ≠ i` is refused (`C_i` and `C_j` share `h`, neither caller nor
+/// callee): k(k − 1) refusals, two per unordered pair of chains.
 fn shared_function_joins(k: usize) -> (Vec<usize>, Vec<(usize, usize)>) {
     let mut first = vec![0];
     let add = |first: &mut Vec<usize>, p: usize| {
@@ -126,11 +129,13 @@ fn shared_function_joins(k: usize) -> (Vec<usize>, Vec<(usize, usize)>) {
 }
 
 /// The joins of [`shared_function_joins`] at `k` = 160 and 452, 25,920 and 205,208
-/// parameters (7.92 times). Each of the `k²` refusals between two classes never refused
-/// before was decided by looking through the smaller class of `k` functions, `n^1.5` in the
+/// parameters (7.92 times). Each of the `k(k − 1)` refusals (two per unordered pair of
+/// chains) was decided by looking through the smaller class of `k` functions, `n^1.5` in the
 /// `n` parameters: 17.37 times the instructions (item LOAD-join-disjoint, 2026-11-22). The
-/// sets looked through now hold only functions of two or more parameters, here `h` alone,
-/// so each refusal costs `O(1)`: 8.7 times.
+/// sets now hold only functions of two or more parameters, here `h` alone, kept inline, so
+/// each refusal compares two inline functions, `O(1)`: 7.95 times the instructions
+/// (DynamoRIO's zed_icount, hm2, 2026-11-22, 15,896,771 and 126,373,868; COMPLEXITY.md row
+/// LOAD-join-disjoint).
 #[test]
 fn joins_refused_for_a_function_shared_by_merged_classes_scale() {
     let (small, large) = (shared_function_joins(160), shared_function_joins(452));
@@ -146,19 +151,21 @@ fn joins_refused_for_a_function_shared_by_merged_classes_scale() {
     );
 }
 
-/// One function of 256 and of 2048 parameters and no join (from the XR-algos review, Codex,
-/// round 1): a structure that starts a count for each pair of a function's parameters, the
-/// candidate named at [`unite`], would cost `k(k - 1)/2` here before any join; `unite` costs
-/// `O(k)`.
+/// One function of 50,000 and of 400,000 parameters and no join (from the XR-algos review,
+/// Codex, round 1; sizes from cross-review XR-join-disjoint round 2, since at 256 and 2048 the
+/// fixed cost of a run hid the growth): a count per pair of class roots of the functions with
+/// parameters in both, the candidate of COMPLEXITY.md row LOAD-affine-join, would start at
+/// `k(k - 1)/2` pairs here before any join; `unite` costs `O(k)`: 7.98 times the instructions
+/// (DynamoRIO's zed_icount, hm2, 2026-11-22, 8,544,673 and 68,221,301).
 #[test]
 fn one_high_arity_owner_with_no_attempts_does_not_expand_pairs() {
-    let small = [0, 256];
-    let large = [0, 2048];
+    let small = [0, 50_000];
+    let large = [0, 400_000];
     let (roots, joined) = unite(&small, &[]);
     assert!(roots.into_iter().eq(0..small[1]));
     assert_eq!(joined, vec![false; small[1]]);
     crate::scaling::compare(
-        "one function with 256 and 2048 parameters",
+        "one function with 50,000 and 400,000 parameters, no join",
         1,
         || {
             std::hint::black_box(unite(&small, &[]));
@@ -171,8 +178,9 @@ fn one_high_arity_owner_with_no_attempts_does_not_expand_pairs() {
 
 /// One function of 50,000 and of 400,000 parameters, and a join between each two adjacent
 /// parameters, every one refused since both classes hold the function (from the XR-algos
-/// review, Gemini, round 1, adversary 2B): each refusal looks through one function on each
-/// side.
+/// review, Gemini, round 1, adversary 2B): each refusal compares two inline functions, the
+/// same one on each side: 7.99 times the instructions (DynamoRIO's zed_icount, hm2,
+/// 2026-11-22, 17,894,520 and 143,021,148, the same in two runs).
 #[test]
 fn joins_refused_between_the_parameters_of_one_wide_function_scale() {
     let build = |n: usize| ([0, n], (1..n).map(|i| (i - 1, i)).collect::<Vec<_>>());
@@ -180,8 +188,121 @@ fn joins_refused_between_the_parameters_of_one_wide_function_scale() {
     let (roots, joined) = unite(&small.0, &small.1);
     assert!(roots.into_iter().eq(0..small.0[1]));
     assert_eq!(joined, vec![false; small.0[1]]);
+    // The steps of `unite` (`unite_steps`), held without a timer: 7n - 4 here (two finds a
+    // join in each pass, a find a parameter in the marks and in `hot`, a find a node at the
+    // end, no set look-up since each refusal sees the function inline), 8.00 times at 8n
+    // (cross-review XR-join-disjoint round 2, where processor time spread from 6.3 to 20.0).
+    let steps = |(first, joins): &([usize; 2], Vec<(usize, usize)>)| {
+        unite_steps::take();
+        std::hint::black_box(unite(first, joins));
+        unite_steps::take()
+    };
+    let (at_n, at_8n) = (steps(&small), steps(&large));
+    assert_eq!((at_n, at_8n), (7 * 50_000 - 4, 7 * 400_000 - 4));
+    crate::scaling::hold_linear(
+        "one function of n parameters, n - 1 refused joins, n = 50,000 and 400,000",
+        "steps of unite",
+        at_n,
+        at_8n,
+    );
     crate::scaling::compare(
         "one function of n parameters, n - 1 refused joins, n = 50,000 and 400,000",
+        1,
+        || {
+            std::hint::black_box(unite(&small.0, &small.1));
+        },
+        || {
+            std::hint::black_box(unite(&large.0, &large.1));
+        },
+    );
+}
+
+/// The joins of [`opposed_multi_owner_classes`] at `k` = 64 and 181, about `2k²` parameters
+/// (8.0 times). The exact rule looked through a class of `k + 1` functions at each of the `k²`
+/// cross refusals, `n^1.5` (Codex, XR-algos round 1: 16.5 times); [`unite`]'s rule refuses each
+/// in O(1), since both classes hold two or more functions of two or more parameters: 8.62
+/// times the instructions (DynamoRIO's zed_icount, hm2, 2026-11-22, 8,531,964 and
+/// 73,546,161).
+#[test]
+fn many_multi_owner_functions_can_refuse_the_same_cross_pairs_scale() {
+    let (small, large) = (
+        opposed_multi_owner_classes(64),
+        opposed_multi_owner_classes(181),
+    );
+    crate::scaling::compare(
+        "multi-owner classes, k = 64 and 181",
+        1,
+        || {
+            std::hint::black_box(unite(&small.0, &small.1));
+        },
+        || {
+            std::hint::black_box(unite(&large.0, &large.1));
+        },
+    );
+}
+
+/// The joins of [`chains_of_two_parameter_functions`] at `k` = 120 and 340, about `2k²`
+/// parameters (8.0 times). The exact rule took 15.2 times the instructions (Gemini, XR-algos
+/// round 1, adversary 2A, on b65fc8f5f, 2026-11-22): each of the `k(k - 1)/2` joins of two
+/// heads looked through a class of `k + 1` functions. Now each is refused in O(1), both classes
+/// holding two or more functions: 8.41 times the instructions (DynamoRIO's zed_icount, hm2,
+/// 2026-11-22, 23,634,602 and 198,774,560).
+#[test]
+fn joins_refused_for_a_shared_function_over_chains_of_two_parameter_functions_scale() {
+    let (small, large) = (
+        chains_of_two_parameter_functions(120),
+        chains_of_two_parameter_functions(340),
+    );
+    crate::scaling::compare(
+        "k chains of k two-parameter functions sharing one function, k = 120 and 340",
+        1,
+        || {
+            std::hint::black_box(unite(&small.0, &small.1));
+        },
+        || {
+            std::hint::black_box(unite(&large.0, &large.1));
+        },
+    );
+}
+
+/// `n/2` functions of two parameters `2i` and `2i + 1`, the joins `(0, 2i)` for `0 < i < n/2`,
+/// which merge the even parameters into one class whose set grows to all `n/2` functions, then
+/// the joins `(0, 2i + 1)` for `0 <= i < n/2`, each refused by a look-up in that set that finds
+/// the function of `2i + 1` (Gemini, cross-review XR-join-disjoint round 3; no other bench here
+/// finds a function in a set, nor grows one past `Θ(√n)`). The `n/2 - 1` merges insert into the
+/// set and the `n/2` refusals look it up, `O(n log n)` in all: 8.83 times the instructions
+/// (DynamoRIO's zed_icount, hm4, 2026-11-22, 54,761,361 and 483,472,420, the same in two runs).
+#[test]
+fn joins_refused_by_a_look_up_in_a_set_of_n_over_2_functions_scale() {
+    let build = |n: usize| {
+        let m = n / 2;
+        let first: Vec<usize> = (0..=m).map(|i| 2 * i).collect();
+        let joins: Vec<(usize, usize)> = (1..m)
+            .map(|i| (0, 2 * i))
+            .chain((0..m).map(|i| (0, 2 * i + 1)))
+            .collect();
+        (first, joins)
+    };
+    let (small, large) = (build(50_000), build(400_000));
+    let (roots, joined) = unite(&small.0, &small.1);
+    let r = roots[0];
+    assert!((0..50_000).step_by(2).all(|v| roots[v] == r));
+    assert!((1..50_000).step_by(2).all(|v| roots[v] == v && !joined[v]));
+    assert!(joined[r]);
+    // The steps of `unite` (`unite_steps`): two finds a join in each pass, 4(n - 1); a find a
+    // parameter in the marks, in `hot` and at the end, 3n; a look-up and an insertion a merge,
+    // 2(n/2 - 1); a look-up a refusal, n/2. In all 8.5n - 6, 424,994 and 3,399,994, the counts
+    // of Gemini's copy of `unite` in round 3.
+    let steps = |(first, joins): &(Vec<usize>, Vec<(usize, usize)>)| {
+        unite_steps::take();
+        std::hint::black_box(unite(first, joins));
+        unite_steps::take()
+    };
+    let (at_n, at_8n) = (steps(&small), steps(&large));
+    assert_eq!((at_n, at_8n), (424_994, 3_399_994));
+    crate::scaling::compare(
+        "n/2 refused joins, each a look-up that finds the function in a set of n/2, n = 50,000 \
+         and 400,000",
         1,
         || {
             std::hint::black_box(unite(&small.0, &small.1));

@@ -6516,6 +6516,10 @@ enum Shape {
     Spine(Spine),
 }
 
+/// Per kinds, in [`RowIndex::by_kinds`]: the open rows' values (`None` where the kinds leave
+/// a row unknown), and whether every one is known.
+type KindsDecided = (Vec<Option<bool>>, bool);
+
 /// A row of a [`RowIndex`] that a tuple with no key of it may be in.
 struct Open {
     /// Per column, the column type and the types below it by depth, made as deep as a class
@@ -6565,9 +6569,14 @@ struct RowIndex {
     read: Vec<bool>,
     /// Per kinds of tuples, the open rows' values on a tuple of them with no key of theirs,
     /// when the kinds decide it ([`kind_status`]), the columns a row absorbs left out where
-    /// their component is a scalar. The chains are numbered by the table the index is read
-    /// with, always the same one.
-    by_kinds: HashMap<Vec<Option<Chain>>, Vec<Option<bool>>>,
+    /// their component is a scalar, and whether the kinds decide every open row. The chains
+    /// are numbered by the table the index is read with, always the same one.
+    // Complexity tradeoff (PERF-listing-complement-meets): whether every open row is decided
+    // is kept with the values, one word per kinds, read in O(1) by each tuple's check. It was
+    // read again by each check, a walk of the `k` open rows, so listing a meet of `c` types
+    // given by their complements, each one open row, took order `c²` (12.2 times the
+    // instructions from 1024 to 8192 types, the walk 337 M of the 1,262 M at 8192).
+    by_kinds: HashMap<Vec<Option<Chain>>, KindsDecided>,
     /// The table [`RowIndex::holds`] reads the chains with; [`RowIndex::holds_in`] is given one.
     chains: Chains,
     /// Per class, the open rows' values on a tuple of it with no key of theirs, and the part
@@ -7400,7 +7409,8 @@ impl RowIndex {
             .collect();
         if !self.by_kinds.contains_key(&kinds) {
             let decided = self.by_kinds(&kinds, chains);
-            self.by_kinds.insert(kinds.clone(), decided);
+            let all = decided.iter().all(Option::is_some);
+            self.by_kinds.insert(kinds.clone(), (decided, all));
         }
         let RowIndex {
             rows,
@@ -7415,7 +7425,7 @@ impl RowIndex {
             graph,
             ..
         } = self;
-        let decided = &by_kinds[&kinds];
+        let (decided, all_decided) = &by_kinds[&kinds];
         let key = ClassKey {
             regions: v
                 .iter()
@@ -7427,7 +7437,7 @@ impl RowIndex {
                     }
                 })
                 .collect(),
-            shape: match decided.iter().all(Option::is_some) {
+            shape: match *all_decided {
                 true => Shape::Kinds(kinds),
                 false => Shape::Spine(
                     v.iter()
@@ -8031,6 +8041,24 @@ pub mod rec {
                     Shape::Morphism(l, u, v) => (&[], [Some(l), Some(u), Some(v)]),
                 };
                 list.iter().chain(boxes.into_iter().flatten())
+            }
+
+            /// Whether the two hold the same besides their parts below, and as many of those:
+            /// the equality test of `ByShape` in module `group`, cheaper than its order.
+            pub(super) fn same_head(&self, other: &Shape) -> bool {
+                match (self, other) {
+                    (Shape::Param(i), Shape::Param(j)) => i == j,
+                    (Shape::Ref(i, xs), Shape::Ref(j, ys)) => i == j && xs.len() == ys.len(),
+                    (Shape::Type(s), Shape::Type(t)) => s == t,
+                    (Shape::Union(xs), Shape::Union(ys))
+                    | (Shape::And(xs), Shape::And(ys))
+                    | (Shape::Tuple(xs), Shape::Tuple(ys)) => xs.len() == ys.len(),
+                    (Shape::Atom(m, xs), Shape::Atom(n, ys)) => m == n && xs.len() == ys.len(),
+                    (Shape::Not(_), Shape::Not(_))
+                    | (Shape::Diff(..), Shape::Diff(..))
+                    | (Shape::Morphism(..), Shape::Morphism(..)) => true,
+                    _ => false,
+                }
             }
 
             fn open(&self, f: &mut fmt::Formatter<'_>) -> Result<&'static str, fmt::Error> {

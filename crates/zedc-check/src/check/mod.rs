@@ -2556,6 +2556,12 @@ struct Ck<'t, 'a> {
     /// check is code of `walk.rs`, which imports this file, and a call from here would make
     /// the two files import each other.
     check_fixes: fn(&mut Ck<'t, 'a>, Span, &mut Msg),
+    /// What refuses the uses of class `r` that take a tuple apart, index it or call it, once a
+    /// restriction leaves the class carriers alone ([`Self::restrict_asking`]): the walk's
+    /// [`Ck::refuse_taken_uses`], which refuses each as the use itself does. Given as a value for
+    /// the reason [`Self::check_fixes`] is: it is code of `walk.rs`, and a call from here
+    /// would make the two files import each other (s_01f_import_graph).
+    refuse_taken: fn(&mut Ck<'t, 'a>, usize, Vec<Need>),
     /// The fixes kept for rejections in the constructs being checked whose checks as written
     /// added errors only inside other arguments ([`Pending`]), settled when the construct's
     /// check ends ([`Ck::pending_settled`]).
@@ -3051,6 +3057,9 @@ struct Ck<'t, 'a> {
     /// operands are literals and such operations, by its span ([`Ck::rat_folded`]): its value,
     /// or for a power only that it is no zero; read off the text alone, so kept after a trial.
     rat_folds: HashMap<Span, RatFact>,
+    /// The value at `rat` of each name read through its binders to a literal or a fold, by the
+    /// name's span ([`Ck::rat_bound`]), or none; read off the text alone, so kept after a trial.
+    rat_bound_names: HashMap<Span, Option<Value>>,
     /// The classes [`Self::generic_parts`] made outside every function, for [`Self::apply`] to
     /// give their types once the application has met them ([`Self::resolve_top_parts`]); for
     /// the class of an operation on literals alone ([`Part::Op`]), the operation, which
@@ -3418,8 +3427,13 @@ struct Open {
 
 impl<'t, 'a> Ck<'t, 'a> {
     /// A check with the binder tables `t`, whose rejections' fixes `check_fixes` checks as
-    /// written ([`Self::check_fixes`]).
-    fn new(t: &'t Tables<'a>, check_fixes: fn(&mut Self, Span, &mut Msg)) -> Self {
+    /// written ([`Self::check_fixes`]), and whose uses left with carriers alone `refuse_taken`
+    /// refuses ([`Self::refuse_taken`]).
+    fn new(
+        t: &'t Tables<'a>,
+        check_fixes: fn(&mut Self, Span, &mut Msg),
+        refuse_taken: fn(&mut Self, usize, Vec<Need>),
+    ) -> Self {
         let mut ck = Ck {
             t,
             env: HashMap::new(),
@@ -3460,6 +3474,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             unnarrowed: HashMap::new(),
             written: None,
             check_fixes,
+            refuse_taken,
             pending_fixes: Vec::new(),
             carried: HashMap::new(),
             bound_carried: HashMap::new(),
@@ -3563,6 +3578,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             entry_params: HashMap::new(),
             entry_classes: HashMap::new(),
             rat_folds: HashMap::new(),
+            rat_bound_names: HashMap::new(),
             top_parts: Vec::new(),
             top_nested: false,
             top_open: Vec::new(),
@@ -6069,6 +6085,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         }
         self.touch(r);
         let c = &mut self.classes[r];
+        let lost_other = c.mask & OTHER != 0 && m & OTHER == 0;
         c.mask = m;
         c.asked |= asks;
         c.reasons.push(Reason {
@@ -6077,6 +6094,29 @@ impl<'t, 'a> Ck<'t, 'a> {
             takes: Some(mask),
         });
         self.log_class(r, r);
+        // A class that takes a tuple apart, is indexed or is called, and then loses every value
+        // but carriers, is refused here at each such use, as [`Ck::component`],
+        // [`Ck::at_index`], [`Ck::at_key`] and [`Ck::call_value_step`] refuse it when the
+        // restriction comes first, with the same message: written order fixes nothing
+        // (DESIGN.md sec:premise; row CHECK-destructure-order). Before, `a, b = p; return p +
+        // 1;` was accepted and the other order refused. A later use equal to a recorded one
+        // records no need of its own (`Ck::same_use`), so it is reported only where the
+        // restriction comes first. Complexity: `OTHER` leaves a class at most once, so the
+        // scan of its uses is O(uses) once per class, O(needs) in all.
+        if lost_other {
+            let taken: Vec<Need> = (self.classes[r].uses.iter())
+                .filter(|(_, u)| match u.kind {
+                    NeedKind::Destructure { i, .. } => i == 0,
+                    NeedKind::Component { .. } | NeedKind::Index { .. } => true,
+                    NeedKind::Call { .. } => true,
+                    _ => false,
+                })
+                .map(|(_, u)| u.clone())
+                .collect();
+            if !taken.is_empty() {
+                (self.refuse_taken)(self, r, taken);
+            }
+        }
         true
     }
 
@@ -7214,6 +7254,96 @@ impl<'t, 'a> Ck<'t, 'a> {
             }
         };
         t.renamed(&self.names(t.var_facts().classes))
+    }
+
+    /// Each of the types of the top values `tops` [`Self::solved`] and then [`Self::shown`],
+    /// the same types, made by one walk for all of them where that gives the same answer.
+    ///
+    /// Complexity tradeoff (GENERIC-nested-quadratic): naive version, as before, each type
+    /// solved and shown by walks of its own: the types of `t{i} = (t{i-1}, 1)` share their rows,
+    /// one deeper each, and each walk entered every row of its type, `O(n^2)` for `n` bindings
+    /// (78 times the work at 8n with `scale` generic, where its classes reach the bottom row;
+    /// probe of 2026-11-22, not committed: 40.0M of the Replacer's steps and 48.0M of
+    /// `VarFacts::tys`'s at n = 4000, all under this map). Used: the facts of all the types by
+    /// one walk ([`Ty::var_facts_all`]), the bindings of all their classes, and one replacement
+    /// and one renaming of all of them ([`Ty::replace_all`], [`Ty::renamed_all`]), whose memos
+    /// make each shared row once: `O(distinct rows)`, the cost of one walk of each (7.86 at 8n,
+    /// 30.8 s to 0.17 s at n = 4000; l01_26 bench
+    /// `a_generic_function_put_in_a_tuple_by_n_bindings_is_one_error_in_linear_time`). Checked:
+    /// in a debug build, in every program, the answers for the first [`TOPS_CHECKED`] top
+    /// values by name are compared with those of the walks of each type
+    /// ([`Self::check_tops_each`]), so in every test of l01_26, l01_26a, l01_29, l01_16 and
+    /// zedc-check's own tests. Tradeoffs: none;
+    /// a program the proof below does not cover takes the walks of each type, as before.
+    ///
+    /// Proof that the answers are those of the walks of each type alone. [`Self::solving`] and
+    /// [`Self::names`] bind each variable by itself, so the bindings `U` made for all the types
+    /// agree with the bindings `B` made for one type `t` on every variable both bind, and `U`
+    /// binds besides only class variables not in `t`'s facts' `classes`. (1) A class variable
+    /// met in `t` is in `t`'s `classes` or `names`; it is in `names` alone only where a
+    /// signature in `t` lists it (own, bounded or held, or a forward's held or outer name,
+    /// which `VarFacts::of` adds to `names`) and no type of that signature writes it, and then
+    /// the facts of every type holding that signature have `unwritten_class`, and so the facts
+    /// of all the types. Where they lack it, every class variable met anywhere in `t` is in
+    /// `t`'s `classes`, so `U` and `B` bind alike every variable `t` holds (the generic
+    /// `scale` of the bench lists its own `$0`, which its arrow writes). The replacement reads
+    /// its bindings only by such a
+    /// variable (`Replacer::bound`, `holds`, the variables a signature hides, `sig_of`) and in
+    /// the decoding of compact forwards (`Replacer::must_decode`), which also reads the
+    /// variables the bindings put in place (`targets`). (2) Where no function holds a compact
+    /// forward with internal results or held names (the facts' `internal` and `fwd_names`),
+    /// `must_decode_fwd` decodes only where a binding of a held outer variable or a held
+    /// class does, and those are among the facts' `names` (not classes, by (1)) or `classes`,
+    /// so bound alike; and [`Self::shown`] decodes none. The rows `U` rebuilds and `B` keeps
+    /// whole bind none of their variables, so are made equal. The same holds for the renaming
+    /// of the solved types with their facts. Otherwise each type is walked alone, as before.
+    fn shown_tops(&self, tops: HashMap<String, Ty>) -> HashMap<String, Ty> {
+        let alike = |f: &VarFacts| !f.internal && f.fwd_names.is_empty() && !f.unwritten_class;
+        let (keys, tys): (Vec<String>, Vec<Ty>) = tops.into_iter().unzip();
+        let facts = Ty::var_facts_all(&tys);
+        if !alike(&facts) {
+            let each = tys.iter().map(|t| self.shown(&self.solved(t)));
+            return keys.into_iter().zip(each).collect();
+        }
+        let solved = Ty::replace_all(&tys, &self.solving(&facts.classes));
+        let facts = Ty::var_facts_all(&solved);
+        let shown = match alike(&facts) {
+            true => Ty::renamed_all(&solved, &self.names(facts.classes)),
+            false => solved.iter().map(|t| self.shown(t)).collect(),
+        };
+        #[cfg(debug_assertions)]
+        self.check_tops_each(&keys, &tys, &shown);
+        keys.into_iter().zip(shown).collect()
+    }
+
+    /// The check of [`Self::shown_tops`] (debug builds, TEST-generic-shown-tops-equal): makes
+    /// the types of the first [`TOPS_CHECKED`] top values by name by walks of their own, as
+    /// before `shown_tops`, and asserts that each equals the one made with the others.
+    ///
+    /// Complexity tradeoff: naive version, every type walked alone, the `O(n^2)` work
+    /// `shown_tops` saves, which would make each scaling test of a program with many top values
+    /// quadratic in a debug build; and a limit on the number of types, which would check a
+    /// program at n and not at 8n and so lower the ratio a scaling test measures. Used: at most
+    /// `TOPS_CHECKED` walks, each of one type, so at most `TOPS_CHECKED` times the work of
+    /// `shown_tops`'s own walk, at every size, plus `O(k)` to choose them among `k` names.
+    /// Tradeoffs: a program with more top values is checked on the first `TOPS_CHECKED` only.
+    #[cfg(debug_assertions)]
+    fn check_tops_each(&self, keys: &[String], tys: &[Ty], shown: &[Ty]) {
+        let mut first: Vec<usize> = (0..keys.len()).collect();
+        if first.len() > TOPS_CHECKED {
+            first.select_nth_unstable_by_key(TOPS_CHECKED, |&i| &keys[i]);
+            first.truncate(TOPS_CHECKED);
+        }
+        for i in first {
+            let one = self.shown(&self.solved(&tys[i]));
+            assert!(
+                one == shown[i],
+                "the type of top value `{}` made with the others differs from the one made \
+                 alone: {:?} against {one:?}",
+                keys[i],
+                shown[i]
+            );
+        }
     }
 
     /// Decodes `NeedKind::Fwd` in `s` (and in the nested functions `s` holds) ONLY when
@@ -8450,10 +8580,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             .map(|(k, s)| (k, self.finished_arc_with(&s, &mut made, &mut fwd_memo)))
             .collect();
         let tops = std::mem::take(&mut self.info.tops);
-        self.info.tops = tops
-            .into_iter()
-            .map(|(k, t)| (k, self.shown(&self.solved(&t))))
-            .collect();
+        self.info.tops = self.shown_tops(tops);
         self.copy_alike_keys();
         // A test whose `||` alternatives limit each other's ranges in a loop is rejected, not
         // warned of (DESIGN.md L1.39): one error at each such test, for its `true` outcome
@@ -11989,7 +12116,11 @@ fn lit_carrier(v: &Value) -> Carrier {
 /// ([`menu`]) when it cannot take `c`, being a decimal at `int` or written with a suffix, or is
 /// not exactly a `c`.
 fn adopt(l: &Lit, c: Carrier) -> Result<Option<Value>, Msg> {
-    if let Some(m) = past(l, c) {
+    // At `f32` the range is found by the read of the digits below, which is the costly part, so
+    // [`past`] is asked only at `f64`, where it reads a field.
+    if c == Carrier::F64
+        && let Some(m) = past(l, c)
+    {
         return Err(m);
     }
     if lit_carrier(&l.value) == c || !c.numeric() {
@@ -12004,6 +12135,11 @@ fn adopt(l: &Lit, c: Carrier) -> Result<Option<Value>, Msg> {
     if c == Carrier::F32 && is_decimal(&l.value) {
         return match literal_f32(lit_digits(l)) {
             Some(Ok(x)) => Ok(Some(Value::float32(x))),
+            Some(Err(r)) if l.bare => Err(Msg::from(float_range(
+                l.spelling(),
+                Some(FloatFormat::F32),
+                &r,
+            ))),
             _ => Err(menu(l, &[c])),
         };
     }
@@ -12029,10 +12165,37 @@ fn adopt(l: &Lit, c: Carrier) -> Result<Option<Value>, Msg> {
 }
 
 /// The rejection of the decimal `l` at `c` when `c` is `f64` and `l` rounds there to infinity
-/// or, being nonzero, to zero ([`Lit::past_f64`]); `None` otherwise.
+/// or, being nonzero, to zero ([`Lit::past_f64`]), or `c` is `f32` and `l`, written without a
+/// suffix, rounds so there ([`past_f32`]); `None` otherwise.
 fn past(l: &Lit, c: Carrier) -> Option<Msg> {
-    let r = l.past_f64.as_ref().filter(|_| c == Carrier::F64)?;
-    Some(Msg::from(float_range(l.spelling(), None, r)))
+    match c {
+        Carrier::F64 => {
+            let r = l.past_f64.as_ref()?;
+            Some(Msg::from(float_range(l.spelling(), None, r)))
+        }
+        Carrier::F32 => past_f32(l).map(Msg::from),
+        _ => None,
+    }
+}
+
+/// The rejection of the decimal `l`, written without a suffix, at `f32` when its digits round
+/// there to infinity, as `1e39` does, or, being nonzero, to zero, as `1e-50` does: the range of
+/// the format is the reason, as for `1e39f32` (DESIGN.md L1.26b: a decimal literal is read once,
+/// straight into the carrier its use fixes, and one outside the range of that format is
+/// rejected for its range). A decimal is a value of `f32` wherever its digits round to a finite
+/// nonzero `f32` or are zero, so the rejection "A decimal literal is never an `f32`" that
+/// [`menu`] gave before was false (rows LIT-formats-decimal-past-f32-param of LIT-formats; test
+/// `l01_26a_generic_literals::f32_literals`). `None` for a literal with a suffix, an integer
+/// literal, or a decimal `f32` takes.
+// Complexity tradeoff: the digits are read to `f32` once more, O(n log^2 n) in their number as
+// in [`adopt`]'s own read; that read is kept separate because this one runs only on a literal
+// already rejected, where [`menu`] needs the reason and [`adopt`] has returned.
+fn past_f32(l: &Lit) -> Option<String> {
+    if !l.bare || !is_decimal(&l.value) {
+        return None;
+    }
+    let r = literal_f32(lit_digits(l))?.err()?;
+    Some(float_range(l.spelling(), Some(FloatFormat::F32), &r))
 }
 
 /// Why the decimal written `s`, with the suffix `forced` or none, is no value of the format
@@ -15264,7 +15427,11 @@ fn leaves_with(
 /// The literals of the other carriers that are exactly the number of `e` when `e` is a `rat`
 /// literal, `k` or `-k` with `k` written `1r` or `0.5r`, each with its type and the repair
 /// that writes it and the literal it writes, in the order of [`menu`]: the `f64` literal,
-/// `1.0` or `0.5`, where the number is an `f64` exactly, then the `int` literal, `1`, where it
+/// `1.0` or `0.5`, where the number is an `f64` exactly, then the same decimal at `f32` where
+/// the number is an `f32` exactly, since a decimal without a suffix takes the carrier its use
+/// fixes (step L1.26b), so `x + 1r` with `x: f32` is offered `x + 1.0` as `x: f64` is (plan
+/// row LIT-formats-rat-suffix-beside-f32; the suffix `f64` that [`with_carrier`] writes would
+/// be wrong there), then the `int` literal, `1`, where it
 /// is written without a point; `None` when `e` is no `rat` literal. A repair writes the
 /// literal's digits as `src`, the program's text, writes them, `1_000.0` for `1_000r`, where it is
 /// known. A literal has no length limit, so a repair that quotes it is written in memory asked for
@@ -15285,6 +15452,7 @@ fn rat_forms(e: &Expr, src: Option<&str>) -> Option<Vec<(Ty, Option<String>, Str
     let mut out = Vec::new();
     for (prim, carrier, suffix) in [
         (Prim::CastF64, Carrier::F64, if point { "" } else { ".0" }),
+        (Prim::CastF32, Carrier::F32, if point { "" } else { ".0" }),
         (Prim::CastInt, Carrier::Int, ""),
     ] {
         if carrier == Carrier::Int && point {
@@ -17471,6 +17639,12 @@ impl Ck<'_, '_> {
     }
 }
 
+/// How many top values' types [`Ck::check_tops_each`] makes alone in a debug build. Chosen,
+/// not measured: 8 covers every top value of most test programs, and keeps the check within 8
+/// times the work of the walk it checks, at every size.
+#[cfg(debug_assertions)]
+const TOPS_CHECKED: usize = 8;
+
 /// The check of the memo of rows that hold only lasting classes ([`Ck::clean`]), compiled only
 /// in a debug build and run only when the environment variable `ZEDC_CHECK_CLEAN` names a
 /// file: each [`Ck::unbound`] then also walks the whole type without the memo
@@ -18526,7 +18700,7 @@ mod tests {
     /// These tests record no construct ([`Ck::written`]), and with none recorded
     /// [`Ck::fixes_checked`], which `walk.rs` defines, keeps them as they are too.
     fn checker<'t, 'a>(t: &'t Tables<'a>) -> Ck<'t, 'a> {
-        Ck::new(t, |_, _, _| {})
+        Ck::new(t, |_, _, _| {}, |_, _, _| {})
     }
 
     fn span(start: usize) -> Span {
@@ -18543,6 +18717,56 @@ mod tests {
         sig.data = true;
         sig.arrows[0].result = lookup;
         sig
+    }
+
+    /// TEST-generic-shown-tops-equal: [`Ck::shown_tops`] gives each top value the type the walks
+    /// of that type alone give, where a signature lists a class variable `$k` that no type of
+    /// it writes ([`VarFacts::unwritten_class`]) and another top value writes `$k`, solved to
+    /// `int`: the walk of all the types binds `$k` and the walk of the signature alone does not.
+    /// No program of the tests of l01_26, l01_26a, l01_29, l01_16 or this crate gives a top value
+    /// such a signature (probe of 2026-11-23), so the signatures are built here: `$k` bounded
+    /// only, bounded and own, and bounded, own and held by a parameter that does not write it.
+    #[test]
+    fn top_values_shown_together_equal_those_shown_alone_where_a_signature_lists_an_unwritten_class()
+     {
+        let res = zedc_resolve::resolve::resolve(&[]).expect("the empty unit resolves");
+        let tables = Tables::new(&[], &res);
+        let mut ck = checker(&tables);
+        let k = ck.class();
+        ck.classes[k].resolved = Some(Ty::carrier(Carrier::Int));
+        let v: Arc<str> = format!("${k}").into();
+        let int = Ty::carrier(Carrier::Int);
+        let classes = Carrier::Int.bit() | Carrier::F64.bit();
+        let listing = |own: bool, held: bool| {
+            let mut s = Sig::one_partial(positional(1), vec![int.clone()], int.clone());
+            s.bounds.insert(v.clone(), classes);
+            if own {
+                s.own.insert(v.clone());
+            }
+            if held {
+                s.held.insert(v.clone());
+            }
+            Ty::func(Arc::new(s))
+        };
+        for (own, held) in [(false, false), (true, false), (true, true)] {
+            let tops: HashMap<String, Ty> = [
+                ("f".to_owned(), listing(own, held)),
+                ("w".to_owned(), Ty::var(v.clone())),
+            ]
+            .into_iter()
+            .collect();
+            let tys: Vec<Ty> = tops.values().cloned().collect();
+            assert!(
+                Ty::var_facts_all(&tys).unwritten_class,
+                "own {own}, held {held}: the signature lists a class no type writes"
+            );
+            let shown = ck.shown_tops(tops.clone());
+            for (name, t) in &tops {
+                let alone = ck.shown(&ck.solved(t));
+                assert_eq!(shown[name], alone, "own {own}, held {held}: `{name}`");
+            }
+            assert_eq!(shown["w"], int, "own {own}, held {held}: `w` is solved");
+        }
     }
 
     /// Whether the float format of `p` significand bits, least exponent `least` (of the least

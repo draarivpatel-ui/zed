@@ -108,3 +108,42 @@ fn removing_from_a_priority_search_tree_takes_log_time() {
         || removes(&large, &large_last),
     );
 }
+
+/// The second case of the held-back parts of a chain key (row PROOF-chain-left-held-back-bench,
+/// [`Block::certifies_held`]), measured on the held set alone: building a [`HeldBack`] and
+/// asking it, the branch of `certifies_held` for an entry `Some`, not `None` and not the rest
+/// of `Scope::project_block`. c parts with ends (c + j, c + j), j < c, held back in two
+/// batches (two wakes), then c idle parts with ends (i, 2c - i), i < c, asked in turn, none
+/// below every held part. The scan of before kept, at call i, the c - i held parts with
+/// j < c - i, scanned again by each later call: Θ(c^2) over the run. Now each call reads the
+/// least ends in O(e) and leaves the entry as it was: holding the c parts costs O(c log c),
+/// the calls O(c). Sizes c = 2,000 and 16,000; order n log n in the set's comparisons, under
+/// the limit for power 1, 10.5.
+#[test]
+fn held_back_parts_are_certified_in_constant_time_a_call() {
+    let run = |c: i64| {
+        let parts: Vec<(Vec<Int>, PartAt)> = (0..c)
+            .map(|j| {
+                (
+                    vec![Int::from(c + j), Int::from(c + j)],
+                    super::held_part(j),
+                )
+            })
+            .collect();
+        let mut held = HeldBack::default();
+        let mut parts = parts.into_iter();
+        held.hold(parts.by_ref().take(c as usize / 2));
+        held.hold(parts);
+        let certified = (0..c)
+            .filter(|&i| held.certified_by(&[Int::from(i), Int::from(2 * c - i)]))
+            .count();
+        assert_eq!(certified, 0);
+        std::hint::black_box(&held);
+    };
+    crate::scaling::compare(
+        "c idle parts against c parts held back, none below them all, c = 2,000 and 16,000",
+        1,
+        || run(2000),
+        || run(16_000),
+    );
+}
