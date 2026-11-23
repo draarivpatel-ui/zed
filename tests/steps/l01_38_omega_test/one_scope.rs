@@ -2926,6 +2926,105 @@ fn the_answers_of_variants_of_a_chain_calling_an_integer_function_are_those_read
     }
 }
 
+/// `p{i}(x) = h{n-1}(x: x) && p{i-1}(x: x + 1) && x < 1000 i` beside the chain `h{j}(x) =
+/// h{j-1}(x: x) && x != gap·j` of `n` links: case 1 of LOAD-call-disj for `gap` 1, its holes
+/// spread for `gap` 2.
+fn a_chain_calling_a_callee_with_holes_every(n: usize, gap: usize) -> String {
+    let mut src = String::from("h0(x: int) = x != 0;\n");
+    for j in 1..n {
+        src.push_str(&format!(
+            "h{j}(x: int) = h{}(x: x) && x != {};\n",
+            j - 1,
+            gap * j
+        ));
+    }
+    src.push_str("p0(x: int) = x > 0;\n");
+    for i in 1..n {
+        src.push_str(&format!(
+            "p{i}(x: int) = h{}(x: x) && p{}(x: x + 1) && x < {};\n",
+            n - 1,
+            i - 1,
+            1000 * i
+        ));
+    }
+    src
+}
+
+/// [`a_chain_calling_a_callee_with_holes_every`] with holes at consecutive values.
+pub(super) fn a_chain_calling_a_callee_with_holes(n: usize) -> String {
+    a_chain_calling_a_callee_with_holes_every(n, 1)
+}
+
+/// [`a_chain_calling_a_callee_with_holes_every`] with holes at every second value.
+pub(super) fn a_chain_calling_a_callee_with_spread_holes(n: usize) -> String {
+    a_chain_calling_a_callee_with_holes_every(n, 2)
+}
+
+#[test]
+fn the_answers_of_calls_of_a_callee_that_chooses_are_those_reading_bodies() {
+    // LOAD-call-disj (design A3 of its cross-review): a call that does not hold the claim of a
+    // callee that chooses writes the callee's choices over its kept symbols beside the rows
+    // of its projection ([`preimage::projected`]); each answer is the one read with the
+    // bodies, and the one decided whole where that decides.
+    for m in [1, 2, 6, 30] {
+        answers_are_those_reading_bodies(&a_chain_calling_a_callee_with_holes(m));
+        answers_are_those_reading_bodies(&a_chain_calling_a_callee_with_spread_holes(m));
+    }
+    for src in [
+        // Two calls with different arguments, one of them past every hole.
+        "h0(x: int) = x != 0;\nh1(x: int) = h0(x: x) && x != 1;\n\
+         h2(x: int) = h1(x: x) && x != 2 && x != 7;\n\
+         p0(x: int) = h2(x: x) && x >= 0 && x < 9;\n\
+         p1(x: int) = h2(x: x) && h2(x: x + 3) && x >= 0 && x < 5;\n\
+         p2(x: int) = h2(x: x + 5) && h2(x: 2 * x) && x > 0 - 4 && x < 4;",
+        // One argument for two parameters, and two arguments for them.
+        "w(x: int, y: int) = x != y + 1 && (x == 0 || y != 2);\n\
+         a0(a: int) = w(x: a, y: a + 3) && a > 0 - 3 && a < 3;\n\
+         a1(a: int) = w(x: a, y: a) && a > 0 - 3 && a < 3;\n\
+         a2(a: int) = w(x: a, y: a - 1) && a > 0 - 3 && a < 3;",
+        // The cross-review's R(x, x) against R(x, x + 1) (Codex seat): a key of the set of
+        // atoms would read both calls as one.
+        "r(a: int, b: int) = a == b || a == 0;\n\
+         f0(x: int) = r(a: x + 7, b: x + 8) && x > 3;\n\
+         f1(x: int) = r(a: x, b: x) && x > 3;\n\
+         f2(x: int) = r(a: x, b: x + 1) && x > 3;",
+        // A callee that is one constraint over a remainder, called twice.
+        "q(x: int) = x mod 3 == 1;\n\
+         s0(x: int) = q(x: x) && x > 0 && x < 9;\n\
+         s1(x: int) = q(x: x + 1) && q(x: x) && x > 0 && x < 9;",
+        // A call compared as a test, whose reading as an integer is undone first.
+        "h0(x: int) = x != 0;\nh1(x: int) = h0(x: x) && x != 1;\n\
+         t0(x: int) = h1(x: x) && x > 0 - 3 && x < 3;\n\
+         t1(x: int) = (h1(x: x + 1) == (x > 1)) && h1(x: x) && x > 0 - 3 && x < 3;",
+        // Choices over `abs` and `min`, which read auxiliary variables: read again.
+        "g0(x: int) = abs(x - 2) != 1;\ng1(x: int) = g0(x: x) && min(x, 5) != 3;\n\
+         u0(x: int) = g1(x: x) && x > 0 - 6 && x < 9;\n\
+         u1(x: int) = g1(x: x + 1) && x > 0 - 6 && x < 9;",
+    ] {
+        answers_are_those_reading_bodies(src);
+    }
+}
+
+#[test]
+fn a_callee_that_chooses_is_projected_once_for_its_key() {
+    // LOAD-call-disj: one projection for each callee and key ([`Walk::projection`], keyed by
+    // the canonical body, lambda and ordered key in `Memo::projections`), whatever the number
+    // of calls: `h{n-1}` is claimed by `p1`'s call and projected once for the others.
+    for n in [10, 40] {
+        let src = a_chain_calling_a_callee_with_holes(n);
+        let (stmts, tokens, unit) = (
+            zed_tests::deep::statements(&src),
+            zedc::lex::lex_fence(&src).unwrap(),
+            elab(&src).unwrap(),
+        );
+        zedc::store::preimage::PROJECTIONS_MADE.with(|c| c.set(0));
+        let refused = zedc::front::linear_questions(&src, &tokens, &stmts, &unit);
+        let made = zedc::store::preimage::PROJECTIONS_MADE.with(|c| c.get());
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(made, 1, "{n} links: {made} projections made");
+    }
+}
+
 /// The chains `g{i}` of largest values and `p{i}` of guarded increments of `m` links, both
 /// over `x`, and tests `t{i}` reading link `i` of each.
 pub(super) fn two_chains_sharing_an_input(m: usize) -> String {
@@ -3234,12 +3333,22 @@ fn answers_are_those_reading_bodies(src: &str) {
             let a = ext.defined_with(&r, &|n| scoped.def(n), &|g| scoped.interface(g));
             let b = ext_again.defined_with(&s, &|n| again.def(n), &|g| again.interface(g));
             let w = scoped.written(&r);
-            assert_eq!(
-                a,
-                b,
-                "`{name}` in\n{src}\n{w}\nwith the bodies:\n{}",
-                again.written(&s)
-            );
+            // A decided answer is accepted where the reference is refused: a call that writes
+            // its callee's projection (an integer function's value, LOAD-defined-with; a
+            // callee's choices, LOAD-call-disj) leaves the decision fewer atoms than the body
+            // read again, so it may decide where the reference is refused (Growth, Shadows).
+            // Such an answer is checked against the whole decision below where that decides.
+            // Every other pair must be equal, refusals too.
+            for (got, want) in [(&a.holds, &b.holds), (&a.fails, &b.fails)] {
+                if want.is_ok() || got.is_err() {
+                    assert_eq!(
+                        got,
+                        want,
+                        "`{name}` in\n{src}\n{w}\nwith the bodies:\n{}",
+                        again.written(&s)
+                    );
+                }
+            }
             for (got, f) in [
                 (&a.holds, expected.body.clone()),
                 (&a.fails, Formula::negate(expected.body.clone())),

@@ -692,6 +692,32 @@ fn the_relations_of_a_chain_calling_an_integer_function_scale() {
 }
 
 #[test]
+fn the_questions_of_a_chain_calling_a_callee_with_holes_scale() {
+    // `p{i}(x) = h{n-1}(x: x) && p{i-1}(x: x + 1) && x < 1000 i` beside `h{j}(x) = h{j-1}(x:
+    // x) && x != j` (LOAD-call-disj, case 1 of its cross-review): each call but the claiming
+    // one read the callee's body again, Θ(n) a call, since its projection refused every
+    // choice (relations 0.051 s at 50 links, 4.41 s at 400, measured once). The callee's
+    // holes are now one clause beside its projection, written at each call in O(1).
+    questions_scale_unit(
+        "the linear questions of a chain calling a callee with holes",
+        50,
+        a_chain_calling_a_callee_with_holes,
+    );
+}
+
+#[test]
+fn the_questions_of_a_chain_calling_a_callee_with_spread_holes_scale() {
+    // The same with `x != 2j` (LOAD-call-disj): the holes do not merge, so each call writes
+    // the n clauses, Θ(n) a call and Θ(n²) in all (META1 A3, its error 4). Kept to find
+    // whether that breaks 10.5; the shared call node is the design that removes it.
+    questions_scale_unit(
+        "the linear questions of a chain calling a callee with spread holes",
+        50,
+        a_chain_calling_a_callee_with_spread_holes,
+    );
+}
+
+#[test]
 fn the_questions_of_a_chain_moving_a_hole_scale() {
     // LOAD-bound-holes: the drifting chain beside `q(x) = (x < 10 || x > 20) && 0 < x <
     // 1000000`. Each link moves the hole `10..=20` by 3 and keeps it, so the face of the
