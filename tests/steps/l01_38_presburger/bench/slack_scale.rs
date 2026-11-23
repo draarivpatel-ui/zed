@@ -405,14 +405,17 @@ fn sat_half_project_each_scales_past_512() {
     });
 }
 
-/// Negative control for the scaling checks above: `build_many_linked`, whose `project_each` by
-/// the solver alone is not near linear (175M and 4,963M instructions at 64 and 512 in round 6,
-/// over 60 s at 4,096), fails the same limit on instructions (its bytes grow 13.9 times, too
-/// near the limit of 13.2 of 2026-11-13 to test). If this test stops panicking, the solver has
-/// become near linear on this family, or the check has stopped measuring. (Claude round 6.)
+/// `build_many_linked` projected by the solver alone. This was a negative control (Claude round
+/// 6): the solver alone was not near linear here (175M and 4,963M instructions at 64 and 512,
+/// over 60 s at 4,096) and failed the limit. Since PRES-growth-ladder-bytes, whose
+/// `merged_equal_atoms` writes the atoms tied by two-term equations by one root, the solver
+/// alone is near linear on this family: 9.66 times the instructions at 8n on VM v5e3, 9.49 and
+/// 9.74 times the processor time on VM hm4, and 8.98 without that row's change to
+/// `pairs::Index::frees`; the tree before the row fails in the same runs. So this now holds the
+/// solver alone to the limit; that the check fails superlinear work is `scaling_tests`'
+/// `work_a_power_of_n_above_the_order_given_fails`.
 #[test]
-#[should_panic(expected = "times the work")]
-fn many_linked_rows_project_each_fails_the_order_check() {
+fn many_linked_rows_project_each_scales_by_the_solver_alone() {
     let k = 64;
     let y0 = [sym("y0")];
     let (s, l) = (build_many_linked(k), build_many_linked(scaling::FACTOR * k));

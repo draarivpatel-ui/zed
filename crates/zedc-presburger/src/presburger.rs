@@ -111,7 +111,7 @@ use std::sync::Arc;
 use imbl::{OrdMap, OrdSet};
 use zed_kernel::digest::{DigestMap, DigestSet, TextMap, TextSet, text_hash, text_hasher};
 
-use zed_graph::UnionFind;
+use zed_graph::{Offset, UnionFind};
 use zed_kernel::refine::Refine;
 use zed_kernel::value::fresh_id;
 use zedc_int::int::{Int, IntRange, meet_range, range_meet, row_range};
@@ -11774,34 +11774,54 @@ fn tidy(lin: Lin, rel: Rel) -> Result<Option<Con>, ()> {
 /// row tidied ([`tidy`]); `None` where a row so written holds at no integer point. An equation
 /// is a row `a·x + b·y + k == 0`, or two rows `a·x + b·y + k >= 0` and `-a·x - b·y - k >= 0`,
 /// with `a` and `b` each 1 or -1; it gives `x = s·y + c` with `s = -a·b` and `c = -a·k`. The
-/// atoms are joined in classes (union-find, each atom holding its sign `s` and offset `c` from
-/// its parent, so that the root of its class gives its value), and each atom whose root is
-/// another is written in every row as `s·root + c`. A class holds at most one atom of `keep`,
-/// which is its root: two classes that each hold one are not joined, and their equation stays a
-/// row. Rows that name no atom so written are returned as they are, untidied. With `charged`
-/// the work is charged to the meter of the cover's work, `None` where it is spent.
+/// atoms are joined in classes (zed-graph's [`UnionFind`] with a [`zed_graph::Signed`] offset
+/// on each edge, so that the root of its class gives each atom's value), and each atom whose
+/// root is another is written in every row as `s·root + c`. A class holds at most one atom of
+/// `keep`, which is its root: two classes that each hold one are not joined, and their
+/// equation stays a row. Rows that name no atom so written are returned as they are, untidied.
+/// With `charged` the work is charged to the meter of the cover's work, `None` where it is
+/// spent.
+///
+/// This can complete a projection the queue of [`shadow_logged`] alone declines: two halves
+/// `x - y >= 0` and `y - x >= 0` are an equation here, while the queue, which takes only a
+/// `==` row as an equation, sees them as one more lower and upper bound of `x` and keeps `x`
+/// when its elimination would make more rows than it takes out (XR-presburger4 round 1,
+/// Codex Q1; test `opposite_halves_complete_a_projection_the_queue_declined`). The answer is
+/// still exact, by the proof below; only which projections are completed changed.
 ///
 /// Proof that the integer points on the atoms of `keep` are those of `rows` (step (8) of
 /// PROOF-shadow-exact, [`shadow`]): each atom written is outside `keep` and equals `s·root + c`
 /// at every integer point of `rows`, by the chain of equations that joined it to the root
 /// (composed: `x = s₁·y + c₁` and `y = s₂·r + c₂` give `x = s₁s₂·r + s₁c₂ + c₁`, integers
-/// with `s₁s₂` 1 or -1). So a point of `rows` is a point of the rows written, on the atoms
-/// left; and a point of the rows written gives each atom written the value `s·root + c`, an
-/// integer, which makes every row of `rows` hold, since each was written from it by putting
-/// in a value it then has; the equations themselves are written to `0 == 0` or `0 >= 0`,
-/// which `tidy` drops, or to a false row without atoms, which shows no point. This is step (3),
-/// substituting an equation whose atom has coefficient 1 or -1, done for every such equation
-/// at once. A row never gains a term: each term becomes one term, possibly joining another.
+/// with `s₁s₂` 1 or -1, [`zed_graph::Signed`]'s `compose`). So a point of `rows` is a point of
+/// the rows written, on the atoms left; and a point of the rows written gives each atom written
+/// the value `s·root + c`, an integer, which makes every row of `rows` hold, since each was
+/// written from it by putting in a value it then has; the equations themselves are written to
+/// `0 == 0` or `0 >= 0`, which `tidy` drops, or to a false row without atoms, which shows no
+/// point (an equation whose atoms were already one class with another offset, or with the
+/// other sign: `a - b == 0` and `a + b - 1 == 0` give `2·a - 1 == 0`, which `tidy` finds odd;
+/// written as halves, they give the rows `a >= 1` and `a <= 0`, which hold at no point).
+/// This is step (3), substituting an equation whose atom has coefficient 1 or -1, done for
+/// every such equation at once. A row never gains a term: each term becomes one term, possibly
+/// joining another.
 ///
 /// Complexity tradeoff: naive version, each such atom eliminated by the queue of
 /// [`shadow_logged`], one at a time, by its equation or by Fourier-Motzkin on its two halves;
 /// each elimination writes again every row of the atom, so k atoms `w{i} == b{i}` in one row
 /// of k terms cost Θ(k²) terms (`l01_38_presburger::bench::ladder`
 /// `products_whose_factors_one_sum_joins_scale`: 13.69 times the instructions at 8n from 90).
-/// Used: one pass to find the equations (a map of the `>=` rows of two terms, O(1) a row),
-/// union by size with path compression, and one pass writing each term by its root, O(T log
-/// T) for T terms of `rows` (the terms are held in ordered maps); never more rows or terms
-/// than `rows`.
+/// Used: one pass to find the equations, over ordered maps: the `>=` rows of two unit terms
+/// grouped by their terms, each group an ordered set of constants, and a row is the second half
+/// of an equation when the set of its negated terms holds its negated constant, O(log n) a row
+/// for n rows (a scan of each group's constants was Θ(n²) on n rows `a - b + i >= 0` and n rows
+/// `b - a + i >= 0`, XR-presburger4 round 1 A2; test
+/// `opposite_halves_are_found_in_logarithmic_comparisons`); then union by size with full path
+/// compression (zed-graph, its bounds there), and one pass writing each term by its root:
+/// O(T log T) for T terms of `rows` (the terms are held in ordered maps); never more rows or
+/// terms than `rows`. The pass that finds the equations is not charged to the meter: it reads
+/// each row once with O(log n) map steps, as the `put!` pass of [`shadow_logged`] that follows
+/// it does uncharged for every row; the meter counts the work that grows past the rows read
+/// (atoms taken, rows written), charged below.
 fn merged_equal_atoms(
     rows: &[&Con],
     keep: &dyn Fn(&Atom) -> bool,
@@ -11809,17 +11829,19 @@ fn merged_equal_atoms(
 ) -> Option<Vec<Con>> {
     let as_is = || rows.iter().map(|c| (*c).clone()).collect();
     let two_units = |c: &&&Con| c.lin.terms.len() == 2 && c.lin.terms.values().all(Int::is_unit);
-    let mut ge: HashMap<&BTreeMap<Atom, Int>, Vec<&Int>> = HashMap::new();
+    let mut ge: BTreeMap<&BTreeMap<Atom, Int>, BTreeSet<Counted<'_>>> = BTreeMap::new();
     for c in rows.iter().filter(|c| c.rel == Rel::Ge).filter(two_units) {
-        ge.entry(&c.lin.terms).or_default().push(&c.lin.constant);
+        ge.entry(&c.lin.terms)
+            .or_default()
+            .insert(Counted(Cow::Borrowed(&c.lin.constant)));
     }
     let mut eqs: Vec<&Lin> = Vec::new();
     for c in rows.iter().filter(two_units) {
         let equation = c.rel == Rel::Eq || {
             let neg: BTreeMap<Atom, Int> =
                 (c.lin.terms.iter()).map(|(a, k)| (a.clone(), -k)).collect();
-            ge.get(&neg)
-                .is_some_and(|ks| ks.iter().any(|k| (*k + &c.lin.constant).is_zero()))
+            let k = Counted(Cow::Owned(-&c.lin.constant));
+            ge.get(&neg).is_some_and(|ks| ks.contains(&k))
         };
         if equation {
             eqs.push(&c.lin);
@@ -11828,56 +11850,17 @@ fn merged_equal_atoms(
     if eqs.is_empty() {
         return Some(as_is());
     }
-    // `val(i) = ±val(up) + off`, `neg` the sign; `kept`, at a root, whether its class holds an
-    // atom of `keep` (then the root itself).
-    struct Node {
-        up: usize,
-        neg: bool,
-        off: Int,
-        kept: bool,
-        size: usize,
-    }
-    // The root of `i`, with `val(i) = ±val(root) + off`, every node of the path then pointing
-    // at the root directly.
-    fn find(nodes: &mut [Node], i: usize) -> (usize, bool, Int) {
-        let mut path = Vec::new();
-        let mut r = i;
-        while nodes[r].up != r {
-            path.push(r);
-            r = nodes[r].up;
-        }
-        // From the node nearest the root down, so that each parent already points at the root.
-        for &j in path.iter().rev() {
-            let p = nodes[j].up;
-            if p != r {
-                let (np, op) = (nodes[p].neg, nodes[p].off.clone());
-                let n = &mut nodes[j];
-                n.off = if n.neg { &n.off - &op } else { &n.off + &op };
-                n.neg ^= np;
-                n.up = r;
-            }
-        }
-        if r == i {
-            (r, false, Int::ZERO)
-        } else {
-            (r, nodes[i].neg, nodes[i].off.clone())
-        }
-    }
+    // `val(i) = f(val(root))`, `f` the composed edges' `Signed` offset; each class's value is
+    // whether it holds an atom of `keep` (then its root).
     let mut at: HashMap<&Atom, usize> = HashMap::new();
     let mut atoms: Vec<&Atom> = Vec::new();
-    let mut nodes: Vec<Node> = Vec::new();
+    let mut uf: UnionFind<bool, zed_graph::Signed<Int>> =
+        UnionFind::new(0, zed_graph::Compression::Full, zed_graph::Linking::Size);
     for e in &eqs {
         for a in e.terms.keys() {
             at.entry(a).or_insert_with(|| {
-                nodes.push(Node {
-                    up: atoms.len(),
-                    neg: false,
-                    off: Int::ZERO,
-                    kept: keep(a),
-                    size: 1,
-                });
                 atoms.push(a);
-                atoms.len() - 1
+                uf.push_value(keep(a))
             });
         }
     }
@@ -11885,47 +11868,35 @@ fn merged_equal_atoms(
         let mut t = e.terms.iter();
         let ((x, a), (y, b)) = (t.next().expect("two terms"), t.next().expect("two terms"));
         // `x = s·y + c`: `s = -a·b`, negative when `a` and `b` have one sign; `c = -a·k`.
-        let ns = a.is_positive() == b.is_positive();
-        let c = if a.is_positive() {
-            -&e.constant
-        } else {
-            e.constant.clone()
+        let r = zed_graph::Signed {
+            neg: a.is_positive() == b.is_positive(),
+            d: if a.is_positive() {
+                -&e.constant
+            } else {
+                e.constant.clone()
+            },
         };
-        let (rx, nx, ox) = find(&mut nodes, at[x]);
-        let (ry, ny, oy) = find(&mut nodes, at[y]);
-        if rx == ry || nodes[rx].kept && nodes[ry].kept {
+        let (rx, fx) = uf.find_offset(at[x]);
+        let (ry, fy) = uf.find_offset(at[y]);
+        let (kx, ky) = (*uf.value(rx), *uf.value(ry));
+        if rx == ry || kx && ky {
             continue;
         }
-        // `x = ±rx + ox` and `y = ±ry + oy` give `rx = t·ry + o`, `t` negative when an odd
-        // number of `nx`, `ns`, `ny` are, `o = ±x(s·oy + c - ox)`.
-        let nt = nx ^ ns ^ ny;
-        let s_oy = if ns { -&oy } else { oy };
-        let inner = &(&s_oy + &c) - &ox;
-        let o = if nx { -&inner } else { inner };
+        // `x = fx(rx)`, `y = fy(ry)` and `x = r(y)` give `rx = fx⁻¹(r(fy(ry)))`: with
+        // `fx = (s_x, ox)` and `fy = (s_y, oy)`, `rx = s_x·s·s_y·ry + s_x·(s·oy + c - ox)`.
+        let rx_under_ry = fx.inverse().compose(&r).compose(&fy);
         // A root of `keep` stays a root; otherwise the smaller class goes under the larger.
-        let under_ry = !nodes[rx].kept && (nodes[ry].kept || nodes[rx].size <= nodes[ry].size);
-        if under_ry {
-            nodes[ry].size += nodes[rx].size;
-            nodes[rx] = Node {
-                up: ry,
-                neg: nt,
-                off: o,
-                kept: false,
-                size: 0,
-            };
+        let which = if kx {
+            zed_graph::Keep::First
+        } else if ky {
+            zed_graph::Keep::Second
         } else {
-            // `ry = t·(rx - o) = t·rx - t·o`.
-            nodes[rx].size += nodes[ry].size;
-            nodes[ry] = Node {
-                up: rx,
-                neg: nt,
-                off: if nt { o } else { -&o },
-                kept: false,
-                size: 0,
-            };
-        }
+            zed_graph::Keep::Rule
+        };
+        uf.union_roots(rx, ry, rx_under_ry, which, |k, o, _| *k |= o);
     }
-    let roots: Vec<(usize, bool, Int)> = (0..atoms.len()).map(|i| find(&mut nodes, i)).collect();
+    let roots: Vec<(usize, zed_graph::Signed<Int>)> =
+        (0..atoms.len()).map(|i| uf.find_offset(i)).collect();
     // With `charged`, the meter is charged in the units of the queue of [`shadow_logged`] for
     // the same work: one for each atom eliminated (the queue's one for each atom taken) and one
     // for each row written again (the queue's one for each row an equation is put into). A row
@@ -11950,9 +11921,9 @@ fn merged_equal_atoms(
         for (a, k) in &c.lin.terms {
             let term = match at.get(a) {
                 Some(&i) if roots[i].0 != i => {
-                    let (r, neg, off) = &roots[i];
-                    lin.constant = &lin.constant + &(k * off);
-                    (atoms[*r], if *neg { -k } else { k.clone() })
+                    let (r, f) = &roots[i];
+                    lin.constant = &lin.constant + &(k * &f.d);
+                    (atoms[*r], if f.neg { -k } else { k.clone() })
                 }
                 _ => (a, k.clone()),
             };
@@ -11973,6 +11944,31 @@ fn merged_equal_atoms(
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the constants [`merged_equal_atoms`] compared on this thread.
+    static COMPARED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A constant of [`merged_equal_atoms`]' sets, ordered as the constant; the tests count its
+/// comparisons (`COMPARED`), and nothing else is added to them.
+#[derive(PartialEq, Eq)]
+struct Counted<'a>(Cow<'a, Int>);
+
+impl Ord for Counted<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        #[cfg(test)]
+        COMPARED.with(|n| n.set(n.get() + 1));
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Counted<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// [`shadow`] of the rows `rows` yields, each elimination written to `log` in turn when there
@@ -19529,7 +19525,21 @@ impl Omega {
             // Dropping a variable bounded on one side only removes its rows, which leaves every
             // other such variable bounded on one side or not at all, so the variables dropped
             // in the end, and the rows left, are the same in whatever order they are taken.
+            // `System::count` can put a pending variable back in `one_sided` (`write_lone`);
+            // it is read only once `flush` has taken every pending variable's rows
+            // (XR-presburger4 round 1 B4).
+            debug_assert!(
+                (self.pending_vars.keys()).all(|v| !self.sys.one_sided.contains(v)),
+                "one_sided read while a pending variable is in it"
+            );
             if let Some(&j) = self.sys.one_sided.first() {
+                debug_assert!(
+                    {
+                        let s = &self.sys.vars[j].sides;
+                        s.lo + s.hi > 0 && (s.lo == 0 || s.hi == 0)
+                    },
+                    "x{j} in one_sided is held and bounded on one side"
+                );
                 let rows = self.sys.take(j);
                 self.steps.push(Step::Chosen(j, rows));
                 continue;
@@ -20564,6 +20574,12 @@ impl Omega {
         // variables fixable, whose values can leave more such rows, along a chain.
         loop {
             self.write_lone();
+            // A row written false, or meeting its opposite nowhere, leaves no point: no value
+            // is fixed on it, and `Omega::run` answers at the top of its loop
+            // (XR-presburger4 round 1 B4; test `a_lone_row_written_false_fixes_nothing`).
+            if self.sys.empty {
+                return None;
+            }
             let pending = &self.pending_vars;
             self.sys.fixable.retain(|j| !pending.contains_key(j));
             if self.sys.fixable.is_empty() || meter::spent() {
@@ -20644,21 +20660,32 @@ impl Omega {
     /// written here is the row `flush` would have added; `flush` takes only the rows still
     /// held of the pending variables, so it writes each other row once, as before. Between
     /// the two, the rows held are those of `flush` for the rows written and the rows not yet
-    /// written for the rest: no step reads the rest but [`Omega::deferred`], whose test
-    /// `clear` keeps every elimination off a row that holds a pending variable, and
-    /// [`Omega::fix`], which reads only rows of one variable (`Sides::fixable`), none of them
-    /// holding a pending variable, as the variable fixed is not pending. A pending variable
-    /// is kept out of the ranks: [`System::count`] puts back the rank of each variable of a
-    /// row it removes, so the ranks of the pending variables of each row written are taken
-    /// out again here, as `read_pending` took them out.
+    /// written for the rest. Of the steps between, only these read the rest, and none writes
+    /// it: [`Omega::deferred`], whose test `clear` keeps every elimination off a row that holds
+    /// a pending variable, and whose [`System::least_unfilled`] reads only the ranks, which
+    /// count the terms of a row not yet written with its pending terms (so they can choose
+    /// another variable than after `flush`, the change of order the assumption at
+    /// [`Omega::read_pending`] covers, and `clear` declines the choice when one of its rows
+    /// holds a pending variable); and [`Omega::fix`], which reads the bounds (rows of one
+    /// variable, none of them holding a pending variable, as the variable fixed is not
+    /// pending) and the counts of `Sides::fixable`, where a row not yet written has two or
+    /// more variables not pending and pulls each of them the same way before and after it is
+    /// written, as a value changes no coefficient. A pending variable is kept out of the
+    /// ranks: [`System::count`] puts back the rank of each variable of a row it removes, so
+    /// the ranks of the pending variables of each row written are taken out again here, as
+    /// `read_pending` took them out; `count` also puts them back in `fixable`, which `deferred`
+    /// filters before `fix`, and in `one_sided`, which is read only after `flush`, whose
+    /// `take` removes them again (asserted where `Omega::run` reads it).
     ///
     /// Complexity tradeoff: the earlier rule wrote all the pending definitions into all their
     /// rows whenever one row was left with one variable not pending, so a long row of m terms
     /// beside a chain of m short rows, each fixed in turn, was rewritten at each link, Θ(m²)
     /// terms (`products_along_a_chain_with_a_disjunction_on_each_link_scale`: 21.2 times the
     /// instructions at 8 times the links, 280 to 2,240). Here each row is written once for
-    /// the definitions it holds when it is noted, plus once by `flush`: O(t log t) for the t
-    /// terms of the rows written.
+    /// the definitions it holds when it is noted, plus once by `flush`: O(t log n) for the t
+    /// terms of the rows written, n the rows held, as each row written is removed from and
+    /// added to the ordered maps of the system (XR-presburger4 round 1 B4: not O(t log t)
+    /// when t is small beside n). Test `a_lone_row_is_written_as_flush_writes_it`.
     fn write_lone(&mut self) {
         for id in std::mem::take(&mut self.lone) {
             if meter::spent() {
@@ -30319,6 +30346,78 @@ pub(super) mod tests {
         }
     }
 
+    /// The rows an [`Omega`] holds, each its terms and constant.
+    fn held(o: &Omega) -> Vec<(Vec<(usize, Int)>, Int)> {
+        (o.sys.rows.iter())
+            .map(|(a, h)| (a.to_vec(), h.k.clone()))
+            .collect()
+    }
+
+    /// `x0 = 0` pending, with `x1 - 5 >= 0` and `x0 - x1 + 3 >= 0`: the second is left with one
+    /// variable not pending, and written alone it is `-x1 + 3 >= 0`, which meets `x1 >= 5`
+    /// nowhere. `Omega::deferred` stops there, with no value fixed for `x1` (whose two rows of
+    /// one term each make it fixable) on a system with no point (XR-presburger4 round 1 B4).
+    #[test]
+    fn a_lone_row_written_false_fixes_nothing() {
+        let rows = [
+            (row(&[(1, 1)], -5), Rel::Ge),
+            (row(&[(0, 1), (1, -1)], 3), Rel::Ge),
+            (row(&[(0, 1)], 0), Rel::Ge),
+            (row(&[(0, -1)], 10), Rel::Ge),
+        ];
+        let mut o = Omega::new(&[0, 0], &rows, false);
+        assert!(!o.sys.empty && o.pending.is_empty(), "{:?}", held(&o));
+        o.cycled = true;
+        o.pending.push((0, row(&[], 0)));
+        assert!(o.deferred().is_none());
+        assert!(o.sys.empty);
+        assert_eq!(
+            o.pending.len(),
+            1,
+            "no value fixed on a system with no point"
+        );
+        assert!(matches!(o.run(), Leaf::Empty));
+    }
+
+    /// A chain `x{i} - x{i+1} + 1 >= 0` beside a long row `Σ x{i} - 2 >= 0`, with `x0 = 2`
+    /// pending: `Omega::write_lone` writes the first link alone, as `-x1 + 3 >= 0`, and leaves
+    /// the long row, which still has four variables not pending, to `Omega::flush`; the rows
+    /// held after the flush are those a flush alone gives (XR-presburger4 round 1 B4).
+    #[test]
+    fn a_lone_row_is_written_as_flush_writes_it() {
+        let n = 5;
+        let mut rows: Vec<(Row, Rel)> = (0..n - 1)
+            .map(|i| (row(&[(i, 1), (i + 1, -1)], 1), Rel::Ge))
+            .collect();
+        let long: Vec<(usize, i128)> = (0..n).map(|i| (i, 1)).collect();
+        rows.push((row(&long, -2), Rel::Ge));
+        rows.push((row(&[(0, 1)], 0), Rel::Ge));
+        rows.push((row(&[(0, -1)], 3), Rel::Ge));
+        let keys = vec![0; n];
+        let mut early = Omega::new(&keys, &rows, false);
+        let mut late = Omega::new(&keys, &rows, false);
+        assert_eq!(held(&early), held(&late));
+        for o in [&mut early, &mut late] {
+            o.cycled = true;
+            o.pending.push((0, row(&[], 2)));
+        }
+        early.read_pending();
+        early.write_lone();
+        let h = held(&early);
+        let first = (vec![(1, Int::from(-1))], Int::from(3));
+        assert!(h.contains(&first), "the first link written alone: {h:?}");
+        let long: Vec<(usize, Int)> = (0..n).map(|i| (i, Int::from(1))).collect();
+        assert!(
+            h.contains(&(long, Int::from(-2))),
+            "the long row waits: {h:?}"
+        );
+        assert!(!early.sys.empty);
+        early.flush();
+        late.flush();
+        assert_eq!(held(&early), held(&late));
+        assert!(held(&late).contains(&first));
+    }
+
     #[test]
     fn columns_of_opposite_signs_merge_and_lift_by_bezout() {
         // `2x - 3y == 1` sees `x` and `y` only through `2x - 3y`, which takes every integer:
@@ -33539,6 +33638,173 @@ mod dark_shadow {
         let keep = |x: &Atom| matches!(x, Atom::Sym(s) if s.starts_with('b'));
         let out = shadow(&rows, &keep, true).expect("a point");
         assert_eq!(out, vec![Con::ge(&want, &Lin::default())], "{rows:?}");
+    }
+
+    /// n rows `a - b + i >= 0` and n rows `b - a + i >= 0`, no two of them halves of one
+    /// equation: [`merged_equal_atoms`] compares O(n log n) constants to find that, not the
+    /// Θ(n²) of a scan of each group's constants (XR-presburger4 round 1 A2, Codex's two term
+    /// signatures), at n and at 8n.
+    #[test]
+    fn opposite_halves_are_found_in_logarithmic_comparisons() {
+        for n in [200_i128, 1600] {
+            let (ab, ba) = (
+                Lin::atom(a("a")).minus(&Lin::atom(a("b"))),
+                Lin::atom(a("b")).minus(&Lin::atom(a("a"))),
+            );
+            let rows: Vec<Con> = (1..=n)
+                .flat_map(|i| {
+                    [&ab, &ba].map(|l| Con::ge(&l.plus(&Lin::constant(i)), &Lin::default()))
+                })
+                .collect();
+            let refs: Vec<&Con> = rows.iter().collect();
+            COMPARED.with(|c| c.set(0));
+            let out = merged_equal_atoms(&refs, &|_| false, false).expect("rows as they are");
+            assert_eq!(out, rows);
+            let compared = COMPARED.with(Cell::get);
+            // 2n rows, each an insertion or a lookup in a set of n: a B-tree compares at most
+            // 2B - 1 = 11 keys a level over ⌈log_B n⌉ + 1 levels, B = 6, under 4·log₂(n) + 11.
+            let bound = 2 * n as u64 * (4 * (n as u64).ilog2() as u64 + 11);
+            assert!(
+                compared <= bound,
+                "n = {n}: {compared} comparisons, over {bound}"
+            );
+        }
+    }
+
+    /// The rows of 16 atoms `w{i}` joined by equations of every sign and offset, pairs then
+    /// pairs of pairs (classes of 2, 4, 8 and 16, so that finds walk paths of more than one
+    /// edge and compress them), then joined to the kept `k`: every row is written on `k` with
+    /// each atom's value composed along its path, checked against the values found by a walk
+    /// of the equations from `k`; a wrong sign or offset at any composition changes a row.
+    #[test]
+    fn merged_classes_write_each_atom_by_its_root() {
+        let w = |i: usize| format!("w{i}");
+        // `s1·u + s2·v + c == 0`.
+        let mut eqs: Vec<(String, String, i128, i128, i128)> = Vec::new();
+        let mut step = 1;
+        while step < 16 {
+            for i in (0..16).step_by(2 * step) {
+                let s1 = if (i + step) % 3 == 0 { -1 } else { 1 };
+                let s2 = if (i / 2 + step) % 2 == 0 { 1 } else { -1 };
+                eqs.push((
+                    w(i),
+                    w(i + step),
+                    s1,
+                    s2,
+                    (i as i128 % 5) - 2 + step as i128,
+                ));
+            }
+            step *= 2;
+        }
+        eqs.push(("k".into(), w(15), 1, -1, 3));
+        // Each atom as `sign·k + off`, by a walk from `k`: `u = -s1·s2·v - s1·c`.
+        let mut val: BTreeMap<String, (i128, i128)> = BTreeMap::from([("k".into(), (1, 0))]);
+        while val.len() < 17 {
+            for (u, v, s1, s2, c) in &eqs {
+                if let (Some(&(sv, ov)), false) = (val.get(v), val.contains_key(u)) {
+                    val.insert(u.clone(), (-s1 * s2 * sv, -s1 * s2 * ov - s1 * c));
+                } else if let (Some(&(su, ou)), false) = (val.get(u), val.contains_key(v)) {
+                    val.insert(v.clone(), (-s1 * s2 * su, -s1 * s2 * ou - s2 * c));
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for (j, (u, v, s1, s2, c)) in eqs.iter().enumerate() {
+            rows.extend(tie(u, v, *s1, *s2, *c, j % 2 == 0));
+        }
+        let mut sum = Lin::constant(1);
+        let mut want = Lin::constant(1);
+        for i in 0..16 {
+            let k = i as i128 + 1;
+            sum = sum.plus(&Lin::atom(a(&w(i))).times(k));
+            let (s, o) = val[&w(i)];
+            want = want.plus(&Lin::atom(a("k")).times(k * s).plus(&Lin::constant(k * o)));
+        }
+        rows.push(Con::ge(&sum, &Lin::default()));
+        let refs: Vec<&Con> = rows.iter().collect();
+        let keep = |x: &Atom| *x == a("k");
+        let out = merged_equal_atoms(&refs, &keep, false).expect("a point");
+        let want = tidy(want, Rel::Ge)
+            .expect("a row")
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(out, want, "{rows:?}");
+    }
+
+    /// `x == y + 1`, `y == z + 1` and `x == z + 3` join `x`, `y` and `z` in one class, and the
+    /// third equation, written by the root, is `0 == 1`: no point.
+    #[test]
+    fn a_cycle_of_equations_with_another_offset_has_no_point() {
+        for halves in [false, true] {
+            // `x - z - 3 == 0`, and with the offset that agrees, `x - z - 2 == 0`.
+            for (c, point) in [(-3, false), (-2, true)] {
+                let mut rows = tie("x", "y", 1, -1, -1, halves);
+                rows.extend(tie("y", "z", 1, -1, -1, halves));
+                rows.extend(tie("x", "z", 1, -1, c, halves));
+                let refs: Vec<&Con> = rows.iter().collect();
+                let out = merged_equal_atoms(&refs, &|_| false, false);
+                assert_eq!(out.is_some(), point, "{rows:?}: {out:?}");
+            }
+        }
+    }
+
+    /// `a - b == 0` and `a + b - 1 == 0` give `2·a == 1` written by the root: no integer point
+    /// (the rational point `a = b = 1/2` is not one). As one `==` row `tidy` finds it odd; as
+    /// two halves each half is tidied alone, to `a >= 1` and `a <= 0`, rows with no point that
+    /// the queue of [`shadow_logged`] then finds empty. Both keep the integer points exactly.
+    #[test]
+    fn an_odd_parity_cycle_has_no_point() {
+        for halves in [false, true] {
+            let mut rows = tie("a", "b", 1, -1, 0, halves);
+            rows.extend(tie("a", "b", 1, 1, -1, halves));
+            let refs: Vec<&Con> = rows.iter().collect();
+            let want = halves.then(|| {
+                vec![
+                    Con::ge(&Lin::atom(a("a")), &Lin::constant(1)),
+                    Con::ge(&Lin::constant(0), &Lin::atom(a("a"))),
+                ]
+            });
+            assert_eq!(
+                merged_equal_atoms(&refs, &|_| false, false),
+                want,
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// `x - y >= 0` and `y - x >= 0` with `x + a{i} >= 0` and `-x + b{i} >= 0` for three `i`,
+    /// `x` alone outside `keep` (Codex's example, XR-presburger4 round 1 B3): the two halves
+    /// are an equation to [`merged_equal_atoms`], so `x` is written as `y` and the projection
+    /// is the six rows on `y`; the queue alone (with a log, which skips the merge) sees four
+    /// lower and four upper bounds of `x` and keeps `x`.
+    #[test]
+    fn opposite_halves_complete_a_projection_the_queue_declined() {
+        let x = || Lin::atom(a("x"));
+        let y = || Lin::atom(a("y"));
+        let mut rows = vec![Con::ge(&x(), &y()), Con::ge(&y(), &x())];
+        let mut want = Vec::new();
+        for i in 1..=3 {
+            let (ai, bi) = (
+                Lin::atom(a(&format!("a{i}"))),
+                Lin::atom(a(&format!("b{i}"))),
+            );
+            rows.push(Con::ge(&x().plus(&ai), &Lin::default()));
+            rows.push(Con::ge(&bi, &x()));
+            want.push(Con::ge(&y().plus(&ai), &Lin::default()));
+            want.push(Con::ge(&bi, &y()));
+        }
+        let keep = |v: &Atom| *v != a("x");
+        let mut out = shadow(&rows, &keep, true).expect("a point");
+        out.sort();
+        want.sort();
+        assert_eq!(out, want, "{rows:?}");
+        let mut log = Vec::new();
+        let queue = shadow_logged(&mut rows.iter(), &keep, true, false, false, Some(&mut log))
+            .expect("a point");
+        assert!(
+            queue.iter().any(|c| c.lin.terms.contains_key(&a("x"))),
+            "the queue alone projected `x` out: {queue:?}"
+        );
     }
 }
 

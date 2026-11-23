@@ -28,6 +28,18 @@ use zedc_int::int::Int;
 
 use super::formula::{Factor, Lin};
 
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the pairs [`Index::frees`] read on this thread, by any of its three ways.
+    static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one pair read, in tests; nothing otherwise.
+fn read() {
+    #[cfg(test)]
+    READS.with(|n| n.set(n.get() + 1));
+}
+
 /// Whether each of `pairs`, the unordered pairs of indices into `rows`, is kept: the pairs left
 /// when every pair whose product alone holds an atom with no entry in `partners` (the factors
 /// each factor is multiplied by in a product the formulas mention) is dropped, to a fixpoint.
@@ -43,8 +55,10 @@ use super::formula::{Factor, Lin};
 /// live pair `{r, s}` with `r` holding `w`, O(log) when `s` is `p` and `p` does not hold `w`
 /// (then `r ⊗ p` holds every `w * z`), and otherwise O(min(|s|, |p|) × log) for the variables
 /// `s` and `p` share; or, when the variables of `p` not yet known to be blocked are on fewer
-/// pairs than `w` is, for each such `z` O(log) for each live pair on a row holding `z` (see the
-/// comment in [`Index::frees`]), whichever reads fewer pairs. After its first test a pair is
+/// pairs than `w` is, for each such `z` O(log) for each live pair on a row holding `z`; or, for
+/// each such `z`, O(log) for each row holding `w` and row holding `z`, the pair of the two
+/// found by binary search (see the comment in [`Index::frees`]), whichever reads fewest
+/// pairs. After its first test a pair is
 /// tested again only when a pair that held one of its atoms at its last test is dropped, so
 /// each drop costs a test of the pairs that
 /// share an atom with it, and each pair is tested at most once more than the number of its
@@ -52,7 +66,10 @@ use super::formula::{Factor, Lin};
 /// of pairs, and the whole costs O(k log k); with one sum `x + z0 + ... + z{k-1}` and the row
 /// `x - 1` beside k rows `y - w{j}`, the test of `{x - 1, y - w{j}}` reads the two pairs on
 /// `w{j}`, not the k on `x`, and the whole is again O(k log k)
-/// (`products_whose_premise_holds_k_atoms_in_no_product_scale`). In general it is not
+/// (`products_whose_premise_holds_k_atoms_in_no_product_scale`); and when each `w{j}` is also
+/// on a sum `w0 + ... + w{k-1}` paired with a row for each product `w{j} * c{j}`, that test
+/// looks up the one pair of `x - 1` with each row on `w{j}`, O(log k), not the k pairs of the
+/// sum (`products_beside_a_sum_whose_atoms_have_products_scale`). In general it is not
 /// O(n log n): many long rows that share variables cost O(|s| × |p|) for each pair read, and
 /// no bound better than the products themselves is known for that case. Tests:
 /// `tests::the_pairs_kept_are_those_left_by_expanding_every_product` (against the naive
@@ -94,6 +111,9 @@ struct Index<'a> {
     /// The number of pairs on the rows holding each variable: the order in which the variables
     /// of a row are tried.
     weight: Vec<usize>,
+    /// Each pair as its two rows, the lesser first, with its place in `pairs`, in that order:
+    /// the pairs of two given rows are found by binary search ([`Index::pairs_of`]).
+    at: Vec<((usize, usize), usize)>,
     /// The variables each variable is multiplied by in a product the formulas mention,
     /// ascending.
     mentioned: Vec<Vec<usize>>,
@@ -140,6 +160,10 @@ impl<'a> Index<'a> {
             .iter()
             .map(|rs| rs.iter().map(|&r| opp[r].len()).sum())
             .collect();
+        let mut at: Vec<((usize, usize), usize)> = (pairs.iter().enumerate())
+            .map(|(e, &(p, q))| ((p.min(q), p.max(q)), e))
+            .collect();
+        at.sort_unstable();
         let mut mentioned: Vec<Vec<usize>> = vec![Vec::new(); holding.len()];
         for (u, ps) in partners {
             if let Some(&u) = number.get(u) {
@@ -153,8 +177,19 @@ impl<'a> Index<'a> {
             holding,
             opp,
             weight,
+            at,
             mentioned,
         }
+    }
+
+    /// The pairs of the rows `r` and `s`, by binary search in `at`: O(log P + found) for P pairs.
+    fn pairs_of(&self, r: usize, s: usize) -> impl Iterator<Item = usize> + '_ {
+        let key = (r.min(s), r.max(s));
+        let from = self.at.partition_point(|&(k, _)| k < key);
+        (self.at[from..].iter())
+            .take_while(move |&&(k, _)| k == key)
+            .map(|&(_, f)| f)
+            .inspect(|_| read())
     }
 
     /// The coefficient of `w` in row `r`, zero when it has none.
@@ -220,58 +255,97 @@ impl<'a> Index<'a> {
             if not.len() == width {
                 continue 'w;
             }
-            // Two ways to find the live pairs that hold an atom `w * z` (PRES-growth-ladder-bytes):
-            // from the rows holding `w` (below, `weight[w]` pairs, each read for the variables it
-            // shares with `p`), or from the rows holding each `z` of `p` still open (`by_z`,
-            // `weight[z]` pairs each). Both are complete: a pair `{r, s}` holds `w * z` only
-            // when its coefficient `r_w s_z + r_z s_w` (`r_w s_w` for `z = w`) is not zero, so
-            // one of its rows holds `w` and one holds `z`. So both put the same `z` into `not`,
-            // and `e` frees an atom through `w` by one exactly when it does by the other; for
-            // each `z` put in through a pair, one blocking pair is watched, which is all
-            // `kept` needs (a pair is tested again when a pair that blocked one of its atoms
-            // goes; while the watched blocker of `z` stays, `z` stays blocked). The way taken
-            // is the one of fewer pairs, `weight[w]` against the sum of `weight[z]` over the
-            // open `z`, summed only until it passes `weight[w]` (each `weight[z] >= 1`, as `z`
-            // is on `p`, which is on `e`), so choosing costs O(min(weight[w], open z)).
+            // Three ways to find the live pairs that hold an atom `w * z`
+            // (PRES-growth-ladder-bytes): from the rows holding `w` (last, `weight[w]` pairs,
+            // each read for the variables it shares with `p`); from the rows holding each `z`
+            // of `p` still open (`by_z`, `weight[z]` pairs each); or, for each open `z`, by
+            // looking up the pairs of each row holding `w` with each row holding `z`
+            // (`by_rows`, `|holding[w]| × |holding[z]|` binary searches in `at`). All three
+            // are complete: a pair `{r, s}` holds `w * z` only when its coefficient
+            // `r_w s_z + r_z s_w` (`r_w s_w` for `z = w`) is not zero, so one of its rows holds
+            // `w` and one holds `z`, and each way reads every live pair with that property
+            // (the third reads exactly those pairs; the coefficient is the same with `r` and
+            // `s` swapped). So all put the same `z` into `not`, and `e` frees an atom through
+            // `w` by one exactly when it does by another; for each `z` put in through a pair,
+            // one blocking pair is watched, which is all `kept` needs (a pair is tested again
+            // when a pair that blocked one of its atoms goes; while the watched blocker of `z`
+            // stays, `z` stays blocked). The way taken is the one that reads fewest pairs,
+            // `weight[w]` against the sums over the open `z` of `weight[z]` and of
+            // `|holding[w]| × |holding[z]|`, summed only until both pass `weight[w]` (each
+            // term is at least 1, as `z` is on `p`, which is on `e`, and `w` is on `q`).
+            // Choosing costs O(|not| + min(weight[w], open z)):
+            // the scan of `p`'s variables passes over the `z` already in `not` on its way to
+            // the open ones (XR-presburger4 round 1 B5), and each of those was put into `not`
+            // above, so the building of `not` pays for passing it. From the open `z`, the
+            // first `z` that no live pair blocks frees an atom, and `e` is answered there.
             // Complexity tradeoff: from `w` alone, the earlier method, one row `x - 1` paired
             // with k rows `y - w{j}` read all k pairs of each to free the atom `x * w{j}`,
             // Θ(k²) for the k pairs (34.1 times the instructions at 8 times the atoms, the
             // benchmark `products_whose_premise_holds_k_atoms_in_no_product_scale`); from the
             // open `z` alone, a long row with many open variables beside a short row holding
-            // `w` costs the same the other way. The cheaper of the two is O(min) per `w`.
+            // `w` costs the same the other way. With only those two, the weights, which count
+            // every pair on a row, dead or alive, could make both dear at once (XR-presburger4
+            // round 1, Claude F3, A4): with a sum `w0 + ... + w{k-1}` paired with a row `c{j}`
+            // for each product `w{j} * c{j}` the formulas mention, beside `x - 1` paired with
+            // each `y - w{j}` for `x * y`, each `w{j}` is on the k pairs of the sum and `x` on
+            // k pairs, so the test of `{x - 1, y - w{j}}` read k pairs either way, Θ(k²) (61.8
+            // times at 8k on the review's port; counting only live pairs gave 61.6, as the
+            // pairs of the sum stay live). The third way reads there the one pair of `x - 1`
+            // with each of the two rows on `w{j}`, O(log P). The cheapest of the three is taken,
+            // O(min(...) × log P) per `w` for P pairs. Test
+            // `tests::a_sum_beside_its_products_reads_few_pairs` (fails for either of the first
+            // two ways alone); benchmark `products_beside_a_sum_whose_atoms_have_products_scale`
+            // in `l01_38_presburger::bench::ladder`.
             let open = || {
                 (self.vars[p].iter())
                     .map(|&(z, _)| z)
                     .filter(|z| !not.contains(z))
             };
-            let mut by_z = 0usize;
+            let (mut by_z, mut by_rows) = (0usize, 0usize);
+            let held_w = self.holding[w].len();
             for z in open() {
                 by_z += self.weight[z];
-                if by_z > self.weight[w] {
+                by_rows += held_w * self.holding[z].len();
+                if by_z > self.weight[w] && by_rows > self.weight[w] {
                     break;
                 }
+            }
+            if by_rows <= self.weight[w] && by_rows <= by_z {
+                let open: Vec<usize> = open().collect();
+                for z in open {
+                    let blocker = (self.holding[w].iter()).find_map(|&r| {
+                        (self.holding[z].iter()).find_map(|&s| {
+                            self.pairs_of(r, s)
+                                .find(|&f| f != e && live[f] && self.holds(r, s, w, z))
+                        })
+                    });
+                    let Some(f) = blocker else {
+                        return true;
+                    };
+                    watch[f].push(e);
+                }
+                continue 'w;
             }
             if by_z <= self.weight[w] {
                 let open: Vec<usize> = open().collect();
                 for z in open {
-                    'z: for &s in &self.holding[z] {
-                        for &(r, f) in &self.opp[s] {
-                            if f != e && live[f] && self.holds(r, s, w, z) {
-                                not.insert(z);
-                                watch[f].push(e);
-                                break 'z;
-                            }
-                        }
-                    }
-                }
-                if not.len() < width {
-                    return true;
+                    let blocker = (self.holding[z].iter()).find_map(|&s| {
+                        (self.opp[s].iter())
+                            .inspect(|_| read())
+                            .find(|&&(r, f)| f != e && live[f] && self.holds(r, s, w, z))
+                            .map(|&(_, f)| f)
+                    });
+                    let Some(f) = blocker else {
+                        return true;
+                    };
+                    watch[f].push(e);
                 }
                 continue 'w;
             }
             let p_holds_w = self.coef(p, w).is_some();
             for &r in &self.holding[w] {
                 for &(s, f) in &self.opp[r] {
+                    read();
                     if f == e || !live[f] {
                         continue;
                     }
@@ -464,5 +538,64 @@ mod tests {
             dropped += want.iter().filter(|&&k| !k).count();
         }
         assert!(dropped > 0, "no case dropped a pair");
+    }
+
+    /// The rows, pairs and products of a sum `w0 + ... + w{k-1} >= 0` paired with `c{j} >= 0`
+    /// for each product `w{j} * c{j}`, and `y - w{j} >= 0` paired with `c{j}` and with
+    /// `x - 1 >= 0` for `x * y`.
+    #[allow(clippy::type_complexity)]
+    fn sum_beside_products(k: usize) -> (Vec<Lin>, Vec<(usize, usize)>, Vec<(String, String)>) {
+        let w = |j: usize| format!("w{j}");
+        let c = |j: usize| format!("c{j}");
+        let sum: Vec<(i64, String)> = (0..k).map(|j| (1, w(j))).collect();
+        let sum: Vec<(i64, &str)> = sum.iter().map(|(c, s)| (*c, s.as_str())).collect();
+        let mut rows = vec![row(-1, &[(1, "x")]), row(0, &sum)];
+        let mut pairs = Vec::new();
+        let mut products = vec![("x".to_string(), "y".to_string())];
+        for j in 0..k {
+            let a = rows.len();
+            rows.push(row(0, &[(1, "y"), (-1, w(j).as_str())]));
+            rows.push(row(0, &[(1, c(j).as_str())]));
+            pairs.extend([(0, a), (1, a + 1), (a, a + 1)]);
+            products.push((w(j), c(j)));
+        }
+        (rows, pairs, products)
+    }
+
+    /// The pairs read in deciding `sum_beside_products(k)`, and whether the answer is right
+    /// (against `expanded` when `check`).
+    fn reads(k: usize, check: bool) -> u64 {
+        let (rows, pairs, products) = sum_beside_products(k);
+        let products: Vec<(&str, &str)> = (products.iter())
+            .map(|(u, v)| (u.as_str(), v.as_str()))
+            .collect();
+        let partners = partners_of(&products);
+        let rows: Vec<&Lin> = rows.iter().collect();
+        super::READS.with(|n| n.set(0));
+        let got = kept(&rows, &pairs, &partners);
+        let n = super::READS.with(std::cell::Cell::get);
+        if check {
+            assert_eq!(got, expanded(&rows, &pairs, &partners), "k = {k}");
+        }
+        n
+    }
+
+    /// XR-presburger4 round 1 A4 (Claude F3, F4): on `sum_beside_products`, the test of
+    /// `{x - 1, y - w{j}}` read the k pairs on `x` from `x`, or the k pairs of the sum from
+    /// `w{j}`, Θ(k²) in all either way; the lookup of the pairs of `x - 1` with the two rows on
+    /// `w{j}` reads one. Counted: the pairs read at k and 8k grow by at most 9 times, and stay
+    /// under 20 a link (taking only the first or only the second way reads about k a link).
+    #[test]
+    fn a_sum_beside_its_products_reads_few_pairs() {
+        for k in [1, 2, 5, 9] {
+            reads(k, true);
+        }
+        let (small, large) = (reads(250, false), reads(2000, false));
+        assert!(small <= 20 * 250, "{small} pairs read at k = 250");
+        assert!(large <= 20 * 2000, "{large} pairs read at k = 2000");
+        assert!(
+            9 * small >= large,
+            "{small} and {large} pairs read at k = 250 and 2000"
+        );
     }
 }

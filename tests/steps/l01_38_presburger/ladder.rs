@@ -1476,3 +1476,24 @@ pub(super) fn one_sum_of_atoms_in_no_product(k: usize) -> (Relation, Relation) {
     let g = rs.pop().expect("two relations");
     (rs.pop().expect("two relations"), g)
 }
+
+/// `x >= 1`, `y >= 0`, the rows `y >= w{j}`, `c{j} >= 0` and `w{j} * c{j} >= 0`, and the sum
+/// `w0 + ... + w{k-1} >= 0`, with the goal `x * y >= 0`: each `w{j}` is on the sum, which is
+/// paired with each `c{j}` for `w{j} * c{j}`, and on `y - w{j}`, which is paired with `x - 1`
+/// for `x * y` (XR-presburger4 round 1 A4, Claude F3).
+pub(super) fn sum_beside_products_of_its_atoms(k: usize) -> (Relation, Relation) {
+    let names: Vec<String> = (0..k).map(|j| format!("w{j}: int, c{j}: int")).collect();
+    let head = format!("ok(x: int, y: int, {})", names.join(", "));
+    let ws: Vec<String> = (0..k).map(|j| format!("w{j}")).collect();
+    let mut premise = vec![
+        "x >= 1".to_string(),
+        "y >= 0".to_string(),
+        format!("{} >= 0", ws.join(" + ")),
+    ];
+    premise.extend((0..k).map(|j| format!("y >= w{j} && c{j} >= 0 && w{j} * c{j} >= 0")));
+    let (ps, p) = function(&format!("{head} = {};", premise.join(" && ")));
+    let (_, g) = function(&format!("{head} = x * y >= 0;"));
+    let mut rs = relations(&[&p, &g], &ps, true).expect("in the domain");
+    let g = rs.pop().expect("two relations");
+    (rs.pop().expect("two relations"), g)
+}
