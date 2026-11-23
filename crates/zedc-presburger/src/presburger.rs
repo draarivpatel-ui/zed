@@ -11941,6 +11941,15 @@ thread_local! {
     static COMPARED: Cell<u64> = const { Cell::new(0) };
 }
 
+thread_local! {
+    /// Test control: [`shadow_logged`] takes the rows as they are, with no [`merged_equal_atoms`]
+    /// pass (the path before PRES-growth-ladder-bytes), for the negative control
+    /// `l01_38_presburger::bench::slack_scale`
+    /// `many_linked_rows_project_each_fails_the_order_check`, which shows the scaling check
+    /// fails the work this pass removes.
+    pub static MERGE_EQUAL_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
 /// A constant of [`merged_equal_atoms`]' sets, ordered as the constant; the tests count its
 /// comparisons, `==` and orderings alike (`COMPARED`), and nothing else is added to them.
 #[derive(Eq)]
@@ -12101,7 +12110,7 @@ fn shadow_logged<'a>(
     // the merge charges the meter in the queue's units for the same work, so a metered run
     // takes the same route as an unmetered one (exact::tests
     // `a_small_shadow_charges_its_generated_rows`, `reduced_is_refused_past_the_limit`).
-    if log.is_none() {
+    if log.is_none() && !MERGE_EQUAL_OFF.with(Cell::get) {
         let rows: Vec<&Con> = rows.collect();
         for c in merged_equal_atoms(&rows, keep, charged)? {
             put!(c);

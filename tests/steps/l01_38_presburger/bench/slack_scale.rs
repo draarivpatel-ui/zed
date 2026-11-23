@@ -4,7 +4,7 @@ use crate::slack_scale::*;
 use zed_tests::scaling;
 use zedc::store::interval::IntervalSet;
 use zedc::store::presburger::{
-    ROW_SUMS_OFF, Refusal, decide, project_each, project_each_solver, satisfiable,
+    MERGE_EQUAL_OFF, ROW_SUMS_OFF, Refusal, decide, project_each, project_each_solver, satisfiable,
 };
 
 #[test]
@@ -412,8 +412,8 @@ fn sat_half_project_each_scales_past_512() {
 /// alone is near linear on this family: 9.66 times the instructions at 8n on VM v5e3, 9.49 and
 /// 9.74 times the processor time on VM hm4, and 8.98 without that row's change to
 /// `pairs::Index::frees`; the tree before the row fails in the same runs. So this now holds the
-/// solver alone to the limit; that the check fails superlinear work is `scaling_tests`'
-/// `work_a_power_of_n_above_the_order_given_fails`.
+/// solver alone to the limit, and the negative control below, the same run without
+/// `merged_equal_atoms`, shows the check fails the work that pass removes.
 #[test]
 fn many_linked_rows_project_each_scales_by_the_solver_alone() {
     let k = 64;
@@ -434,6 +434,48 @@ fn many_linked_rows_project_each_scales_by_the_solver_alone() {
         ROW_SUMS_OFF.with(|o| o.set(false));
         assert_eq!(got.expect("projection").0[0], Ok(pt_set(&[1000])));
     });
+}
+
+/// Negative control for the test above (Claude round 6, kept from main with the pass it guards
+/// named): the same two sizes projected by the solver alone with [`MERGE_EQUAL_OFF`], so that
+/// `shadow_logged` takes its rows as they are and its queue writes each row of k atoms tied by
+/// two-term equations again k times, the path before PRES-growth-ladder-bytes, which was not
+/// near linear here (175M and 4,963M instructions at 64 and 512 in round 6, over 60 s at
+/// 4,096). It must fail the same limit on instructions; if it stops failing, the queue has
+/// become near linear on this family without the merge, or the check has stopped measuring.
+/// The two tests differ only in that switch, so the test above passing and this failing show
+/// it is `merged_equal_atoms` that makes the solver alone near linear here.
+///
+/// On a machine that counts no instructions the test measures nothing, as
+/// `l01_38_omega_test`'s `decide_on_unit_rows_costs_a_constant_times_the_search` does: a meter of
+/// processor time allows `scaling::TIME_ALLOWANCE` times the limit, 21, and under the load of a
+/// run of all of l01_38 at 8 test threads on a Colab VM the ratio measured was 14.97 (2026-11-23),
+/// so the check passed and this test, then `#[should_panic]`, failed in 7 of 10 such runs
+/// (b22-presburgerb3). On a Colab VM the instructions are counted under DynamoRIO's
+/// `zed_icount` only in a test run alone (`--exact`; tests/src/scaling.rs).
+#[test]
+fn many_linked_rows_project_each_fails_the_order_check() {
+    if !scaling::Meter::new().unit().starts_with("instructions") {
+        return;
+    }
+    let k = 64;
+    let y0 = [sym("y0")];
+    let build = |n: usize| build_many_linked_by(&squares_mod(n, 1000, 16001));
+    let (s, l) = (build(k), build(scaling::FACTOR * k));
+    let check = std::panic::AssertUnwindSafe(|| {
+        scaling::check_instructions_only("project_each: many linked rows", k, 1, |m| {
+            ROW_SUMS_OFF.with(|o| o.set(true));
+            MERGE_EQUAL_OFF.with(|o| o.set(true));
+            drop(project_each_solver(if m == k { &s } else { &l }, &y0));
+            MERGE_EQUAL_OFF.with(|o| o.set(false));
+            ROW_SUMS_OFF.with(|o| o.set(false));
+        })
+    });
+    let payload = std::panic::catch_unwind(check).expect_err("the queue alone fails the check");
+    let message = (payload.downcast_ref::<String>().map(String::as_str))
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(message.contains("times the work"), "{message}");
 }
 
 /// The same family with the join of row sums (module `row_sums`): the first row forces
