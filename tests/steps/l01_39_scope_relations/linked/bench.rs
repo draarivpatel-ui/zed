@@ -424,6 +424,18 @@ fn holes_piled_in_the_names_of_a_chain_take_quadratic_time() {
     });
 }
 
+/// The band of ST-band-quintic ([`band_holes_run`]), refused by its graph and its holed names
+/// and narrowed once by its hulls at each projection that reaches it (`Scope::by_holes`).
+/// Negative control: before ST-band-quintic it was projected block by block, 138 M, 4,115 M
+/// and 110,524 M instructions at k = 5, 10 and 20, about k^5 (COMPLEXITY.md S25).
+#[test]
+fn a_band_with_holes_and_joined_rungs_is_refused_in_near_linear_time() {
+    let p = Premises::new();
+    scaling::check("a band with holes and joined rungs", 16, |k| {
+        std::hint::black_box(band_holes_run(k, &p));
+    });
+}
+
 /// Holes in every name of a grid of difference constraints: each hole moves about `m - 1`
 /// names of the potential, so `m^3`, `n^1.5` in the `n = m^2` names (order 3 in `m`). Open as
 /// item ST-holes-moves (COMPLEXITY.md S25): the names a hole moves are those within its shift

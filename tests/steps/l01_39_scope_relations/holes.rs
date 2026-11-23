@@ -277,10 +277,23 @@ fn a_staircase_of_holes_on_one_cycle_is_exact() {
     .check_exact();
 }
 
+/// The part of `holes_on_three_names_of_two_cycles_are_refused`, joined both ways in two
+/// cycles, with holes in two of its names only: the ends method stays exact there (CT,
+/// ST-band-quintic keeps it), against the solutions found by brute force, in every order.
+#[test]
+fn holes_on_two_names_of_two_cycles_are_exact() {
+    System {
+        names: &[("x", 0, 6, &[5]), ("y", 0, 6, &[1, 4]), ("z", 0, 6, &[])],
+        differences: &["z <= y", "y <= x", "x <= z + 1", "z <= x", "x <= y + 1"],
+    }
+    .check_exact();
+}
+
 /// Holes in three names of a part that the constraints join both ways in two cycles,
 /// `z <= y <= x <= z + 1` and `z <= x <= y + 1`, each test a nested `if`: no method near
-/// linear in the names is known for the ends, so the part is projected one block at a time
-/// and a warning of its own says so. The warning depends on the constraints and on which
+/// linear in the names is known for the ends, so the part is refused, narrowed by its hulls
+/// with the holes left out (ST-band-quintic), and a warning of its own says so and gives the
+/// repairs. The warning depends on the constraints and on which
 /// names have holes alone: other holes in the same names give the same warning. Each depth
 /// where the tests so far already join the names in two cycles warns, each warning naming its
 /// own constraints. In one `&&` the hole tests stay in the relation as conjuncts that are
@@ -300,14 +313,21 @@ fn holes_on_three_names_of_two_cycles_are_refused() {
     let head = "warning: Cannot find exactly the least and greatest values the conditions \
         here allow\n  \
         [1] the constraints `";
-    let tail = "` hold in the scope\n  \
+    let mid = "` hold in the scope\n  \
         [2] they join their 3 names both ways in more than one cycle, and 3 of them have \
         holes: `x`, `y`, `z`; the ends of such names are found exactly when at most two of \
         them have holes\n  \
-        [3] the names of the constraints are narrowed one block at a time, and their ends may \
-        be wider than the constraints make them; so the checker may reject or warn \
-        about code here that is correct, and it does not accept code that is wrong";
-    let all = format!("{head}x <= y + 1 && x <= z + 1 && x >= y && x >= z && y >= z{tail}");
+        [3] the names of the constraints are narrowed by the constraints with the holes left \
+        out, and their ends may be wider than the constraints make them; so the checker may \
+        reject or warn about code here that is correct, and it does not accept code that is \
+        wrong\n  \
+        [4] to find the ends exactly, leave holes in at most two of `x`, `y`, `z`: drop the \
+        tests `!=` that leave holes in the others\n  \
+        [5] or split the constraints `";
+    let tail = "` so that they join these names in one cycle only, for example by dropping a \
+        constraint that joins two of them a second way";
+    let c = "x <= y + 1 && x <= z + 1 && x >= y && x >= z && y >= z";
+    let all = format!("{head}{c}{mid}{c}{tail}");
     for s in [a, b] {
         for (order, ws) in s.warnings() {
             let found: Vec<&String> = ws
@@ -320,7 +340,10 @@ fn holes_on_three_names_of_two_cycles_are_refused() {
             }
             assert!(found.contains(&&all), "{order}: {ws:?}");
             for w in found {
-                assert!(w.starts_with(head) && w.ends_with(tail), "{order}: {w}");
+                assert!(
+                    w.starts_with(head) && w.contains(mid) && w.ends_with(tail),
+                    "{order}: {w}"
+                );
             }
         }
         for (order, src) in s.programs() {

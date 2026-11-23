@@ -2402,6 +2402,69 @@ fn piled_holes_run(k: usize, p: &Premises) -> Scope {
     })
 }
 
+/// The band of ST-band-quintic at size `k`: names `x_0..=x_k`, `x_i` in `10 (k - i) ..= 10 (k -
+/// i) + 9` and `10 <= x_i - x_(i+1) <= 11`, then for each `i < k - 1` a hole
+/// `x_i != 10 (k - i) + 5` that holds and a rung `x_i - x_(i+2) >= 20` as an `if` whose arms
+/// join. The band joins its names both ways in more than one cycle once a rung is in, and the
+/// holes pile up in three names or more, so the ends method refuses the tree.
+fn band_holes_run(k: usize, p: &Premises) -> Scope {
+    let n = named(k + 1, "x");
+    let base = |i: usize| (10 * (k - i)) as i64;
+    let s = (0..=k).fold(ints(&n), |s, i| {
+        s.assume(&prim(Prim::Ge, var(&n[i]), int(base(i))), true, p)
+            .assume(&prim(Prim::Le, var(&n[i]), int(base(i) + 9)), true, p)
+    });
+    let s = (0..k).fold(s, |s, i| {
+        s.assume(&ge(&n[i], &n[i + 1], 10), true, p)
+            .assume(&ge(&n[i + 1], &n[i], -11), true, p)
+    });
+    (0..k - 1).fold(s, |s, i| {
+        let s = s.assume(&prim(Prim::Ne, var(&n[i]), int(base(i) + 5)), true, p);
+        let t = ge(&n[i], &n[i + 2], 20);
+        let mut j = s
+            .assume_case(&t, true, p)
+            .join(&s.assume_case(&t, false, p));
+        j.reduce();
+        j
+    })
+}
+
+/// The band of [`band_holes_run`] at `k = 5`, 10 and 20: the tree is refused by its graph and its holed
+/// names (a warning on the band's names), and each name is still narrowed to within its own
+/// bounds with its hole left out, so the scope stays sound. `bench::a_band_with_holes_and_
+/// joined_rungs_is_refused_in_near_linear_time` measures its cost.
+#[test]
+fn a_band_with_holes_and_joined_rungs_is_refused() {
+    for k in [5, 10, 20] {
+        check_band_holes(k);
+    }
+}
+
+fn check_band_holes(k: usize) {
+    let p = Premises::new();
+    let s = band_holes_run(k, &p);
+    let n = named(k + 1, "x");
+    assert!(
+        !s.refused_on(n.iter().map(|x| &**x)).is_empty(),
+        "no refusal on the band"
+    );
+    for (i, x) in n.iter().enumerate() {
+        let b = (10 * (k - i)) as i64;
+        let got = s.get(x).ints().to_string();
+        assert!(!s.get(x).ints().is_empty(), "{x}: {got}");
+        if i < k - 1 {
+            assert!(
+                !s.get(x).ints().contains(b + 5),
+                "{x} keeps its hole: {got}"
+            );
+        }
+        assert!(
+            !s.get(x).ints().contains(b - 1) && !s.get(x).ints().contains(b + 10),
+            "{x} within its bounds: {got}"
+        );
+    }
+}
+
 /// An `m` by `m` grid of names, each in its own ten values, each greater than the names right of
 /// and below it, then a hole in each name in rows; the names, their bases and the scope.
 fn grid_holes(m: usize, p: &Premises) -> Scope {
