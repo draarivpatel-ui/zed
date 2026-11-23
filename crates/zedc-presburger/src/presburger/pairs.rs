@@ -21,12 +21,42 @@
 //! shorter row `q`, the `z` of the longer row `p` that do not give a free atom `w * z` are
 //! collected, and the pair goes when they are fewer than the variables of `p`.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use zed_graph::{Order, Worklist};
 use zedc_int::int::Int;
 
+use super::Refusal;
 use super::formula::{Factor, Lin};
+
+/// The steps [`kept`] may take for each unit of its input, and the terms and pairs
+/// [`super::products`] may form for each unit of its own (the work meter of plan row
+/// PRES-pairs-grid-reads). What it bounds: the reads, lookups and variables passed of
+/// [`Index::frees`] and the pairs taken from the queue, against `k = R + T + P + M` (rows,
+/// their terms, pairs, entries of `partners`); in [`super::products`], the pairs formed and
+/// the terms of the products kept, against the terms of the rows multiplied. Past it the
+/// question is refused ([`Refusal::Products`]); below it nothing changes: the meter only
+/// stops the work, it never changes which pairs are kept, so every answer given is the one
+/// the unmetered method gives. How it was chosen: the largest ratio measured with the meter
+/// off on the tests of the crate (VM v5e1, job 45, 4,023 calls): steps of [`kept`] over its
+/// input at most 35.1 (k = 37, a random case of
+/// `tests::the_pairs_kept_are_those_left_by_expanding_every_product`; small inputs pay the
+/// fixed cost of each pair's test), apart from the grid family at m = 16 (37.3, k = 976,
+/// growing about as k^0.9 over the ratio); the pairs formed over the input of
+/// [`super::products`] at most 1.14, and the terms of the products kept at most 24.6 (the
+/// grid at m = 16), apart from Θ(k²) families such as
+/// `tests::a_sum_holding_the_goal_reads_few_pairs` (76 at k = 100, 601 at k = 800), which
+/// are refused. On the other tests (VM hm4, job 47, meter off): `l01_38_presburger`
+/// (193 calls, up to the run's end at FAIL-power-too-large-built-before-refusal) steps at
+/// most 13.3 and product terms 6.5; the ladder benchmarks and `l01_38_omega_test` (130
+/// calls) 13.6 and 3.2. 40 is the next round number above 37.3. Neon's single-pass design
+/// (XR-presburger4, NEON.md) measured at most 11.1 on its model and allows 16; that value
+/// applies to it, not to this method. Why a limit at all: triangle detection reduces
+/// to [`kept`] in linear size (proof below), so no near-linear method is likely for every
+/// input; the author's rule (input only, DESIGN sec:plan) is to refuse what provably passes
+/// a near-linear budget rather than run it, as [`Refusal::Work`] does.
+pub(super) const PER_INPUT: u64 = 40;
 
 #[cfg(test)]
 thread_local! {
@@ -34,9 +64,16 @@ thread_local! {
     /// pair read, each lookup of the pairs of two rows ([`Index::pairs_of`], counted whether
     /// it finds a pair or not), and each row whose list of pairs is entered (counted whether
     /// the list is empty or not).
-    pub(super) static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static READS: Cell<u64> = const { Cell::new(0) };
     /// Tests only: the entries made in the lists of the pairs each pair blocked ([`kept`]).
-    pub(super) static WATCHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static WATCHED: Cell<u64> = const { Cell::new(0) };
+    /// Tests only: the steps the last call of [`kept`] on this thread charged its meter.
+    pub(super) static SPENT: Cell<u64> = const { Cell::new(0) };
+    /// Tests only: the input `k` of the last call of [`kept`] on this thread ([`PER_INPUT`]).
+    pub(super) static INPUT: Cell<u64> = const { Cell::new(0) };
+    /// Tests only: `Some(n)` gives the call of [`kept`] after the next `n` on this thread a
+    /// limit of zero steps, so it refuses; `None` leaves every call its limit.
+    pub(super) static REFUSE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Counts one read ([`READS`]), in tests; nothing otherwise.
@@ -109,27 +146,48 @@ fn watch_on(watch: &mut [Vec<usize>], f: usize, e: usize) {
 /// family, as written, cannot reach this function (its parallel rows are one row each after
 /// `Formula::and`); on Gemini's extraction the reads grew 19.62 times at 7.83 times the pairs
 /// (about k^1.45, two points). Its variant with no two rows parallel does reach it: from
-/// m = 16 to 32 the products made grow 4 times (512 to 2,048), the terms they hold 7.1 times
-/// (5,328 to 37,792) and the reads 13.2 times (14,473 to 191,505, about k^1.86), near the
-/// square of the products, not within a constant of the terms, past the scaling limit
-/// (`tests::the_grid_family_reads_are_counted_exactly`; plan row PRES-pairs-grid-reads, open).
+/// m = 16 to 32 the products made grew 4 times (512 to 2,048), the terms they hold 7.1 times
+/// (5,328 to 37,792) and the reads 13.2 times (14,473 to 191,505, about k^1.86) when it ran
+/// to the end, before the meter: near the square of the products, not within a constant of
+/// the terms, past the scaling limit. Under the meter the family is refused in steps linear in
+/// its input (`tests::the_meter_refuses_the_grid_family_in_steps_linear_in_its_input`);
+/// whether a method decides it in O((products + terms) log) is plan row PRES-pairs-grid-reads.
 /// Tests:
 /// `tests::the_pairs_kept_are_those_left_by_expanding_every_product` (against the naive
-/// method) and
-/// `l01_38_presburger::ladder::products_whose_factors_one_sum_on_the_factors_joins_scale`.
+/// method),
+/// `l01_38_presburger::ladder::products_whose_factors_one_sum_on_the_factors_joins_scale`, and
+/// for the meter `tests::the_meter_refuses_the_grid_family_in_steps_linear_in_its_input`.
+///
+/// `Err(Refusal::Products)` when the steps pass [`PER_INPUT`] times the input `k`: each step
+/// charged is O(log k) work, the meter is checked before each read and at each pair taken from
+/// the queue, and the work between two checks is O(k log k) (one call of [`Index::shared`] or
+/// [`Index::meets_only_at`], or one pass over a row's variables), so a refusal costs
+/// O(PER_INPUT × k log k) and an answer the same at most.
 pub(super) fn kept(
     rows: &[&Lin],
     pairs: &[(usize, usize)],
     partners: &HashMap<Factor, Vec<Factor>>,
-) -> Vec<bool> {
+) -> Result<Vec<bool>, Refusal> {
     let index = Index::new(rows, pairs, partners);
     let n = pairs.len();
     let mut live = vec![true; n];
     let mut queue = Worklist::all(n, Order::Fifo);
     // The pairs that each pair blocked at their last test, to test again when it goes.
     let mut watch: Vec<Vec<usize>> = vec![Vec::new(); n];
-    while let Some(e) = queue.pop() {
-        if live[e] && index.frees(e, &live, &mut watch) {
+    let answer = loop {
+        let Some(e) = queue.pop() else {
+            break Ok(live);
+        };
+        index.charge(1);
+        if !live[e] {
+            continue;
+        }
+        // A test stopped by the meter may answer wrongly; its answer is never used.
+        let frees = index.frees(e, &live, &mut watch);
+        if index.over() {
+            break Err(Refusal::Products);
+        }
+        if frees {
             live[e] = false;
             for f in std::mem::take(&mut watch[e]) {
                 if live[f] {
@@ -137,8 +195,12 @@ pub(super) fn kept(
                 }
             }
         }
-    }
-    live
+    };
+    #[cfg(test)]
+    SPENT.with(|s| s.set(index.spent.get()));
+    #[cfg(test)]
+    INPUT.with(|s| s.set(index.input));
+    answer
 }
 
 /// The factor rows and pairs of [`kept`], with each factor numbered.
@@ -159,6 +221,13 @@ struct Index<'a> {
     /// The variables each variable is multiplied by in a product the formulas mention,
     /// ascending.
     mentioned: Vec<Vec<usize>>,
+    /// The steps charged so far ([`PER_INPUT`]).
+    spent: Cell<u64>,
+    /// Tests only: the input `k = R + T + P + M` (rows, terms, pairs, entries of `partners`).
+    #[cfg(test)]
+    input: u64,
+    /// The steps allowed: [`PER_INPUT`] times the input `k = R + T + P + M`.
+    limit: u64,
 }
 
 impl<'a> Index<'a> {
@@ -225,6 +294,22 @@ impl<'a> Index<'a> {
                 mentioned[u].sort_unstable();
             }
         }
+        let k = rows.len()
+            + rows.iter().map(|r| r.terms.len()).sum::<usize>()
+            + pairs.len()
+            + partners.values().map(Vec::len).sum::<usize>();
+        let input = k as u64;
+        #[allow(unused_mut)]
+        let mut limit = PER_INPUT.saturating_mul(input);
+        #[cfg(test)]
+        REFUSE_AFTER.with(|c| match c.get() {
+            Some(0) => {
+                limit = 0;
+                c.set(None);
+            }
+            Some(n) => c.set(Some(n - 1)),
+            None => {}
+        });
         Index {
             vars,
             pairs,
@@ -233,19 +318,45 @@ impl<'a> Index<'a> {
             weight,
             at,
             mentioned,
+            spent: Cell::new(0),
+            #[cfg(test)]
+            input,
+            limit,
         }
     }
 
-    /// The pairs of the rows `r` and `s`, by binary search in `at`: O(log P + found) for P pairs.
-    /// Each call is counted as a read ([`READS`]), and so is each pair found.
-    fn pairs_of(&self, r: usize, s: usize) -> impl Iterator<Item = usize> + '_ {
+    /// Charges `n` steps to the meter ([`PER_INPUT`]).
+    fn charge(&self, n: usize) {
+        self.spent.set(self.spent.get().saturating_add(n as u64));
+    }
+
+    /// Whether the steps charged passed the limit.
+    fn over(&self) -> bool {
+        self.spent.get() > self.limit
+    }
+
+    /// One read: counted in tests ([`READS`]) and charged one step; whether the meter allows
+    /// more.
+    fn read(&self) -> bool {
         read();
+        self.charge(1);
+        !self.over()
+    }
+
+    /// The pairs of the rows `r` and `s`, by binary search in `at`: O(log P + found) for P pairs.
+    /// Each call is counted as a read ([`READS`]), and so is each pair found; none are found
+    /// once the meter is spent.
+    fn pairs_of(&self, r: usize, s: usize) -> impl Iterator<Item = usize> + '_ {
         let key = (r.min(s), r.max(s));
-        let from = self.at.partition_point(|&(k, _)| k < key);
+        let from = if self.read() {
+            self.at.partition_point(|&(k, _)| k < key)
+        } else {
+            self.at.len()
+        };
         (self.at[from..].iter())
             .take_while(move |&&(k, _)| k == key)
             .map(|&(_, f)| f)
-            .inspect(|_| read())
+            .take_while(|_| self.read())
     }
 
     /// The coefficient of `w` in row `r`, zero when it has none.
@@ -273,6 +384,7 @@ impl<'a> Index<'a> {
         } else {
             (p, s)
         };
+        self.charge(self.vars[short].len());
         (self.vars[short].iter())
             .map(|&(v, _)| v)
             .filter(|&v| self.coef(long, v).is_some())
@@ -287,6 +399,7 @@ impl<'a> Index<'a> {
         } else {
             (p, r)
         };
+        self.charge(self.vars[short].len());
         (self.vars[short].iter()).all(|&(v, _)| v == w || self.coef(long, v).is_none())
     }
 
@@ -302,11 +415,17 @@ impl<'a> Index<'a> {
         };
         let width = self.vars[p].len();
         let mut ws: Vec<usize> = self.vars[q].iter().map(|&(w, _)| w).collect();
+        self.charge(ws.len());
         ws.sort_by_key(|&w| (self.weight[w], w));
         'w: for w in ws {
+            // A spent meter ends the test; [`kept`] refuses and never reads its answer.
+            if self.over() {
+                return true;
+            }
             // The `z` of `p` for which `w * z` is not free.
             let mut not: HashSet<usize> = HashSet::new();
             let ms = &self.mentioned[w];
+            self.charge(ms.len().min(width) + self.vars[q].len());
             if ms.len() <= width {
                 not.extend(ms.iter().filter(|&&z| self.coef(p, z).is_some()));
             } else {
@@ -377,6 +496,7 @@ impl<'a> Index<'a> {
             let (mut by_z, mut by_rows) = (0usize, 0usize);
             let held_w = self.holding[w].len();
             for z in open() {
+                self.charge(1);
                 by_z = by_z.saturating_add(self.weight[z]);
                 by_rows = by_rows.saturating_add(held_w.saturating_mul(self.holding[z].len()));
                 if by_z > self.weight[w] && by_rows > self.weight[w] {
@@ -401,9 +521,11 @@ impl<'a> Index<'a> {
             if by_z <= self.weight[w] {
                 for z in open() {
                     let blocker = (self.holding[z].iter()).find_map(|&s| {
-                        read();
+                        if !self.read() {
+                            return None;
+                        }
                         (self.opp[s].iter())
-                            .inspect(|_| read())
+                            .take_while(|_| self.read())
                             .find(|&&(r, f)| f != e && live[f] && self.holds(r, s, w, z))
                             .map(|&(_, f)| f)
                     });
@@ -443,9 +565,13 @@ impl<'a> Index<'a> {
             // No pair `{r, p}` blocks every `z` (above), so each pair read blocks only the `z`
             // that its rows share with `p`, and is watched once whatever their number.
             for &r in &self.holding[w] {
-                read();
+                if !self.read() {
+                    return true;
+                }
                 for &(s, f) in &self.opp[r] {
-                    read();
+                    if !self.read() {
+                        return true;
+                    }
                     if f == e || !live[f] {
                         continue;
                     }
@@ -474,10 +600,12 @@ impl<'a> Index<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
+    use super::super::Refusal;
     use super::super::formula::{Atom, Factor, Lin};
-    use super::kept;
+    use super::{INPUT, PER_INPUT, SPENT, kept};
 
     /// The pairs kept, found by expanding every product: each round drops every live pair
     /// that alone holds an atom with no entry in `partners`, until a round drops none.
@@ -563,12 +691,15 @@ mod tests {
         let rows: Vec<&Lin> = rows.iter().collect();
         let pairs = [(0, 1), (2, 3), (3, 4), (4, 4)];
         let partners = partners_of(&[("a", "b"), ("b", "b"), ("b", "c"), ("c", "c")]);
-        assert_eq!(kept(&rows, &pairs, &partners), [true; 4]);
+        assert_eq!(
+            kept(&rows, &pairs, &partners).expect("within the meter"),
+            [true; 4]
+        );
         assert_eq!(expanded(&rows, &pairs, &partners), [true; 4]);
         // Without the product of `-a - b - d` and `-c`, `(1 - a - d) * (1 + a - b + c)` alone
         // holds `c * d`, and then `(b - a) * (-a - b - d)` alone holds `a * d`.
         assert_eq!(
-            kept(&rows, &[(0, 1), (2, 3), (4, 4)], &partners),
+            kept(&rows, &[(0, 1), (2, 3), (4, 4)], &partners).expect("within the meter"),
             [false, false, true]
         );
     }
@@ -583,9 +714,15 @@ mod tests {
         ];
         let rows: Vec<&Lin> = rows.iter().collect();
         let both = partners_of(&[("x", "x"), ("y", "y")]);
-        assert_eq!(kept(&rows, &[(0, 1)], &both), [true]);
+        assert_eq!(
+            kept(&rows, &[(0, 1)], &both).expect("within the meter"),
+            [true]
+        );
         let one = partners_of(&[("x", "x")]);
-        assert_eq!(kept(&rows, &[(0, 1)], &one), [false]);
+        assert_eq!(
+            kept(&rows, &[(0, 1)], &one).expect("within the meter"),
+            [false]
+        );
     }
 
     #[test]
@@ -630,7 +767,7 @@ mod tests {
             let rows: Vec<&Lin> = rows.iter().collect();
             let want = expanded(&rows, &pairs, &partners);
             assert_eq!(
-                kept(&rows, &pairs, &partners),
+                kept(&rows, &pairs, &partners).expect("within the meter"),
                 want,
                 "case {case}: rows {rows:?}, pairs {pairs:?}, products {products:?}"
             );
@@ -671,7 +808,7 @@ mod tests {
         let partners = partners_of(&products);
         let rows: Vec<&Lin> = rows.iter().collect();
         super::READS.with(|n| n.set(0));
-        let got = kept(&rows, &pairs, &partners);
+        let got = kept(&rows, &pairs, &partners).expect("within the meter");
         let n = super::READS.with(std::cell::Cell::get);
         if check {
             assert_eq!(got, expanded(&rows, &pairs, &partners), "k = {k}");
@@ -719,7 +856,7 @@ mod tests {
         let xy = Lin::atom(Atom::product(&"x".into(), &"y".into()));
         let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(xy)));
         super::READS.with(|n| n.set(0));
-        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        let (made, _) = products(&p, &g, Tier::Cheap).expect("within the meter");
         (super::READS.with(std::cell::Cell::get), made)
     }
 
@@ -757,8 +894,12 @@ mod tests {
     /// fresh, no two parallel (the reviewer's variant): the pairs are the bicliques of the rows
     /// on `x` and `y` and of those on each `w{i}` and `c{i}`, Θ(m²) = Θ(k) for the input size
     /// `k`, and the kept products hold Θ(m³) = Θ(k^{3/2}) terms. The reads, the products made
-    /// and their terms.
-    fn grid_through_products(m: usize, fresh: bool) -> (u64, usize, usize) {
+    /// and their terms, or the refusal; the steps charged and the input of [`kept`] ([`SPENT`],
+    /// [`INPUT`]), zero when it did not run.
+    fn grid_through_products(
+        m: usize,
+        fresh: bool,
+    ) -> (u64, Result<(usize, usize), Refusal>, u64, u64) {
         use super::super::formula::{Con, Formula};
         use super::super::{Relation, Tier, products};
         let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
@@ -787,7 +928,9 @@ mod tests {
         }
         let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(goal)));
         super::READS.with(|n| n.set(0));
-        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        SPENT.with(|n| n.set(0));
+        INPUT.with(|n| n.set(0));
+        let made = products(&p, &g, Tier::Cheap).map(|(made, _)| made);
         fn terms(f: &Formula) -> usize {
             match f {
                 Formula::Con(c) => c.lin.terms.len(),
@@ -795,39 +938,102 @@ mod tests {
                 Formula::And(fs) | Formula::Or(fs) => fs.iter().map(terms).sum(),
             }
         }
-        let n = made.iter().map(terms).sum();
-        (super::READS.with(std::cell::Cell::get), made.len(), n)
+        let made = made.map(|made| (made.len(), made.iter().map(terms).sum()));
+        let reads = super::READS.with(std::cell::Cell::get);
+        (reads, made, SPENT.with(Cell::get), INPUT.with(Cell::get))
     }
 
     /// XR-presburger4 round 2, L6 (Gemini): the grid family ([`grid_through_products`]). As
     /// Gemini wrote it, `products` cannot build it: its parallel rows are one row each by then,
     /// and no product is made. Its variant with no two rows parallel is built (at least m²
-    /// products), and there the reads of [`kept`] grow past the scaling limit: from m = 16 to 32
-    /// the products made grow 4 times (512 to 2,048), the terms they hold 7.1 times (5,328 to
-    /// 37,792), and the reads 13.2 times (14,473 to 191,505; 14,866 to 195,874 before the
-    /// lookup of a pair `{r, p}` blocking every `w * z` in [`Index::frees`]; on round 2, 13,266
-    /// to 186,786). This test records the counts, which are deterministic, exactly (XR-presburger4
-    /// round 3, Claude: a ratio held here let a method reading Θ(products²) pass); it does not
-    /// hold the scaling limit, which this family fails, and any change of the reads, up or
-    /// down, must update it. Whether a method reads O((products + terms) log) on this family,
-    /// or the family needs more, is plan row PRES-pairs-grid-reads (open).
+    /// pairs), and there the reads of [`kept`] grew past the scaling limit when it ran to the
+    /// end: from m = 16 to 32 the products made grew 4 times (512 to 2,048), the terms they
+    /// hold 7.1 times (5,328 to 37,792), and the reads 13.2 times (14,473 to 191,505). With
+    /// the meter ([`PER_INPUT`]) the question is refused ([`Refusal::Products`]) once the
+    /// steps pass the limit, so the steps are at most [`PER_INPUT`] times the input of
+    /// [`kept`] plus the steps of one read, and grow with the input: at m and about 8 times
+    /// its input (m = 45 and 132) by at most 9 times. The counts are deterministic and held
+    /// exactly (XR-presburger4 round 3, Claude: a ratio alone let a method reading
+    /// Θ(products²) pass). Red without the meter: the question is answered, not refused.
+    /// Whether a method decides this family in O(input log input) is plan row
+    /// PRES-pairs-grid-reads (open).
     #[test]
-    fn the_grid_family_reads_are_counted_exactly() {
+    fn the_meter_refuses_the_grid_family_in_steps_linear_in_its_input() {
         let mut counts = Vec::new();
-        for m in [16, 32] {
-            let (_, made, _) = grid_through_products(m, false);
-            assert_eq!(made, 0, "m = {m}: products made from parallel rows");
-            counts.push(grid_through_products(m, true));
+        for m in [45, 132] {
+            let (_, made, _, _) = grid_through_products(m, false);
+            assert_eq!(
+                made,
+                Ok((0, 0)),
+                "m = {m}: products made from parallel rows"
+            );
+            let (reads, made, spent, input) = grid_through_products(m, true);
+            assert_eq!(made, Err(Refusal::Products), "m = {m}");
+            assert!(
+                spent > PER_INPUT * input,
+                "m = {m}: {spent} steps, input {input}"
+            );
+            assert!(
+                spent <= PER_INPUT * input + input,
+                "m = {m}: {spent} steps, input {input}"
+            );
+            counts.push((reads, spent, input));
         }
-        assert_eq!(counts, [(14_473, 512, 5_328), (191_505, 2_048, 37_792)]);
+        // Measured (job 47): the steps 8.11 times at 8.11 times the input, the reads 8.18 times.
+        assert_eq!(
+            counts,
+            [(104_841, 266_422, 6_660), (857_383, 2_159_522, 53_988)]
+        );
+        assert!(9 * counts[0].1 >= counts[1].1, "{counts:?}");
+        assert!(8 * counts[0].2 <= counts[1].2, "{counts:?}");
+    }
+
+    /// The meter's refusal reaches the caller of [`super::super::entails`] from each tier of
+    /// [`super::super::products`]: `x >= 7`, which the goal `x * y >= 7 y` needs with `y >= 0`,
+    /// follows from `x + b >= 10`, `x - b - c >= 4` and `c >= 0` together, where `b` and `c`
+    /// are factors (of `b * c >= -1000000`), so it is no cheap bound and the goal is proved at
+    /// `Tier::Local`. A refusal at `Tier::Cheap` was returned before; one at `Tier::Local` or
+    /// `Tier::Whole` was taken for `NotProved` (XR-presburger4 META3, coordinator point 3),
+    /// which says the linear reading fails with every product allowed, never checked. Red
+    /// with that: `NotProved` at the second call.
+    #[test]
+    fn entailment_refused_for_its_products_says_so() {
+        use super::super::formula::{Con, Formula};
+        use super::super::{Entailment, Relation, entails};
+        let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
+        let bc = Lin::atom(Atom::product(&"b".into(), &"c".into()));
+        let premise = vec![
+            ge0(row(0, &[(1, "z")])),
+            ge0(row(2, &[(-1, "z")])),
+            ge0(row(0, &[(1, "x"), (-1, "z")])),
+            ge0(row(0, &[(1, "y"), (-1, "z")])),
+            ge0(row(-10, &[(1, "x"), (1, "b")])),
+            ge0(row(-4, &[(1, "x"), (-1, "b"), (-1, "c")])),
+            ge0(row(0, &[(1, "c")])),
+            ge0(bc.plus(&Lin::constant(1_000_000))),
+        ];
+        let xy = Lin::atom(Atom::product(&"x".into(), &"y".into()));
+        let goal = ge0(xy.minus(&row(0, &[(7, "y")])));
+        let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(goal));
+        assert!(matches!(entails(&p, &g), Entailment::Proved(_)));
+        for (cheap_calls, tier) in [(0, "Cheap"), (1, "Local")] {
+            super::REFUSE_AFTER.with(|c| c.set(Some(cheap_calls)));
+            let got = entails(&p, &g);
+            super::REFUSE_AFTER.with(|c| c.set(None));
+            assert_eq!(
+                got,
+                Entailment::Refused(Refusal::Products),
+                "refused at {tier}"
+            );
+        }
     }
 
     /// Gemini's family (XR-presburger4 round 3) through [`super::super::products`]: the row
     /// `x + z + w0 + ... + w{k-1} >= 0`, the k rows `x + (j + 1) y >= 0` and the goal
     /// `x * z >= 0`, so the pairs are the sum with itself and with each row `x + (j + 1) y`.
     /// The reads, the entries made in the lists of blockers ([`super::WATCHED`]) and the
-    /// products made.
-    fn sum_holding_the_goal(k: usize) -> (u64, u64, usize) {
+    /// number of products made, or the refusal.
+    fn sum_holding_the_goal(k: usize) -> (u64, u64, Result<usize, Refusal>) {
         use super::super::formula::{Con, Formula};
         use super::super::{Relation, Tier, products};
         let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
@@ -842,9 +1048,9 @@ mod tests {
         let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(xz)));
         super::READS.with(|n| n.set(0));
         super::WATCHED.with(|n| n.set(0));
-        let (made, _) = products(&p, &g, Tier::Cheap).expect("no meter runs");
+        let made = products(&p, &g, Tier::Cheap).map(|(made, _)| made.len());
         let reads = super::READS.with(std::cell::Cell::get);
-        (reads, super::WATCHED.with(std::cell::Cell::get), made.len())
+        (reads, super::WATCHED.with(std::cell::Cell::get), made)
     }
 
     /// XR-presburger4 round 3 (Gemini): on [`sum_holding_the_goal`] the reads, the entries in
@@ -854,11 +1060,18 @@ mod tests {
     /// and entered its blocker once for each `z`: 10,706 and 645,606 reads (60.3 times), 10,201
     /// and 641,601 entries (62.9 times), red here (VM v5e2, job 42); with the entries made once
     /// a blocker but no lookup, the entries were 301 and 2,401 and the reads unchanged, also
-    /// red. The same products are made either way.
+    /// red. The k products kept, of the sum with each row `x + (j + 1) y`, hold Θ(k²) terms
+    /// (3 (k + 3) each), past [`PER_INPUT`] times the input, so since XR-presburger4 META3
+    /// (L6) [`super::super::products`] refuses them before they are expanded, after
+    /// [`kept`] has chosen them in the reads counted here.
     #[test]
     fn a_sum_holding_the_goal_reads_few_pairs() {
         let (small, large) = (sum_holding_the_goal(100), sum_holding_the_goal(800));
-        assert_eq!((small, large), ((708, 201, 100), (5_608, 1_601, 800)));
+        let refused = Err(Refusal::Products);
+        assert_eq!(
+            (small.clone(), large.clone()),
+            ((708, 201, refused.clone()), (5_608, 1_601, refused))
+        );
         assert!(large.0 <= 9 * small.0, "reads {} and {}", small.0, large.0);
         assert!(
             large.1 <= 9 * small.1,

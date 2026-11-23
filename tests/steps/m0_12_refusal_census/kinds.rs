@@ -102,6 +102,10 @@ pub const KINDS: &[Kind] = &[
         phrase: ": an exponent is above",
     },
     Kind {
+        name: "Products",
+        phrase: "Here those conditions are so many that this would take more work",
+    },
+    Kind {
         name: "Questions",
         phrase: "Here those questions would take more work than the checker allows",
     },

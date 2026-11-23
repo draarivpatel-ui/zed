@@ -129,7 +129,7 @@ fn run_on(
             Err(Refusal::Tie(_)) => t.tie += 1,
             Err(Refusal::Disjuncts) => panic!("a conjunction refused for its disjunctions: {f}"),
             Err(Refusal::Unordered(_)) => panic!("a conjunction refused for its disjunctions: {f}"),
-            Err(Refusal::Work | Refusal::Questions | Refusal::Repeats) => {
+            Err(Refusal::Work | Refusal::Questions | Refusal::Repeats | Refusal::Products) => {
                 panic!("a point refused for a cause only a projection has: {f}")
             }
         }

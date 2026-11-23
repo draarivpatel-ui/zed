@@ -2562,7 +2562,8 @@ impl Renamed {
             | Refusal::Disjuncts
             | Refusal::Work
             | Refusal::Questions
-            | Refusal::Repeats => e,
+            | Refusal::Repeats
+            | Refusal::Products => e,
         }
     }
 }
@@ -28623,21 +28624,27 @@ fn entails_inner(premises: &Relation, goal: &Relation) -> Result<Entailment, Ref
     // wherever the premises do and lies within the one before, so each such product implies
     // the one from the wider bound with the linear premises, whatever one try proves the next
     // proves too, and the last verdict is the one the hulls give. Where the solver refuses,
-    // the verdict before stands.
+    // the verdict before stands; where the products are refused for their size
+    // ([`Refusal::Products`]), the refusal is the answer, since `NotProved` would say that the
+    // linear reading fails with every product it allows, which was never checked
+    // (XR-presburger4 META3; test `entailment_refused_for_its_products_says_so`).
     // Complexity tradeoff: each try costs solver questions for the open sides, over the
     // blocks of each cluster O(Σ_B (cuts(B) + sides(B)) × |B|) and over the part
     // O(sides × part); see [`Tier`] for why and when. COMPLEXITY.md row C2.
     let (ps, loose) = match products(premises, goal, Tier::Local) {
         Ok(found) => found,
+        Err(Refusal::Products) => return Err(Refusal::Products),
         Err(_) => return Ok(first),
     };
     let second = linear_reading(premises, goal, ps).unwrap_or(first);
     if !loose || !matches!(second, Entailment::NotProved(_)) {
         return Ok(second);
     }
-    Ok(products(premises, goal, Tier::Whole)
-        .and_then(|(ps, _)| linear_reading(premises, goal, ps))
-        .unwrap_or(second))
+    match products(premises, goal, Tier::Whole) {
+        Ok((ps, _)) => Ok(linear_reading(premises, goal, ps).unwrap_or(second)),
+        Err(Refusal::Products) => Err(Refusal::Products),
+        Err(_) => Ok(second),
+    }
 }
 
 /// Whether `premises` with the products `extra` ([`products`]) entail `goal` when each
@@ -29050,6 +29057,31 @@ fn products(
     for ps in partners.values_mut() {
         zed_collections::sorted::sort_dedup(ps);
     }
+    // The work allowed (plan row PRES-pairs-grid-reads): [`pairs::PER_INPUT`] times the input
+    // read here, the terms of the rows multiplied (each with one for the row), the products
+    // wanted and the entries of `partners`. The pairs are counted before they are formed, in
+    // O(|wanted|) saturating products, and the terms of the products kept before they are
+    // expanded, in O(kept); past the limit the question is refused ([`Refusal::Products`]).
+    // Below it nothing changes. So `products` does O(PER_INPUT × input × log) work or
+    // refuses: the pairs and the terms it forms are each at most the limit, and
+    // [`pairs::kept`] meters itself against its own input, which is at most the limit too.
+    // Complexity tradeoff: with m rows on each of two factors the pairs are m², and a product
+    // of rows of t terms has t² terms, so before the limit one question could form Θ(input²)
+    // terms (the grid family of `pairs::tests::the_meter_refuses_the_grid_family_in_steps_
+    // linear_in_its_input`). Tests: that test and
+    // `entailment_refused_for_its_products_says_so`.
+    let input = (table.iter())
+        .map(|r| r.terms.len() + 1)
+        .sum::<usize>()
+        .saturating_add(wanted.len())
+        .saturating_add(partners.values().map(Vec::len).sum::<usize>());
+    let limit = (pairs::PER_INPUT as usize).saturating_mul(input);
+    let formed = (wanted.iter())
+        .map(|(x, y)| on[x].len().saturating_mul(on[y].len()))
+        .fold(0usize, usize::saturating_add);
+    if formed > limit {
+        return Err(Refusal::Products);
+    }
     // The pairs of rows on the two factors of each product, each once, and of them those the
     // exact rule keeps ([`pairs::kept`]).
     let mut pairs = BTreeSet::new();
@@ -29062,7 +29094,14 @@ fn products(
     }
     let pairs: Vec<(usize, usize)> = pairs.into_iter().collect();
     let rows: Vec<&Lin> = table.iter().map(|r| &**r).collect();
-    let kept = pairs::kept(&rows, &pairs, &partners);
+    let kept = pairs::kept(&rows, &pairs, &partners)?;
+    let terms = (pairs.iter().zip(&kept))
+        .filter(|&(_, &keep)| keep)
+        .map(|(&(a, b), _)| (rows[a].terms.len() + 1).saturating_mul(rows[b].terms.len() + 1))
+        .fold(0usize, usize::saturating_add);
+    if terms > limit {
+        return Err(Refusal::Products);
+    }
     let mut out = BTreeSet::new();
     for (&(a, b), keep) in pairs.iter().zip(kept) {
         if keep && let Some(p) = rows[a].product(rows[b]) {

@@ -99,6 +99,18 @@ fn a_refusal_for_the_work_of_the_sums_is_of_kind_work() {
 }
 
 #[test]
+fn a_refusal_for_the_products_is_of_kind_products() {
+    // The refusal of the products of a question by size (`Refusal::Products`, plan row
+    // PRES-pairs-grid-reads), read from the solver's own reason, so a rewording there fails
+    // here rather than counting its census lines as `Other`.
+    use zedc::store::presburger::Refusal;
+    let text = Refusal::Products
+        .closed_by("It kept the bounds of each variable.")
+        .to_string();
+    assert_eq!(kinds::of(&text), vec!["Products"], "{text}");
+}
+
+#[test]
 fn a_census_line_is_tab_separated_on_one_line() {
     let mut out = String::new();
     line(

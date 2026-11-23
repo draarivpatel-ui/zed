@@ -17,7 +17,8 @@ use zedc_lattice::interval::{End, IntervalSet, Num};
 use zedc_lattice::lattice::{Congruence, Lattice};
 
 /// Why a question lies outside the fragment the solver decides. Each is reported in its own
-/// words (sec:diagnostics), and each but [`Refusal::Work`] and [`Refusal::Questions`] is a
+/// words (sec:diagnostics), and each but [`Refusal::Work`], [`Refusal::Questions`] and
+/// [`Refusal::Products`] is a
 /// property of the system's shape, never of its size or of the names of its variables;
 /// narrowing keeps the written constraint, which is sound.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -58,6 +59,13 @@ pub enum Refusal {
     /// The values of a variable have gaps that repeat without end (`x == 2 * y` with `y`
     /// unbounded gives the even numbers), which a set of ranges cannot hold (module `exact`).
     Repeats,
+    /// The products of the conditions (`x * y`) were to be read linearly, each product of two
+    /// rows bounding the factors read as one more row (`products` in `presburger.rs`), and the
+    /// pairs of rows, the terms of their products or the work of choosing which products to
+    /// form ([`pairs::kept`](super::pairs::kept)) passed [`PER_INPUT`](super::pairs::PER_INPUT)
+    /// times the size of the conditions (PRES-pairs-grid-reads). A refusal by size, as
+    /// [`Refusal::Work`] is; below the limit the answer is the one with no limit.
+    Products,
 }
 
 /// The variables of a [`Refusal::Tie`], and the rows they share, written over the variables
@@ -325,6 +333,13 @@ impl fmt::Display for Closed<'_> {
                 "to find exactly which values each variable can take, the checker asks, one \
                  range of values at a time, whether some values there meet every condition. \
                  Here those questions would take more work than the checker allows."
+            ),
+            Refusal::Products => write!(
+                f,
+                "the conditions multiply variables, and the checker reads each product through \
+                 the bounds on its factors, multiplying the conditions on one factor by those \
+                 on the other. Here those conditions are so many that this would take more \
+                 work than the checker allows."
             ),
             Refusal::Repeats => write!(
                 f,
