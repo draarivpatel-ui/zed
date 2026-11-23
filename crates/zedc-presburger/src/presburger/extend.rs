@@ -69,7 +69,7 @@ pub struct Answers {
 pub mod counts {
     use std::cell::Cell;
 
-    /// Atoms read by [`super::Extending::closure`]: those of the parts after the largest, of
+    /// Atoms read by `Extending::closure`: those of the parts after the largest, of
     /// the conjunction's own atoms and of the definitions it reaches.
     pub const CLOSURE_ATOMS: usize = 0;
     /// Atoms looked up by `apart`, the smaller side of each test.
