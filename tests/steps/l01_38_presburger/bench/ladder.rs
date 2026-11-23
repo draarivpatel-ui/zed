@@ -242,8 +242,9 @@ fn products_whose_premise_holds_k_atoms_in_no_product_scale() {
     // product with each row `y - w{j}` alone holds `z{i} * w{j}` and is left out; the k
     // products of the sum cost Θ(k²) terms (C2-pairs-long-row, C2-pairs-exact). The test of
     // each pair `{x - 1, y - w{j}}` read the k pairs on `x`, Θ(k²) in all (34.1 times the
-    // instructions at k = 1,000, 16.1 times the bytes); it reads the pairs on `w{j}` instead
-    // (`pairs::Index::frees`, PRES-growth-ladder-bytes).
+    // instructions at k = 1,000, 16.1 times the bytes). `pairs::kept` (META4 order 3) peels
+    // each pair once from live opposite lists, with no walk of the pairs on `x` per pair (its
+    // passes P2 and P3; unit test `a_premise_holding_k_atoms_in_no_product_scale`).
     let n = 1000;
     let built = scaling::inputs(n, one_sum_of_atoms_in_no_product);
     let measure = move || {
@@ -264,8 +265,9 @@ fn products_whose_premise_holds_k_atoms_in_no_product_scale() {
 fn products_beside_a_sum_whose_atoms_have_products_scale() {
     // Each `w{j}` is on the sum, paired with k rows `c{j}`, and on `y - w{j}`, paired with
     // `x - 1`: the test of `{x - 1, y - w{j}}` read k pairs from `x` or from `w{j}` (Θ(k²),
-    // 61.8 times at 8k on the port of XR-presburger4 round 1, Claude F3); it looks up the one
-    // pair of `x - 1` with each row on `w{j}` instead (`pairs::Index::frees`, A4).
+    // 61.8 times at 8k on the port of XR-presburger4 round 1, Claude F3). `pairs::kept`
+    // (META4 order 3) drops each pair once from live opposite lists, O(1) a drop (unit test
+    // `a_sum_beside_its_products_scale`).
     let n = 1000;
     let built = scaling::inputs(n, sum_beside_products_of_its_atoms);
     let measure = move || {
@@ -280,10 +282,11 @@ fn products_beside_a_sum_whose_atoms_have_products_scale() {
 
 #[test]
 fn products_beside_rows_on_no_pair_scale() {
-    // The k rows `z + u{j}` are on no pair, and with every row in `pairs::Index`'s `holding`
-    // the test of each pair `{x - 1, y + (j + 1) z}` walked them among the rows holding `z`,
-    // whose weight (the pairs on them) did not count them: Θ(k²) (XR-presburger4 round 2, L1,
-    // Codex). `holding` keeps only the rows on a pair.
+    // The k rows `z + u{j}` are on no pair, and with every row among the holders of `z` the
+    // test of each pair `{x - 1, y + (j + 1) z}` walked them, whose weight (the pairs on them)
+    // did not count them: Θ(k²) (XR-presburger4 round 2, L1, Codex). `pairs::kept` counts the
+    // holders of an atom among the rows on a pair only (unit test
+    // `a_premise_of_rows_on_no_pair_scale`).
     let n = 1000;
     let built = scaling::inputs(n, rows_on_no_pair_beside_paired_rows);
     let measure = move || {

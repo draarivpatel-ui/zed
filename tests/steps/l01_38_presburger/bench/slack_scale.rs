@@ -411,7 +411,8 @@ fn sat_half_project_each_scales_past_512() {
 /// `merged_equal_atoms` writes the atoms tied by two-term equations by one root, the solver
 /// alone is near linear on this family: 9.66 times the instructions at 8n on VM v5e3, 9.49 and
 /// 9.74 times the processor time on VM hm4, and 8.98 without that row's change to
-/// `pairs::Index::frees`; the tree before the row fails in the same runs. So this now holds the
+/// `pairs::Index::frees` (since replaced by `pairs::kept`, META4 order 3); the tree before the
+/// row fails in the same runs. So this now holds the
 /// solver alone to the limit, and the negative control below, the same run without
 /// `merged_equal_atoms`, shows the check fails the work that pass removes.
 #[test]

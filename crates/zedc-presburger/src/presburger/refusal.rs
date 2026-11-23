@@ -61,10 +61,12 @@ pub enum Refusal {
     Repeats,
     /// The products of the conditions (`x * y`) were to be read linearly, each product of two
     /// rows bounding the factors read as one more row (`products` in `presburger.rs`), and the
-    /// pairs of rows, the terms of their products or the work of choosing which products to
-    /// form ([`pairs::kept`](super::pairs::kept)) passed [`PER_INPUT`](super::pairs::PER_INPUT)
-    /// times the size of the conditions (PRES-pairs-grid-reads). A refusal by size, as
-    /// [`Refusal::Work`] is; below the limit the answer is the one with no limit.
+    /// pairs of rows or the terms of their products passed 40 times the size of the conditions
+    /// (PRES-pairs-grid-reads, pending AUTHOR-products-terms-refusal), or the choice of which
+    /// products to form ([`pairs::kept`](super::pairs::kept)) met the class Φ its doc states:
+    /// the pairs left after its first two stages expand past
+    /// [`EXPAND_PER_INPUT`](super::pairs::EXPAND_PER_INPUT) times its input. A refusal by
+    /// size, as [`Refusal::Work`] is; outside it the answer is the one with no limit.
     Products,
 }
 

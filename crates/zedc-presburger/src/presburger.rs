@@ -28741,7 +28741,7 @@ fn linear_reading(
 /// `l01_38_presburger::ladder::products_whose_factors_keep_open_sides_scale` (`Local`, links
 /// in clusters of their own) and `products_whose_factors_one_sum_joins_scale` (`Local`, one
 /// cluster of k links). COMPLEXITY.md row C2.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tier {
     Cheap,
     Local,
@@ -29066,30 +29066,31 @@ fn products(
     for ps in partners.values_mut() {
         zed_collections::sorted::sort_dedup(ps);
     }
-    // The pairs and terms allowed (plan row PRES-pairs-grid-reads): [`pairs::PER_INPUT`]
-    // times the input read here, the terms of the rows multiplied (each with one for the
-    // row), the products wanted and the entries of `partners`. This limit is a constant on a
-    // size and stays pending the author's answer to AUTHOR-products-terms-refusal (the
-    // alternative is plan row PRES-products-factored-solver, which forms no product). The
-    // pairs are counted before they are formed, in O(|wanted|) saturating products, and the
-    // terms of the products kept before they are expanded, in O(|pairs|) (the flag of every
-    // pair formed is read, kept or not); past the limit the question is refused
-    // ([`Refusal::Products`]). Below it nothing changes. So `products` does
-    // O(PER_INPUT × input × log) work or refuses: the pairs and the terms it forms are each at
-    // most the limit, and [`pairs::kept`] meters itself against its own input, which is at
-    // most the limit too (its meter is to be replaced by conditions computed before each
-    // pass, XR-presburger4 META4 order 3, open).
+    // The pairs and terms allowed (plan row PRES-pairs-grid-reads): `TERMS_PER_INPUT` times
+    // the input read here, the terms of the rows multiplied (each with one for the row), the
+    // products wanted and the entries of `partners`. This limit is a constant on a size and
+    // stays pending the author's answer to AUTHOR-products-terms-refusal (the alternative is
+    // plan row PRES-products-factored-solver, which forms no product). The pairs are counted
+    // before they are formed, in O(|wanted|) saturating products, and the terms of the
+    // products kept before they are expanded, in O(|pairs|) (the flag of every pair formed is
+    // read, kept or not); past the limit the question is refused ([`Refusal::Products`]).
+    // Below it nothing changes. So `products` does O(TERMS_PER_INPUT × input × log) work or
+    // refuses: the pairs and the terms it forms are each at most the limit, and
+    // [`pairs::kept`] runs in O(k log k) on its own input k, which is at most the limit too,
+    // or refuses the class Φ it states.
     // Complexity tradeoff: with m rows on each of two factors the pairs are m², and a product
     // of rows of t terms has t² terms, so before the limit one question could form Θ(input²)
-    // terms (the grid family of `pairs::tests::the_meter_refuses_the_grid_family_in_steps_
-    // linear_in_its_input`). Tests: that test and
+    // terms (the grid family of
+    // `pairs::tests::the_grid_family_is_decided_in_work_linear_in_its_input`, whose kept
+    // products hold Θ(input^{3/2}) terms). Tests: that test and
     // `entailment_refused_for_its_products_says_so`.
+    const TERMS_PER_INPUT: usize = 40;
     let input = (table.iter())
         .map(|r| r.terms.len() + 1)
         .sum::<usize>()
         .saturating_add(wanted.len())
         .saturating_add(partners.values().map(Vec::len).sum::<usize>());
-    let limit = (pairs::PER_INPUT as usize).saturating_mul(input);
+    let limit = TERMS_PER_INPUT.saturating_mul(input);
     let formed = (wanted.iter())
         .map(|(x, y)| on[x].len().saturating_mul(on[y].len()))
         .fold(0usize, usize::saturating_add);
@@ -29120,6 +29121,8 @@ fn products(
     }
     let pairs: Vec<(usize, usize)> = pairs.into_iter().collect();
     let rows: Vec<&Lin> = table.iter().map(|r| &**r).collect();
+    #[cfg(test)]
+    pairs::TIER.with(|t| t.set(Some(tier)));
     let kept = pairs::kept(&rows, &pairs, &partners)?;
     let terms = (pairs.iter().zip(&kept))
         .filter(|&(_, &keep)| keep)
