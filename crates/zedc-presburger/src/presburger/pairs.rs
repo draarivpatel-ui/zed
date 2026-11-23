@@ -74,6 +74,15 @@ thread_local! {
     /// Tests only: `Some(n)` gives the call of [`kept`] after the next `n` on this thread a
     /// limit of zero steps, so it refuses; `None` leaves every call its limit.
     pub(super) static REFUSE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Tests only: the rows on the first factor of a wanted product that
+    /// [`super::products`] walked to form pairs, on this thread.
+    pub(super) static WALKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts one row walked by [`super::products`] ([`WALKED`]), in tests.
+#[cfg(test)]
+pub(super) fn walked() {
+    WALKED.with(|n| n.set(n.get() + 1));
 }
 
 /// Counts one read ([`READS`]), in tests; nothing otherwise.
@@ -131,16 +140,22 @@ fn watch_on(watch: &mut [Vec<usize>], f: usize, e: usize) {
 /// atom alone, and none is; `{u{a}, u{b}}` holds only `u{a} * u{b}`, also held exactly by the
 /// pairs `{u{a}, S{c}}` and `{u{b}, S{c}}` with `c` adjacent to both, so it is kept exactly
 /// when the edge `ab` lies in a triangle. QED. Checked against a naive fixpoint on 201 graphs
-/// (scratch program, not committed). So an O(k polylog k) method here would detect triangles in
-/// a graph of m edges in almost linear time, against Conjecture 4 of Abboud and Vassilevska
+/// (scratch program, not committed). The reduction gives all-edge triangle membership (for
+/// each edge, whether it lies in a triangle), and so triangle detection too; it is proved for
+/// `kept` on arbitrary rows and pairs, not through the pairs [`super::products`] forms. So an
+/// O(k polylog k) method here would detect triangles in a graph of m edges in almost linear
+/// time. That is a conditional bar, not a proof that no such method exists: it would refute
+/// Conjecture 4 of Abboud and Vassilevska
 /// Williams, "Popular conjectures imply strong lower bounds for dynamic problems" (FOCS 2014,
 /// arXiv:1402.0054): "any algorithm requires m^{1+\delta-o(1)} time in expectation to detect
 /// whether an m edge graph contains a triangle". That paper gives O(min(m^1.41, n^omega)) as
 /// the fastest algorithm in 2014; Dumitrescu, "A Strongly Subcubic Combinatorial Algorithm for
 /// Triangle Detection with Applications" (arXiv:2403.01085, 2024, a preprint), reports a
 /// randomized algorithm "running in O(n^{7/3}) time, or alternatively in O(m^{4/3}) time" with
-/// error at most 10^-30, still above near-linear. The reduction is conditional and holds for
-/// `kept` on arbitrary rows; it says nothing about a restricted family such as the grid below.
+/// one-sided error at most 10^-30, still above near-linear. The lower bound the conjecture
+/// states is for the worst case; it classifies no single input, and says nothing about a
+/// restricted family such as the grid below (XR-presburger4 round 4, LIT4-A, Codex, from the
+/// primary sources).
 /// Searched for a near-linear test of the pairs that alone hold an atom under deletions
 /// (paperclip, 8 searches of 227 to 245 results each, 2026-11-22): none found. Gemini's grid
 /// family, as written, cannot reach this function (its parallel rows are one row each after
@@ -161,7 +176,7 @@ fn watch_on(watch: &mut [Vec<usize>], f: usize, e: usize) {
 /// `Err(Refusal::Products)` when the steps pass [`PER_INPUT`] times the input `k`: each step
 /// charged is O(log k) work, the meter is checked before each read and at each pair taken from
 /// the queue, and the work between two checks is O(k log k) (one call of [`Index::shared`] or
-/// [`Index::meets_only_at`], or one pass over a row's variables), so a refusal costs
+/// [`Index::cancels_nothing`], or one pass over a row's variables), so a refusal costs
 /// O(PER_INPUT × k log k) and an answer the same at most.
 pub(super) fn kept(
     rows: &[&Lin],
@@ -391,16 +406,19 @@ impl<'a> Index<'a> {
             .collect()
     }
 
-    /// Whether the rows `r` and `p` share no variable but `w`, read through the shorter of the
-    /// two and stopping at the first other: O(min(|r|, |p|) log).
-    fn meets_only_at(&self, r: usize, p: usize, w: usize) -> bool {
+    /// Whether no variable `z != w` that the rows `r` and `p` share cancels the atom `w * z` in
+    /// `r ⊗ p` (`r_w p_z + r_z p_w != 0` for each), read through the shorter of the two:
+    /// O(min(|r|, |p|) log). With `r` holding `w`, it says that `r ⊗ p` holds `w * z` for
+    /// every `z` of `p` (proof at its use in [`Index::frees`]).
+    fn cancels_nothing(&self, r: usize, p: usize, w: usize) -> bool {
         let (short, long) = if self.vars[r].len() <= self.vars[p].len() {
             (r, p)
         } else {
             (p, r)
         };
         self.charge(self.vars[short].len());
-        (self.vars[short].iter()).all(|&(v, _)| v == w || self.coef(long, v).is_none())
+        (self.vars[short].iter())
+            .all(|&(v, _)| v == w || self.coef(long, v).is_none() || self.holds(r, p, w, v))
     }
 
     /// Whether the live pair `e` alone holds an atom `w * z` that the formulas do not mention,
@@ -537,15 +555,20 @@ impl<'a> Index<'a> {
                 continue 'w;
             }
             // First, a live pair `{r, p}` other than `e` with `r` holding `w` that holds every
-            // `w * z` of `p` at once: when `p` does not hold `w`, or `r` and `p` share no
-            // variable but `w`. Proof: the coefficient of `w * z` in `r ⊗ p` is
-            // `r_w p_z + r_z p_w` for `z != w` and `r_w p_w` for `z = w`; for `z != w` on `p`,
-            // `r_z p_w` is 0 in both cases (`p_w = 0`, or `r_z = 0` as `z` is not shared), so
-            // the coefficient is `r_w p_z != 0`, and for `z = w` (then `p` holds `w`) it is
-            // `r_w p_w != 0`. QED. That pair blocks `w` alone, and is watched once. The pair of
-            // each `r` with `p` is found by binary search ([`Index::pairs_of`]), O(log P) per
-            // row holding `w`, and the shared variables are read through the shorter row and
-            // stop at the first other ([`Index::meets_only_at`]). Complexity tradeoff: found
+            // `w * z` of `p` at once: when `p` does not hold `w`, or no `z != w` shared by `r`
+            // and `p` cancels (`r_w p_z + r_z p_w != 0`). Proof: the coefficient of `w * z` in
+            // `r ⊗ p` is `r_w p_z + r_z p_w` for `z != w` and `r_w p_w` for `z = w`. For `z != w`
+            // on `p`: if `p_w = 0` or `z` is not on `r` (`r_z = 0`), it is `r_w p_z != 0`;
+            // otherwise `z` is shared and the test reads it nonzero. For `z = w` (then `p`
+            // holds `w`) it is `r_w p_w != 0`. QED. That pair blocks `w` alone, and is watched
+            // once. The pair of each `r` with `p` is found by binary search
+            // ([`Index::pairs_of`]), O(log P) per row holding `w`, and the shared variables are
+            // read through the shorter row ([`Index::cancels_nothing`]). Before XR-presburger4
+            // META4 order 2 (B-L2) the test asked that `r` and `p` share no variable but `w`,
+            // which missed the sum `x + z + y + w0 + ...` of Gemini's S1_plus_y family, sharing
+            // `x` and `y` with each `x + (j + 1) y` without cancelling: Θ(k²) reads again
+            // (62.80 times at 8k, computed by Gemini and META4). Test
+            // `tests::a_sum_holding_the_goal_and_y_reads_few_pairs`. Complexity tradeoff: found
             // instead in the scan below, among the pairs of each `r`, with an entry in `watch`
             // for each `z` put into `not`, a sum `x + z + w0 + ... + w{k-1}` paired with itself
             // and with k rows `x + (j + 1) y` under the goal `x * z` read the k pairs of the sum's
@@ -556,7 +579,7 @@ impl<'a> Index<'a> {
             for &r in &self.holding[w] {
                 let other_live = |f: usize| f != e && live[f];
                 if let Some(f) = self.pairs_of(r, p).find(|&f| other_live(f))
-                    && (!p_holds_w || self.meets_only_at(r, p, w))
+                    && (!p_holds_w || self.cancels_nothing(r, p, w))
                 {
                     watch_on(watch, f, e);
                     continue 'w;
@@ -1016,16 +1039,33 @@ mod tests {
         let goal = ge0(xy.minus(&row(0, &[(7, "y")])));
         let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(goal));
         assert!(matches!(entails(&p, &g), Entailment::Proved(_)));
-        for (cheap_calls, tier) in [(0, "Cheap"), (1, "Local")] {
-            super::REFUSE_AFTER.with(|c| c.set(Some(cheap_calls)));
-            let got = entails(&p, &g);
+        let refused_after = |p: &Relation, g: &Relation, calls: usize| {
+            super::REFUSE_AFTER.with(|c| c.set(Some(calls)));
+            let got = entails(p, g);
             super::REFUSE_AFTER.with(|c| c.set(None));
-            assert_eq!(
-                got,
-                Entailment::Refused(Refusal::Products),
-                "refused at {tier}"
-            );
+            got
+        };
+        for (calls, tier) in [(0, "Cheap"), (1, "Local")] {
+            let got = refused_after(&p, &g, calls);
+            assert_eq!(got, Entailment::Refused(Refusal::Products), "{tier}");
         }
+        // `Tier::Whole` (XR-presburger4 META4 order 4, NB-L1): `x >= 7` follows from
+        // `x + 2 z >= 21` and the difference rows `z <= w <= x` together, as `3 x >= 21`. The
+        // cluster of `x` holds the general row alone, as `w` is outside it, so neither its rows
+        // nor the bounds give `x` a lower side, and only the hull over the whole part does. With
+        // the third call of `kept` refused the answer is the refusal; with the fourth, none is
+        // made, so the third is the last, at `Tier::Whole`, and the goal is proved there.
+        let premise = vec![
+            ge0(row(-21, &[(1, "x"), (2, "z")])),
+            ge0(row(0, &[(1, "w"), (-1, "z")])),
+            ge0(row(0, &[(1, "x"), (-1, "w")])),
+            ge0(row(0, &[(1, "y")])),
+        ];
+        let p = Relation::of(Formula::and(premise));
+        assert!(matches!(entails(&p, &g), Entailment::Proved(_)));
+        assert!(matches!(refused_after(&p, &g, 3), Entailment::Proved(_)));
+        let got = refused_after(&p, &g, 2);
+        assert_eq!(got, Entailment::Refused(Refusal::Products), "Whole");
     }
 
     /// Gemini's family (XR-presburger4 round 3) through [`super::super::products`]: the row
@@ -1034,11 +1074,20 @@ mod tests {
     /// The reads, the entries made in the lists of blockers ([`super::WATCHED`]) and the
     /// number of products made, or the refusal.
     fn sum_holding_the_goal(k: usize) -> (u64, u64, Result<usize, Refusal>) {
+        sum_holding_the_goal_and(k, false)
+    }
+
+    /// [`sum_holding_the_goal`], with `y` in the sum too when `with_y` (Gemini's S1_plus_y,
+    /// XR-presburger4 round 4, B-L2).
+    fn sum_holding_the_goal_and(k: usize, with_y: bool) -> (u64, u64, Result<usize, Refusal>) {
         use super::super::formula::{Con, Formula};
         use super::super::{Relation, Tier, products};
         let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
         let w: Vec<String> = (0..k).map(|j| format!("w{j}")).collect();
         let mut sum: Vec<(i64, &str)> = vec![(1, "x"), (1, "z")];
+        if with_y {
+            sum.push((1, "y"));
+        }
         sum.extend(w.iter().map(|v| (1, v.as_str())));
         let mut premise = vec![ge0(row(0, &sum))];
         for j in 0..k {
@@ -1079,5 +1128,59 @@ mod tests {
             small.1,
             large.1
         );
+    }
+
+    /// B-L2 (XR-presburger4 META4 order 2): with `y` in the sum, the sum shares `x` and `y`
+    /// with each row `x + (j + 1) y`, and no atom cancels (`1 · (j + 1) + 1 · 1 != 0`), so
+    /// each pair of the sum with a row still blocks every atom of the sum at once. The reads
+    /// and the entries in the lists of blockers grow by at most 9 times at 8 times `k`. Red
+    /// before [`Index::cancels_nothing`] replaced the test that `r` and `p` share no variable
+    /// but `w`: the pair test fell through to the scan of every pair of each row on `w`.
+    #[test]
+    fn a_sum_holding_the_goal_and_y_reads_few_pairs() {
+        let within = |k: usize| {
+            let got = sum_holding_the_goal_and(k, true);
+            let (spent, input) = (SPENT.with(Cell::get), INPUT.with(Cell::get));
+            // The meter stops a pass early, which would hide its reads: it must not have.
+            assert!(spent <= PER_INPUT * input, "k = {k}: {spent} steps on input {input}");
+            got
+        };
+        let (small, large) = (within(100), within(800));
+        assert!(large.0 <= 9 * small.0, "reads {} and {}", small.0, large.0);
+        assert!(large.1 <= 9 * small.1, "entries {} and {}", small.1, large.1);
+    }
+
+    /// Codex's family (XR-presburger4 round 4, L4-B, `ladder_empty_r4.rs`): the k rows
+    /// `x + (i + 1) s >= 0` and the goal `x * y0 + ... + x * y{k-1} >= 0`, no `y{j}` on any
+    /// row. The rows [`super::super::products`] walks ([`super::WALKED`]) and the products
+    /// made.
+    fn products_of_a_factor_on_no_row(k: usize) -> (u64, Result<usize, Refusal>) {
+        use super::super::formula::{Con, Formula};
+        use super::super::{Relation, Tier, products};
+        let ge0 = |l: Lin| Formula::Con(Con::ge(&l, &Lin::constant(0)));
+        let premise: Vec<Formula> = (0..k)
+            .map(|i| ge0(row(0, &[(1, "x"), (i as i64 + 1, "s")])))
+            .collect();
+        let goal = (0..k).fold(Lin::constant(0), |sum, j| {
+            sum.plus(&Lin::atom(Atom::product(
+                &"x".into(),
+                &format!("y{j}").as_str().into(),
+            )))
+        });
+        let (p, g) = (Relation::of(Formula::and(premise)), Relation::of(ge0(goal)));
+        super::WALKED.with(|n| n.set(0));
+        let made = products(&p, &g, Tier::Cheap).map(|(made, _)| made.len());
+        (super::WALKED.with(std::cell::Cell::get), made)
+    }
+
+    /// L4-B: a product `x * y{j}` with no row on `y{j}` forms no pair, so no row on `x` is
+    /// walked for it. Red before the check of an empty side in [`super::super::products`]:
+    /// every row on `x` was walked for each such product, k² rows, 62,500 and 4,000,000 at
+    /// k = 250 and 2,000 (Codex, computed; reproduced here).
+    #[test]
+    fn products_of_a_factor_on_no_row_walk_no_rows() {
+        for k in [250, 2_000] {
+            assert_eq!(products_of_a_factor_on_no_row(k), (0, Ok(0)), "k = {k}");
+        }
     }
 }

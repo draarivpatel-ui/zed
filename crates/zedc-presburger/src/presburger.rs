@@ -29066,14 +29066,19 @@ fn products(
     for ps in partners.values_mut() {
         zed_collections::sorted::sort_dedup(ps);
     }
-    // The work allowed (plan row PRES-pairs-grid-reads): [`pairs::PER_INPUT`] times the input
-    // read here, the terms of the rows multiplied (each with one for the row), the products
-    // wanted and the entries of `partners`. The pairs are counted before they are formed, in
-    // O(|wanted|) saturating products, and the terms of the products kept before they are
-    // expanded, in O(kept); past the limit the question is refused ([`Refusal::Products`]).
-    // Below it nothing changes. So `products` does O(PER_INPUT × input × log) work or
-    // refuses: the pairs and the terms it forms are each at most the limit, and
-    // [`pairs::kept`] meters itself against its own input, which is at most the limit too.
+    // The pairs and terms allowed (plan row PRES-pairs-grid-reads): [`pairs::PER_INPUT`]
+    // times the input read here, the terms of the rows multiplied (each with one for the
+    // row), the products wanted and the entries of `partners`. This limit is a constant on a
+    // size and stays pending the author's answer to AUTHOR-products-terms-refusal (the
+    // alternative is plan row PRES-products-factored-solver, which forms no product). The
+    // pairs are counted before they are formed, in O(|wanted|) saturating products, and the
+    // terms of the products kept before they are expanded, in O(|pairs|) (the flag of every
+    // pair formed is read, kept or not); past the limit the question is refused
+    // ([`Refusal::Products`]). Below it nothing changes. So `products` does
+    // O(PER_INPUT × input × log) work or refuses: the pairs and the terms it forms are each at
+    // most the limit, and [`pairs::kept`] meters itself against its own input, which is at
+    // most the limit too (its meter is to be replaced by conditions computed before each
+    // pass, XR-presburger4 META4 order 3, open).
     // Complexity tradeoff: with m rows on each of two factors the pairs are m², and a product
     // of rows of t terms has t² terms, so before the limit one question could form Θ(input²)
     // terms (the grid family of `pairs::tests::the_meter_refuses_the_grid_family_in_steps_
@@ -29093,10 +29098,22 @@ fn products(
     }
     // The pairs of rows on the two factors of each product, each once, and of them those the
     // exact rule keeps ([`pairs::kept`]).
+    // A product whose factor has no row on it forms no pair, and is passed over before either
+    // list is walked: walking the rows on `x` for each `x * y{j}` whose `y{j}` has none cost
+    // Θ(k²) for k such products of one factor on k rows, with no pair formed (XR-presburger4
+    // round 4, L4-B, Codex: 62,500 to 4,000,000 rows walked at k = 250 and 2,000). So the
+    // loops cost O(|wanted| log + formed log), formed being the pairs counted above. Test:
+    // `pairs::tests::products_of_a_factor_on_no_row_walk_no_rows`.
     let mut pairs = BTreeSet::new();
     for (x, y) in &wanted {
-        for &a in &on[x] {
-            for &b in &on[y] {
+        let (on_x, on_y) = (&on[x], &on[y]);
+        if on_x.is_empty() || on_y.is_empty() {
+            continue;
+        }
+        for &a in on_x {
+            #[cfg(test)]
+            pairs::walked();
+            for &b in on_y {
                 pairs.insert((a.min(b), a.max(b)));
             }
         }
