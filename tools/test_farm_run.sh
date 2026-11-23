@@ -85,13 +85,20 @@ if [ -z "$pieces" ]; then
   fi
   names="p1 p2 p3 p4 p5 p6 p7"
   [ -z "$short_steps" ] || names+=" short-g1"
-  # short-zed_kernel runs on the VMs since TEST-short-zed_kernel-split, as a short piece.
+  # short-zed_kernel runs on the VMs since TEST-short-zed_kernel-split, as a short piece; with
+  # STUB_SHORT_SPLIT, as two: the piece of the tests not run alone, named after its group, and
+  # the piece of a test run alone, short-zed_kernel::t1.
   [ -z "$short_libs" ] || names+=" short-zed_kernel"
+  [ -z "$short_libs" ] || [ -z "${STUB_SHORT_SPLIT:-}" ] || names+=" short-zed_kernel::t1"
   [ -z "$full" ] || names+=" full-a full-b full-c"
   : >"$d/pieces"
   : >"$d/chosen"
   for n in $names; do
-    [ -z "$only" ] || [[ $n =~ $only ]] || continue
+    # --only matches a piece's group as well as its name, as run_tests.sh's selected() does, so
+    # ^short-zed_kernel$ selects short-zed_kernel::t1 too.
+    g=grp-$n
+    [[ $n != short-zed_kernel* ]] || g=short-zed_kernel
+    [ -z "$only" ] || [[ $n =~ $only || $g =~ $only ]] || continue
     [ -z "$except" ] || [[ ! $n =~ $except ]] || continue
     # A short-addresses piece builds only at the build root, here with its clone's upper layer on
     # a tmpfs (FARM-short-pieces-on-vm-tmpfs).
@@ -105,7 +112,7 @@ if [ -z "$pieces" ]; then
         { echo "SHORT BUILD: build/short-clone cannot be renamed"; exit 1; }
     fi
     echo "$n dir bin-$n" >>"$d/pieces"
-    echo "grp-$n step-$n $n" >>"$d/chosen"
+    echo "$g step-$n $n" >>"$d/chosen"
   done
   if [ ! -s "$d/pieces" ]; then echo "NO PIECE MATCHES --only '$only'"; exit 1; fi
   if [ -n "$list" ]; then echo "listed $(wc -l <"$d/pieces")"; exit 0; fi
@@ -141,6 +148,16 @@ done <"$pieces"
 # STUB_LOWER_LOAD: the load file a run beside others leaves high, lowered to 0.1 2 s after it ends.
 if [ -n "${STUB_LOWER_LOAD:-}" ] && [ "$jobs" != 1 ]; then
   (sleep 2 && echo '0.10 0.10 0.10 1/100 1' >"$STUB_LOWER_LOAD") >/dev/null 2>&1 &
+fi
+# A benchmark run's `bench` lines, as run_tests.sh prints them after its summary: `instr=` when
+# the run counted instructions, `work=` with STUB_BENCH_WORK, as a run in processor time says.
+if [ -n "$bench" ]; then
+  echo "bench lines ($d/bench.log):"
+  key=instr
+  [ -z "${STUB_BENCH_WORK:-}" ] || key=work
+  while read -r name rest; do
+    echo "bench $name n=20 ns=1/8 $key=100/800 bytes=10/80 ratio=8.00"
+  done <"$pieces"
 fi
 echo "pieces: $n, failed: $f"
 [ "$f" = 0 ]
@@ -195,6 +212,8 @@ mkdir -p "$out/src" "$out/out" || exit 2
 ( cd "$wt" && git ls-files -z -co --exclude-standard | tar --null -T - -cf - ) | tar xf - -C "$out/src" || exit 2
 [ "${FAKE_SETUP_FULL_FAIL:-}" != 1 ] ||
   echo "run.sh: the setup of the full tests' tools failed (setup.log)" >"$out/out/setup-full.log"
+[ "${FAKE_ICOUNT_FAIL:-}" != 1 ] ||
+  echo "run.sh: building zed_icount failed (setup.log); benchmarks measure processor time" >"$out/out/icount.log"
 # Each line in order, as run.sh runs them: out/<k>.log and a line of summary.tsv each (a share's
 # job has one line, a --commands job one per command).
 k=0 all=0
@@ -209,6 +228,13 @@ while IFS= read -r raw; do
     ( cd "$out/src" && FARM_VM_JOB=$out bash -c "${line#!}" ) >"$out/out/$k.log" 2>&1
     rc=$?
   fi
+  # FAKE_RETRY_ROW: a failed first attempt run again, as job.sh writes it before the final row
+  # (column 6 dylib-retry; FARM-merge-check-first-row-rc).
+  [ -z "${FAKE_RETRY_ROW:-}" ] || printf '%s\t1\t0\t1\t1\tdylib-retry\n' "$raw" >>"$out/summary.tsv"
+  # FAKE_RETRY_FIRST: line 1 has a failed try before it, as job.sh writes a try it runs again
+  # (a `!` line that met a mix of dylib and rlib builds, or a test line out of memory).
+  [ "${FAKE_RETRY_FIRST:-}" != 1 ] || [ "$k" != 1 ] ||
+    printf '%s\t1\t0\t1\t1\tdylib-retry\n' "$raw" >>"$out/summary.tsv"
   printf '%s\t%s\t0\t1\t1\n' "$raw" "$rc" >>"$out/summary.tsv"
   [ "$rc" = 0 ] || all=1
 done <"$tests"
@@ -293,6 +319,11 @@ notrun all ""
 # Tests (FARM-short-pieces-on-vm-tmpfs): short-g1 ran on a VM (the stub checked its build root
 # and tmpfs), by name in a run of its own, as --pieces refuses it.
 has all '^stub: --pieces refuses' 0
+# The pieces short-zed_kernel and short-zed_kernel::t1 go to shares 1 and 2. --only
+# '^short-zed_kernel$' matches the group of both, so share 1 ran t1 too, and the share failed:
+# "reported but not sent" (b22-tests7's merge check on v5e2, 2026-11-23). Each runs once.
+STUB_SHORT_SPLIT=1 case_ short-split 0 "pieces: 10, failed: 0" "$all short-zed_kernel::t1" -- --owner t --vms 2
+has short-split 'reported but not sent' 0
 STUB_HAS_PODMAN=1 case_ full 0 "pieces: 11, failed: 0" "$all full-a full-c" -- --owner t --vms 2 --full
 notrun full "full-b"
 # Tests (FARM-local-only-pieces-on-vm): full-c needs podman, so each share fetches the deps first,
@@ -359,7 +390,18 @@ has short-fail-and-timeout '^farm: stopped by its limit under load, passed alone
 has short-fail-and-timeout '^short-g1 rc=1 ' 1
 STUB_FLAKY='^p4$' case_ bench-rerun 0 "pieces: 9, failed: 0" "$all" -- --owner t --vms 2 --bench
 command grep -q -c '^farm: first run: p4 rc=1' "$ws/case-$n-bench-rerun.out" || { fail=$((fail + 1)); echo "FAIL bench-rerun: no first-run line"; }
+# Tests (FARM-icount-fallback-silent): benchmarks measured in processor time fail the run, though
+# every piece passed, with a line naming each share's VM and the cause: the job's out/icount.log
+# (zed_icount's build failed), or `work=` bench lines (a checkout older than tools/icount). The
+# case above, whose lines say `instr=` and which has no icount.log, passes with no such line.
+has bench-rerun '^farm: benchmarks measured processor time' 0
 STUB_FAIL='^p5$' case_ bench-fail 1 "pieces: 9, failed: 1" "$all" -- --owner t --vms 2 --bench
+FAKE_ICOUNT_FAIL=1 case_ bench-icount-fail 1 "pieces: 9, failed: 0" "$all" -- --owner t --vms 2 --bench
+has bench-icount-fail '^farm: benchmarks measured processor time, not instructions, on hm[0-9]+ \(share [12] of 2\): run\.sh: building zed_icount failed \(setup\.log\); benchmarks measure processor time$' 2
+STUB_BENCH_WORK=1 case_ bench-work 1 "pieces: 9, failed: 0" "$all" -- --owner t --vms 1 --bench
+has bench-work '^farm: benchmarks measured processor time, not instructions, on hm1 \(share 1 of 1\): 9 bench lines say work=, not instr=$' 1
+# A test run (no --bench) does not look: its pieces print no bench line.
+FAKE_ICOUNT_FAIL=1 case_ test-icount-fail 0 "pieces: 9, failed: 0" "$all" -- --owner t --vms 1
 # Tests (FARM-share-load-timeouts): a piece stopped by its limit under the share's load runs once
 # more alone; passing alone it is reported passed, its first line kept with the prefix, and named.
 STUB_TIMEOUT='^p4$' case_ timeout-rerun 0 "pieces: 9, failed: 0" "$all" -- --owner t --vms 2
@@ -421,9 +463,25 @@ case_ cmd-fail 1 "farm: command 3 rc=0: echo third" "" -- --owner t --vms 1 --co
 o=$ws/case-$n-cmd-fail.out
 [ "$(command grep -a -c -x 'farm: command 2 rc=3: exit 3' "$o")" = 1 ] && [ "$(command grep -a -c -x 'first' "$o")" = 1 ] ||
   { fail=$((fail + 1)); echo "FAIL cmd-fail: line 2's exit 3 or line 1's log not printed ($o)"; }
+# A line job.sh ran again after a dylib retry (FARM-merge-check-first-row-rc): summary.tsv has the
+# retry row, exit 1, before the final row, and only the final row is the line's exit. Before the
+# fix a share read row 1 and failed with every piece passed, and --commands counted both rows.
+FAKE_RETRY_ROW=1 case_ retry-row 0 "pieces: 9, failed: 0" "$all" -- --owner t --vms 2
+FAKE_RETRY_ROW=1 STUB_FAIL='^p3$' case_ retry-row-fail 1 "pieces: 9, failed: 1" "$all" -- --owner t --vms 2
+FAKE_RETRY_ROW=1 case_ cmd-retry-row 0 "farm: command 2 rc=0: echo \"out \${FARM_OUT:-unset}\"; ls \"\$FARM_OUT\" >/dev/null" "" -- --owner t --vms 1 --commands "$ws/cmd-pass"
+[ "$(command grep -c '^acquire' "$colab/log")" = 1 ] || { fail=$((fail + 1)); echo "FAIL cmd-retry-row: not one attempt"; }
+FAKE_RETRY_ROW=1 case_ cmd-retry-row-fail 1 "farm: command 3 rc=0: echo third" "" -- --owner t --vms 1 --commands "$ws/cmd-fail"
+has cmd-retry-row-fail '^farm: command 2 rc=3: exit 3$' 1
 FAKE_DIE_ALWAYS=1 case_ cmd-die 129 "farm: FAILED: the commands could not be run after 3 attempts" "" -- --owner t --vms 1 --commands "$ws/cmd-pass"
 [ "$(command grep -c '^acquire' "$colab/log")" = 3 ] || { fail=$((fail + 1)); echo "FAIL cmd-die: not 3 attempts"; }
 FAKE_DIE_FIRST=1 case_ cmd-died-once 0 "farm: command 2 rc=0: echo \"out \${FARM_OUT:-unset}\"; ls \"\$FARM_OUT\" >/dev/null" "" -- --owner t --vms 1 --commands "$ws/cmd-pass"
+# A line job.sh ran again (a row marked dylib-retry before the row that counts) is one line that
+# passed, on the first attempt (b22-tests7's merge check, clippy on v5e2, 2026-11-23).
+FAKE_RETRY_FIRST=1 case_ cmd-retried 0 "farm: command 2 rc=0: echo \"out \${FARM_OUT:-unset}\"; ls \"\$FARM_OUT\" >/dev/null" "" -- --owner t --vms 1 --commands "$ws/cmd-pass"
+o=$ws/case-$n-cmd-retried.out
+[ "$(command grep -a -c -x 'farm: command 1 rc=0: echo "cwd $PWD"' "$o")" = 1 ] && [ "$(command grep -c '^acquire' "$colab/log")" = 1 ] ||
+  { fail=$((fail + 1)); echo "FAIL cmd-retried: line 1 not passed, or not on the first attempt ($o)"; }
+FAKE_RETRY_FIRST=1 case_ share-retried 0 "pieces: 9, failed: 0" "$all" -- --owner t --vms 2
 # Usage errors: exit 2, nothing made, no VM acquired.
 for bad in "--owner '' --vms 1" "--owner t --vms 5" "--owner t --vms 0" "--owner 't x' --vms 1" "--owner t --vms 1 --jobs 0" \
   "--owner t --vms 1 --terms /nonexistent" "--owner t --vms 1 --trace rel" "--owner t --vms 1 --zrun /bin/true" \

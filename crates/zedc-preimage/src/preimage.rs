@@ -13739,6 +13739,40 @@ pub mod counts {
         pub(crate) static NEGATIVE_CYCLES: Cell<[u64; 2]> = const { Cell::new([0, 0]) };
         pub(crate) static INVERSE_MOST: Cell<[u64; 2]> = const { Cell::new([0, 0]) };
         pub(crate) static IF_TREE_NODES: Cell<Option<u64>> = const { Cell::new(None) };
+        pub(crate) static BOUNDARY_GCDS: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static IF_TREE_SEAMS: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// Starts adding up, on this thread, the pairs of neighbors with touching values and equal
+    /// input labels in the tree of excluded values at each `If` step of
+    /// `preimage_ref::Tx::inverse_states` (REF-merge-equal-labels).
+    pub fn count_if_tree_seams() {
+        IF_TREE_SEAMS.set(Some(0));
+    }
+
+    /// The pairs added up since [`count_if_tree_seams`] (`None` when it was not called), and
+    /// stops adding.
+    pub fn if_tree_seams() -> Option<u64> {
+        IF_TREE_SEAMS.replace(None)
+    }
+
+    /// Adds `count()` to [`if_tree_seams`] while adding up; does not call `count` otherwise.
+    pub(crate) fn note_if_tree_seams(count: impl FnOnce() -> usize) {
+        if let Some(sum) = IF_TREE_SEAMS.get() {
+            IF_TREE_SEAMS.set(Some(sum + count() as u64));
+        }
+    }
+
+    /// The gcds taken on this thread for the cuts of the trees of excluded values
+    /// (`Boundaries::join` in `preimage_ref`, which only `tree_round` reads) since the last call,
+    /// and resets the count to 0 (REF-boundaries-gate).
+    pub fn boundary_gcds() -> u64 {
+        BOUNDARY_GCDS.replace(0)
+    }
+
+    /// Adds `n` to [`boundary_gcds`].
+    pub(crate) fn note_boundary_gcds(n: u64) {
+        BOUNDARY_GCDS.set(BOUNDARY_GCDS.get() + n);
     }
 
     /// Starts recording, on this thread, the most nodes in the tree of excluded values of an

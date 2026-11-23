@@ -8,14 +8,14 @@
 //!   the points near every end of the input, of main's box and of the new one, and in
 //!   [-60, 60]. The other 182,327 calls give main's answer unchanged; the dump is 126 MB, so
 //!   that replay was run once, outside the tests (COMPLEXITY.md C56);
-//! - the scaling, in `bench::ref_memo`: each of the 48 families of the item's benchmark at n
-//!   and 8n, held to the plan's limit (`scaling::LIMIT`) in instructions and bytes, with no
-//!   wider limit for any family; each answer grows at most 8 times (`output_grid` demands four
-//!   values, 4n pieces).
-//!   The work of writing out a larger answer is held at one n by
+//! - the scaling, in `bench::ref_memo`: each of the 55 families (the 53 of [`FAMILIES`],
+//!   `random_chains` and `nested_moduli_eq_4096_at_6`) at n and 8n, held to the plan's limit
+//!   (`scaling::LIMIT`) in instructions and bytes, with no wider limit for any family; each
+//!   answer grows at most 8 times (`output_grid` demands four values, 4n pieces). None is
+//!   ignored. The work of writing out a larger answer is held at one n by
 //!   `output_grid_work_grows_with_its_answer`, and `nested_moduli_eq_4096` with its costly
-//!   constants next to the root at every n is ignored with its plan row,
-//!   REF-nested-moduli-state.
+//!   constants next to the root at every n by `nested_moduli_eq_4096_at_6_scales`
+//!   (REF-nested-moduli-state).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -812,6 +812,37 @@ pub(super) fn family(name: &str, n: usize) -> Vec<(Term, Domains, Demand)> {
             steps(n, |j, t| sub_c(j % 5, prim(Prim::IntDiv, t, int(-2)))),
             mega(),
         ),
+        // Not timed: DAGs that mix `Round` (`(t / k) * k`) and `Abs`, for the replay of the
+        // answers kept by changes to the inverse tree (REF-boundaries-gate). Links alternate
+        // the two, and in `round_abs_one_link` each link takes both.
+        "round_abs_mixed" => {
+            let t = chain(n, var("i"), g_lej, |j, t| {
+                if j % 2 == 1 {
+                    sub_c(j % 5 + 4, abs(t))
+                } else {
+                    let k = 2 + j % 3;
+                    sub_c(
+                        6 * j + 2,
+                        prim(Prim::Mul, prim(Prim::IntDiv, t, int(k)), int(k)),
+                    )
+                }
+            });
+            vec![
+                (t.clone(), i_in(-1000, 1000), gap()),
+                (ne0(t), mega(), Demand::Bool(true)),
+            ]
+        }
+        "round_abs_one_link" => {
+            let g = |j| prim(Prim::Le, var("i"), int(3 * j));
+            let t = chain(n, var("i"), g, |j, t| {
+                let r = prim(Prim::Mul, prim(Prim::IntDiv, abs(t), int(2)), int(2));
+                sub_c(j % 5 + 4, r)
+            });
+            vec![
+                (t.clone(), i_in(-1000, 1000), gap()),
+                (ne0(t), mega(), Demand::Bool(true)),
+            ]
+        }
         _ => panic!("no family {name}"),
     }
 }
@@ -978,6 +1009,135 @@ fn every_family_the_benchmarks_time_is_answered_soundly_at_small_sizes() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The answers of [`answer_table`] as main gave them before REF-boundaries-gate (8376989a7),
+/// one line per family, size and case.
+const ANSWERS: &str = include_str!("ref_memo_answers.txt");
+
+/// The sizes [`answer_table`] runs each family at; `output_grid` only from 8, where its four
+/// demanded values fit.
+const ANSWER_SIZES: [usize; 8] = [1, 2, 3, 4, 5, 8, 16, 33];
+
+/// The families whose answers [`answer_table`] records: every timed one, `random_chains`, and two
+/// DAGs that mix `Round` and `Abs`.
+fn answer_families() -> impl Iterator<Item = &'static str> {
+    (FAMILIES.iter().copied()).chain(["random_chains", "round_abs_mixed", "round_abs_one_link"])
+}
+
+/// One line per family of [`answer_families`], size of [`ANSWER_SIZES`] and case: the family,
+/// the size, the case, the pieces of the answer's box, whether it is exact, and the FNV-1a hash
+/// (64 bits) of the whole answer as `{:?}` prints it.
+fn answer_table() -> String {
+    let mut out = String::new();
+    for name in answer_families() {
+        for &n in &ANSWER_SIZES {
+            if name == "output_grid" && n < 8 {
+                continue;
+            }
+            for (k, (t, ds, d)) in family(name, n).iter().enumerate() {
+                let p = preimage(t, ds, d);
+                let pieces: usize = p.domains.values().map(IntervalSet::len).sum();
+                let hash = format!("{p:?}")
+                    .bytes()
+                    .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                    });
+                out += &format!("{name}\t{n}\t{k}\t{pieces}\t{}\t{hash:016x}\n", p.exact);
+            }
+        }
+    }
+    out
+}
+
+/// REF-boundaries-gate: the cuts that only `tree_round` reads are computed when it reads them,
+/// and every answer of [`answer_table`] stays the one main gave (`ref_memo_answers.txt`). With
+/// `REF_MEMO_ANSWERS_OUT` set to a path, the table this build gives is also written there, which
+/// is how the file was made, on main.
+#[test]
+fn every_family_keeps_main_s_answers_through_the_inverse_tree_changes() {
+    let got = answer_table();
+    if let Some(path) = std::env::var_os("REF_MEMO_ANSWERS_OUT") {
+        std::fs::write(path, &got).expect("writing the table of answers");
+    }
+    let (got, want): (Vec<&str>, Vec<&str>) = (got.lines().collect(), ANSWERS.lines().collect());
+    let differ: Vec<_> = got
+        .iter()
+        .zip(&want)
+        .filter(|(g, w)| g != w)
+        .take(20)
+        .collect();
+    assert!(
+        got.len() == want.len() && differ.is_empty(),
+        "{} lines against main's {}; the first that differ (this build, main): {differ:#?}",
+        got.len(),
+        want.len()
+    );
+}
+
+/// The gcds `Boundaries::join` takes per link of the family `name` at `n` links
+/// ([`zedc::store::preimage::counts::boundary_gcds`]), read on the calling thread.
+fn boundary_gcds_per_link(name: &str, n: usize) -> f64 {
+    use zedc::store::preimage::counts::boundary_gcds;
+    boundary_gcds();
+    for (t, ds, d) in family(name, n) {
+        preimage(&t, &ds, &d);
+    }
+    boundary_gcds() as f64 / n as f64
+}
+
+/// REF-boundaries-gate (XR-ROOTS-REF A7): the cuts of the inverse tree, two gcds a join, are read
+/// only by `tree_round`, so a chain with no `Round` takes none; one with a `Round` takes them,
+/// which shows the count counts. On main (8376989a7) every node built joined them.
+#[test]
+fn only_a_chain_with_a_round_takes_gcds_for_the_cuts() {
+    for n in [16, 64, 128] {
+        let abs = boundary_gcds_per_link("normal_abs_gap", n);
+        let round = boundary_gcds_per_link("normal_round_down", n);
+        println!("gcds per link at {n}: normal_abs_gap {abs:.1}, normal_round_down {round:.1}");
+        assert_eq!(abs, 0.0, "normal_abs_gap at {n}");
+        assert!(round > 0.0, "normal_round_down at {n}");
+    }
+}
+
+/// REF-merge-equal-labels (XR-ROOTS-REF A8): the inverse of `abs` made the piece at 0, `[0, h]`,
+/// and its reflection `[-h, 0]` into `[-h, -1]`, `[0, 0]`, `[1, h]` with one label, two pairs of
+/// touching pieces where one piece does. Summed over the `If` steps, normal_abs_gap at 16 links
+/// had 104 such pairs with main's `abs` (2437d9d67) and has none now that `abs` builds
+/// `[-h, h]` (`State1d::abs`). A `Round` (`(t / k) * k`) widens each piece to whole grid cells
+/// and drops a piece with no grid point, so two pieces with one label can come to touch: with
+/// the new `abs` and no merge in `tree_round`, round_abs_mixed had 1 such pair at 16 links
+/// (4b3c2ee8d); `tree_round` now makes them one piece. Held at 0 on every family listed, the
+/// two that mix `abs` and `Round` included; the most nodes at an `If` step are printed for the
+/// record.
+#[test]
+fn abs_and_round_leave_no_touching_pieces_with_one_label() {
+    use zedc::store::preimage::counts::{
+        count_if_tree_nodes, count_if_tree_seams, if_tree_nodes, if_tree_seams,
+    };
+    for name in [
+        "normal_abs_gap",
+        "pathological_abs",
+        "normal_round_down",
+        "normal_min_gap",
+        "random_chains",
+        "round_abs_mixed",
+        "round_abs_one_link",
+    ] {
+        for n in [16, 64] {
+            count_if_tree_seams();
+            count_if_tree_nodes();
+            for (t, ds, d) in family(name, n) {
+                preimage(&t, &ds, &d);
+            }
+            let nodes = if_tree_nodes();
+            let seams = if_tree_seams();
+            println!(
+                "{name} at {n}: touching pairs with one label {seams:?}, most nodes {nodes:?}"
+            );
+            assert_eq!(seams, Some(0), "{name} at {n}");
         }
     }
 }

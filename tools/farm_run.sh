@@ -68,7 +68,8 @@
 #    DynamoRIO's client zed_icount, which job.sh's VM setup builds and names in ZED_METER_DRRUN and
 #    ZED_METER_ICOUNT (BENCH-vm-no-instruction-counter; tests/src/scaling.rs). Where that build
 #    failed (the job's out/icount.log says so), they fall back on the task clock, which is
-#    noisier. A benchmark that fails is run once more on the same VM at once, alone; that
+#    noisier and held to twice the limit; such a run prints `farm: benchmarks measured processor
+#    time, not instructions, on <VM> ...` and exits 1 (FARM-icount-fallback-silent). A benchmark that fails is run once more on the same VM at once, alone; that
 #    second run's line is the verdict, and the first run's failed line is kept prefixed
 #    `farm: first run: `, which no reader of summary lines takes for one.
 #  - Tests: a test piece stopped by its limit (not one that failed otherwise) is run once more in
@@ -389,9 +390,20 @@ vm_side() {
     rc=$?
   fi
   if [ -s "$w/share-short" ]; then
-    local rs
+    local rs ex=()
+    # --only matches a piece's group as well as its name, so ^short-zed_kernel$, the piece of the
+    # tests not run alone, selected every piece of the group short-zed_kernel, those of other
+    # shares too, and the check of the pieces sent failed the share: "reported but not sent"
+    # (b22-tests7's merge check, v5e2, 2026-11-23). --except matches the piece's name alone, so
+    # it names the short-addresses pieces of the other shares.
+    awk 'NR == FNR { s[$1] = 1; next } $1 ~ /^short-/ && !($1 in s) { print $1 }' \
+      "$w/share-short" "$w/list/latest/pieces" >"$w/short-other" ||
+      { echo "vm_side: listing the other shares' short-addresses pieces failed"; return 2; }
+    [ ! -s "$w/short-other" ] ||
+      ex=(--except "$(sed 's/[][\.*^$+?(){}|/]/\\&/g; s/.*/^&$/' "$w/short-other" | paste -sd'|')")
     bash "$w/run_tests.sh" --logs "$w/run-short" "${a[@]}" \
-      --only "$(sed 's/[][\.*^$+?(){}|/]/\\&/g; s/.*/^&$/' "$w/share-short" | paste -sd'|')" "$cores" >>"$w/r1.out" 2>&1
+      --only "$(sed 's/[][\.*^$+?(){}|/]/\\&/g; s/.*/^&$/' "$w/share-short" | paste -sd'|')" \
+      "${ex[@]}" "$cores" >>"$w/r1.out" 2>&1
     rs=$?
     [ "$rc" != 0 ] || rc=$rs
   fi
@@ -539,6 +551,13 @@ share_failed() {
   echo "farm: FAILED: $*" >>"$out/report"
   [ "$rc_all" != 0 ] || rc_all=1
 }
+# final_rows <summary.tsv>: the rows of a job's summary.tsv that hold a line's exit, one a line in
+# order. job.sh writes a row with a sixth field (dylib-retry, oom-retry) for a try it runs again,
+# before the row of the try that counts, so those rows are left out: a clippy line that failed on
+# a mix of dylib and rlib builds and passed again with prefer-dynamic on v5e2 gave two rows for one
+# line, and farm_run read that as a job not run to its end, twice (b22-tests7's merge check,
+# 2026-11-23).
+final_rows() { awk -F '\t' '$2 ~ /^[0-9]+$/ && $6 == ""' "$1" 2>/dev/null; }
 # --commands: the file's lines, each a `!` line of one job.sh job on one VM (vm_cmd), run in order;
 # a job that did not run to its end (job.sh exit other than 0 or 1, or a line with no exit in
 # summary.tsv) is run again on another VM, up to 3 attempts, as a share is. Prints each line's log
@@ -562,10 +581,10 @@ if [ -n "$commands" ]; then
     jrc=$?
     kids=()
     release_all
-    if [[ $jrc =~ ^[01]$ ]] && [ "$(awk -F '\t' '$2 ~ /^[0-9]+$/' "$d/job/summary.tsv" 2>/dev/null | wc -l)" = ${#cl[@]} ]; then
+    if [[ $jrc =~ ^[01]$ ]] && [ "$(final_rows "$d/job/summary.tsv" | wc -l)" = ${#cl[@]} ]; then
       for i in "${!cl[@]}"; do
         k=$((i + 1))
-        r=$(awk -F '\t' -v k="$k" 'NR == k { print $2 }' "$d/job/summary.tsv")
+        r=$(final_rows "$d/job/summary.tsv" | awk -F '\t' -v k="$k" 'NR == k { print $2 }')
         command grep -a -v '@' "$d/job/out/$k.log" 2>/dev/null
         echo "farm: command $k rc=$r: ${cl[$i]}"
         [ "$r" = 0 ] || rc_all=1
@@ -622,7 +641,7 @@ if [ -n "$run_vm" ]; then
       d=$out/vm$k-${tries[$k]}
       jrc=$(cat "$d/job.rc" 2>/dev/null)
       log=$d/job/out/1.log
-      lrc=$(awk -F '\t' 'NR == 1 { print $2 }' "$d/job/summary.tsv" 2>/dev/null)
+      lrc=$(final_rows "$d/job/summary.tsv" | awk -F '\t' 'NR == 1 { print $2 }')
       if [[ ! $jrc =~ ^[01]$ ]] || [ ! -f "$log" ] || [[ ! $lrc =~ ^[0-9]+$ ]]; then
         why=$(job_why "$d/job.out")
         echo "farm: share $k of $n on ${vm_last[$k]} did not run to its end (job.sh exit ${jrc:-none})${why:+: $why}; $d/job.out"
@@ -680,6 +699,22 @@ if [ -n "$run_vm" ]; then
       # pieces passed: a piece whose tool is missing may skip, not fail.
       if [ -n "$full" ] && [ -f "$d/job/out/setup-full.log" ]; then
         share_failed "share $k of $n on ${vm_last[$k]}: $(join_lines <"$d/job/out/setup-full.log"); $d/job/setup.log"
+      fi
+      # Benchmarks measured in processor time fail the run (FARM-icount-fallback-silent). Without
+      # zed_icount (its build failed: job.sh's run.sh writes out/icount.log; or the checkout
+      # predates tools/icount: no log, but each `bench` line says `work=` where a count says
+      # `instr=`, tests/src/scaling_tests.rs), a benchmark falls back on processor time, whose
+      # ratio scaling::compare_measured holds to LIMIT x TIME_ALLOWANCE = 21, not 10.5; such a run
+      # passed silently (l01_38 twin_chains_of_absolute_values_scale at 11.94, b22-msgtypes4).
+      if [ "$kind" = bench ]; then
+        why=
+        [ ! -f "$d/job/out/icount.log" ] || why=$(join_lines <"$d/job/out/icount.log")
+        c=$(awk '$1 == "bench" && / work=/' "$log" | wc -l)
+        [ "$c" = 0 ] || why+="${why:+; }$c bench lines say work=, not instr="
+        if [ -n "$why" ]; then
+          echo "farm: benchmarks measured processor time, not instructions, on ${vm_last[$k]} (share $k of $n): $why" >>"$out/report"
+          [ "$rc_all" != 0 ] || rc_all=1
+        fi
       fi
     fi
     if [ -n "$trace" ] && [ -d "$d/job/out/trace-$k" ]; then
