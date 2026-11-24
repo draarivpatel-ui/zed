@@ -1082,16 +1082,24 @@ fn a_function_of_a_positional_range_and_a_family_print_alike_and_read_back() {
         // A call through the parameter outside the declared range is refused at the call, so
         // `f` needs no test of its domain there (`Ck::coercion`).
         let outside = program("h(7)", arg);
-        let why = zedc::run::load(outside.as_bytes()).err();
-        eprintln!("TMPDEBUG outside {arg}: {why:?}");
-        assert!(why.is_some(), "{outside}");
+        let why = zedc::run::load(outside.as_bytes())
+            .err()
+            .unwrap_or_default();
+        assert!(
+            why.contains("`h` takes `x0` in int[2..=4]: `h(7 : int)`")
+                && why.contains("the parameter is declared int[2..=4] here"),
+            "{outside}\n{why}"
+        );
     }
     // The parameter passed on to a partial slot is refused, as no test of its domain can be
     // put on a union holding a function beside a family.
     let onward = program("k(h)", "f");
-    let why = zedc::run::load(onward.as_bytes()).err();
-    eprintln!("TMPDEBUG onward: {why:?}");
-    assert!(why.is_some(), "{onward}");
+    let why = zedc::run::load(onward.as_bytes()).err().unwrap_or_default();
+    assert!(
+        why.contains("`h` is `int[2..=4] -> String`, passed as `int ->? String`")
+            && why.contains("no test at run time can be put on a function that sits beside"),
+        "{onward}\n{why}"
+    );
     let count = format!("{unit}main(a: MainArgs) {{\n  a.stdout <- \"${{f.count}}\";\n}}\n");
     assert!(zedc::run::load(count.as_bytes()).is_err(), "{count}");
 }

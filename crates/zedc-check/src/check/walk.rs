@@ -18149,6 +18149,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 n => format!("the function {what} returns after {n} calls"),
             };
             let from = stack.len();
+            let s = ranged_needs_met(&s, &q);
             for a in &q.arrows {
                 let args = a.params.iter().map(|t| Some(Arg::of(t.clone()))).collect();
                 let (r, _) = self.apply(Label::Text(&named), &s, args, false, span);
@@ -34370,6 +34371,52 @@ fn range_need_of<'n>(s: &Sig, n: &'n Need) -> Option<(usize, &'n IntDomain)> {
     let own = s.params.get(*param)?.range.as_ref()?.int()?;
     own.within(r).then_some((*param, domain))
 }
+
+/// `s` without each need of a parameter declared a range ([`range_need_of`]) that the
+/// function type `q` declares a range within, on the same parameter ([`Need::range_declared`]):
+/// what [`Ck::needs_hold`] calls with `q`'s parameters (row
+/// FAIL-declared-range-fn-into-written-arrow: `f(positional x: int[2..=4])` passed at
+/// `h: int[2..=4] -> String`, whose call `f(int)` was refused, as `int` is not within
+/// `int[2..=4]`). `s` itself where no need is met so.
+///
+/// Proof that dropping such a need loses no check. (1) The need of `q`'s declared range on
+/// parameter `j` is checked at each call made through a value of type `q`, against the
+/// argument (DESIGN.md L1.39; [`Need::declared_range`]), so each such call passes at `j` an
+/// int of `q`'s range. (2) `q`'s range is within `s`'s (`WrittenRange::within`), so that int
+/// is in `s`'s range, and `s`'s need of its declared range holds at every call that can
+/// reach `s` through `q`. (3) The calls [`Ck::needs_hold`] makes pass `q`'s parameter types,
+/// `int` at `j`, which hold ints no such call passes; checking `s`'s need on them refused
+/// what (1) and (2) show it is met. Every other need of `s` is kept and checked as before.
+/// This is the rule [`ty::fits_sig_with`] applies between two signatures with needs
+/// (`ranges_fit` in zedc-types), applied where `s` is called instead.
+///
+/// Cost: one pass over the needs of each, O(needs), and one copy of `s` where a need is
+/// dropped.
+fn ranged_needs_met(s: &Arc<Sig>, q: &Sig) -> Arc<Sig> {
+    let ranges: HashMap<usize, &WrittenRange> =
+        (q.needs.iter()).filter_map(Need::range_declared).collect();
+    if ranges.is_empty() {
+        return s.clone();
+    }
+    let met = |n: &Need| {
+        range_need_of(s, n).is_some_and(|(j, d)| {
+            let own = d.written.as_ref();
+            own.is_some_and(|r| ranges.get(&j).is_some_and(|b| b.within(r)))
+        })
+    };
+    if !s.needs.iter().any(met) {
+        return s.clone();
+    }
+    let mut t = (**s).clone();
+    t.needs = (s.needs.iter())
+        .filter(|n| !met(n))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    t.facts = Default::default();
+    Arc::new(t)
+}
+
 /// `s` with no needs, nor any function its arrows return at any depth: what `s` is as a type,
 /// whose needs [`Ck::needs_hold`] checks by calls.
 ///
@@ -34829,6 +34876,68 @@ mod tests {
             );
         }
         assert!(ck.errors.is_empty());
+    }
+
+    /// Row FAIL-declared-range-fn-into-written-arrow: the answer of [`Ck::fit_needs_member`]
+    /// does not depend on the order of the union's members (the proof at that function). The
+    /// union is `int[2..=4] -> String` as read back (the family and the function with that
+    /// declared range) and the function type `int -> String`, in each of its six orders, so
+    /// each member stands first in some order. The functions passed hold the need of a
+    /// parameter declared a range: one whose range holds `int[2..=4]` fits the ranged member
+    /// alone ([`ranged_needs_met`]); one whose range does not hold it fits none, and the
+    /// answer is the same refusal in every order. A program cannot write this union (a ranged
+    /// key is resolved only at the top of a parameter's type), so the test builds it.
+    #[test]
+    fn a_function_with_needs_fits_a_union_of_arrows_whatever_their_order() {
+        let read =
+            |text: &str| crate::check::read::parse_type(text).unwrap_or_else(|why| panic!("{why}"));
+        let func = |text: &str| {
+            let t = read(text);
+            let s = t.fns.iter().find(|s| !s.data).cloned();
+            s.unwrap_or_else(|| panic!("{text} reads with a function"))
+        };
+        let ranged = read("int[2..=4] -> String");
+        let members: Vec<Arc<Sig>> = (ranged.fns.iter().cloned())
+            .chain([func("int -> String")])
+            .collect();
+        assert_eq!(members.len(), 3, "the family and two functions");
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let at = Span { start: 1, end: 2 };
+        for (text, fits) in [
+            ("int[2..=4] -> String", true),
+            ("int[1..=5] -> String", true),
+            ("int[2..=3] -> String", false),
+            ("int[3..=9] -> String", false),
+        ] {
+            let s = func(text);
+            assert!(s.holds_needs() && s.holds_no_var(), "{text}");
+            let mut firsts = HashSet::new();
+            for order in orders {
+                let p = (order.iter())
+                    .map(|&i| Ty::func(members[i].clone()))
+                    .reduce(|a, b| a.union(&b))
+                    .expect("three members");
+                assert_eq!(p.fns.len(), 3, "{p}");
+                firsts.insert(p.fns.iter().next().map(Arc::as_ptr));
+                let res = zedc_resolve::resolve::resolve(&[]).expect("the empty unit resolves");
+                let t = Tables::new(&[], &res);
+                let mut ck = Ck::new(&t, Ck::fixes_checked, Ck::refuse_taken_uses);
+                let got = ck.fit_needs_member(&s, &p, "a test", at);
+                assert_eq!(got, Some(fits), "{text} at {p}, in the order {order:?}");
+                assert!(
+                    ck.errors.is_empty(),
+                    "{text} at {p}, in the order {order:?}"
+                );
+            }
+            assert_eq!(firsts.len(), 3, "each member stands first in some order");
+        }
     }
 
     /// Row PROOF-join-narrowed-rescan-rounds: [`Ck::push_carrier_groups`] finds a group whose
