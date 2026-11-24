@@ -97,7 +97,7 @@ use ty::{
     Around, Arrow, Binds, CallPath, Carrier, DataUse, Dense, EVERY, FoldForm, IntDomain, KeyUse,
     LevelWord, MapWord, NameItem, NameRun, Names, Narrow, Need, NeedKind, NodeId, OTHER,
     ParamRange, Pat, PathStep, PathSteps, Piece, PowerUse, Reducer, Renamings, RunMark, RunRenames,
-    SParam, Shape, Sig, Slot, Ty, VarFacts, VarSet, Vars, Via, Width, WrittenRange, atoms,
+    SParam, Shape, Sig, Slot, Ty, VarFacts, VarSet, Vars, Via, ViaText, Width, WrittenRange, atoms,
     carriers_text, class_id, errs, fresh_name, mask_text, rename_apart, single_carrier,
 };
 
@@ -2467,6 +2467,12 @@ struct Ck<'t, 'a> {
     /// ([`Ck::derive_into`]). An operation that takes a carrier leaves the set
     /// ([`Ck::lit_takes`]).
     lit_open: HashSet<Span>,
+    /// The operations that left [`Ck::lit_open`] when they took a carrier ([`Ck::lit_takes`],
+    /// outside a trial). A refusal of a call that one of them is an argument of was met while
+    /// it was still open, as in `add(x: add(x: 1e40 / 1e10, y: 1.0f32), y: 1)`, where the outer
+    /// call gives the `/` its `f64` before the inner refusal's steps are built, so a step names
+    /// the carriers it had then (MSG-f32-body-top-agree, [`Ck::derive_work`]).
+    lit_settled: HashSet<Span>,
     /// The operations of [`Ck::lit_ops`] that nothing gives a carrier, so each is an `int`
     /// where its type is `int`: the whole value of a binding, as `1 + 2` in `s = 1 + 2;`, an
     /// operand of an operator whose other operand has no numeric carrier, as `1 + 2` in
@@ -3489,6 +3495,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             lit_ops: HashSet::new(),
             lit_reads: Vec::new(),
             lit_open: HashSet::new(),
+            lit_settled: HashSet::new(),
             lit_uncarried: HashSet::new(),
             kept_ops: HashMap::new(),
             follow_class: HashMap::new(),
@@ -4630,6 +4637,9 @@ impl<'t, 'a> Ck<'t, 'a> {
             .collect();
         // The type of each tuple written out built so far ([`Ck::tuple_seen`]).
         let mut tuples = HashMap::new();
+        // The reasons of literals that narrow an operation on literals alone, given after the
+        // other steps, where a body gives its classes' reasons (MSG-f32-body-top-agree).
+        let mut late: Vec<Note> = Vec::new();
         let mut stack: Vec<Work> = start.into_iter().rev().collect();
         let note = |span: Span, text: String| {
             Work::Show(Note {
@@ -4817,17 +4827,61 @@ impl<'t, 'a> Ck<'t, 'a> {
                     let uncarried = (ty == "int" && self.lit_uncarried.contains(&span))
                         .then(|| verb_of(e))
                         .flatten();
+                    // An operation on literals alone that holds a decimal is shown as a body
+                    // shows its class: by the carriers its literals may all take, each literal
+                    // that narrows them with its reason (MSG-f32-body-top-agree; before, at the
+                    // top level it said "`/` has no arrow at `int`", which a decimal never
+                    // meets, and gave no reason). One that took a carrier after the refusal
+                    // these steps explain is shown as it was then ([`Ck::lit_settled`]).
+                    let open = self.lit_open.contains(&span) || self.lit_settled.contains(&span);
+                    let decimal = match open {
+                        true => open_decimal_carriers(e, self.t.text),
+                        false => None,
+                    };
+                    // The carriers are the ones the headline prints for it
+                    // ([`Self::open_carriers`]); a literal that narrows the others' carriers
+                    // gets the reason a body's class gives it, after the other steps, as there.
+                    let open_ty = decimal.as_ref().and_then(|_| {
+                        let open: Vec<Ty> = [Carrier::F64, Carrier::Rat]
+                            .into_iter()
+                            .filter(|&c| folded(e, c).is_some())
+                            .map(Ty::carrier)
+                            .collect();
+                        (!open.is_empty()).then(|| Ty::union_all(&open))
+                    });
+                    if let Some((m, lits)) = &decimal {
+                        let any = lits.iter().fold(0, |p, l| p | lit_mask(l, true));
+                        for l in lits.iter().filter(|l| lit_mask(l, true) == *m && *m != any) {
+                            let why = format_args!(
+                                "the literal {} takes {}",
+                                l.written(),
+                                ty::mask_text(*m)
+                            );
+                            late.push(Note {
+                                span: l.span,
+                                text: quoting(&why, || "this literal narrows it".into()).into(),
+                            });
+                        }
+                    }
                     let text = match (&e.kind, self.lit_open.contains(&span)) {
+                        _ if let Some(t) = &open_ty => format!("{what} gives {t}"),
                         (_, false) if let Some(verb) = uncarried => format!(
                             "{what} {verb} integer literals alone, so it is a literal too; \
                              nothing here gives it a carrier, so it is an `int`"
                         ),
                         (_, false) if untyped => format!("{what} has no type yet"),
                         (_, false) => format!("{what} {verb} {ty}"),
-                        (ExprKind::Binary(BinaryOp::Div, ..), true) => format!(
-                            "{what} is an operation on literals alone, so it is a literal too \
+                        // Only a `/` of integer literals alone meets `int` at all: one that
+                        // holds a decimal, as `1e40 / 1e10`, never takes `int`, so that
+                        // reason is not its own (MSG-f32-body-top-agree).
+                        (ExprKind::Binary(BinaryOp::Div, ..), true)
+                            if open_lits(e).is_some_and(|o| !o.decimal) =>
+                        {
+                            format!(
+                                "{what} is an operation on literals alone, so it is a literal too \
                              and takes the carrier of what it meets; `/` has no arrow at `int`"
-                        ),
+                            )
+                        }
                         (_, true) => format!(
                             "{what} is an operation on literals alone, so it is a literal too \
                              and takes the carrier of what it meets"
@@ -4887,6 +4941,11 @@ impl<'t, 'a> Ck<'t, 'a> {
                 o = origin.then.as_deref();
             }
             stack.extend(next.into_iter().rev());
+        }
+        for n in late {
+            if shown.insert(n.clone()) {
+                out.push(n);
+            }
         }
     }
 
@@ -6505,10 +6564,7 @@ impl<'t, 'a> Ck<'t, 'a> {
     /// hold it exactly: `9007199254740993` removes `f64`.
     fn join(&mut self, k: usize, l: &Lit, follower: bool) -> bool {
         if !follower {
-            let m = Carrier::ALL
-                .into_iter()
-                .filter(|&c| adoptable(l, c) && (!l.generic || fits(l, c)))
-                .fold(0, |m, c| m | c.bit());
+            let m = lit_mask(l, l.generic);
             // The literal's own carriers do not ask the class for one.
             if !self.restrict_asking(
                 k,
@@ -7227,6 +7283,10 @@ impl<'t, 'a> Ck<'t, 'a> {
     fn sig_text_with(&self, s: &Sig, written: &[(Arc<str>, Arc<str>)]) -> String {
         let s = s.solved_with(&|v| self.stale(v));
         let mut passed: HashMap<Arc<str>, Option<Ty>> = HashMap::new();
+        // For each variable, the (key, result) of each lookup `v[k]` at a fixed key, while
+        // every use of it is one ([`Self::lookups_as_maps`]); `None` after a use of another kind.
+        let mut looked: HashMap<Arc<str>, Option<Vec<(Ty, Ty)>>> = HashMap::new();
+        let mut seen_lookups: HashSet<(Arc<str>, Ty, Ty)> = HashSet::new();
         for n in &s.needs {
             if let NeedKind::Fwd(fwd) = &n.kind {
                 // `Fwd` holds only `Entries`/`Call`/`Map` (`#3`), never `Into`: every `.on`
@@ -7235,11 +7295,29 @@ impl<'t, 'a> Ck<'t, 'a> {
                 for t in &fwd.on_vars {
                     if let Some(v) = t.as_var() {
                         passed.insert(v.clone(), None);
+                        looked.insert(v.clone(), None);
                     }
                 }
                 continue;
             }
             let Some(v) = n.on.as_var() else { continue };
+            let lookup = match (&n.kind, &n.result) {
+                (NeedKind::Component { key, .. }, Some(r)) if !key.holds_vars() => {
+                    Some((key.clone(), r.clone()))
+                }
+                _ => None,
+            };
+            let l = looked.entry(v.clone()).or_insert_with(|| Some(Vec::new()));
+            match (lookup, l.as_mut()) {
+                (Some((k, r)), Some(list)) => {
+                    // A lookup written twice, `p[0] + p[0]`, is one arrow: a set, so that n
+                    // lookups cost O(n), not the O(n^2) of a search of the list.
+                    if seen_lookups.insert((v.clone(), k.clone(), r.clone())) {
+                        list.push((k, r));
+                    }
+                }
+                _ => *l = None,
+            }
             let into = match &n.kind {
                 NeedKind::Into { ty, .. } => Some(ty),
                 _ => None,
@@ -7268,9 +7346,34 @@ impl<'t, 'a> Ck<'t, 'a> {
         around.named.extend(written.iter().cloned());
         let kept: HashSet<&Arc<str>> = around.kept.iter().map(|(v, _)| v).collect();
         passed.retain(|v, _| !kept.contains(v));
-        let twice = match passed.is_empty() {
+        looked.retain(|v, l| l.is_some() && !kept.contains(v) && !s.bounds.contains_key(v));
+        let twice = match passed.is_empty() && looked.is_empty() {
             true => HashSet::new(),
             false => s.standing_twice(),
+        };
+        let maps = Self::lookups_as_maps(looked, &twice);
+        // A map puts the result of each lookup in a second place, the key's arrow, so a result
+        // that stood once now stands twice and keeps its name: `(xs: 0 -> T) -> (int, T)`,
+        // not the bound of `T` in both places, which would drop the link. So the places are
+        // counted again on the rewritten type, once, only when a map was made.
+        let (s, twice) = match maps.is_empty() {
+            true => (s, twice),
+            false => {
+                // A variable made a map has `Component` needs only, and its map says exactly
+                // what they say (points (1) and (2) of [`Self::lookups_as_maps`]), so its needs
+                // are dropped before the replacement: kept,
+                // each of the n needs would take a copy of the n arrows, O(n^2) to replace and
+                // to walk (the bench `printing_a_parameter_of_many_lookups_scales` measured a
+                // ratio of 24.8 at 200 and 1600 lookups with them).
+                let mut s = s;
+                s.needs = (s.needs.iter())
+                    .filter(|n| !n.on.as_var().is_some_and(|v| maps.contains_key(v)))
+                    .cloned()
+                    .collect();
+                let s = s.replace(&maps);
+                let twice = s.standing_twice();
+                (s, twice)
+            }
         };
         // A variable bounded by carriers, `for V in int | f64`, takes the values of its type
         // in those carriers; a bound that lets other values in ([`OTHER`]) bounds nothing.
@@ -7288,6 +7391,58 @@ impl<'t, 'a> Ck<'t, 'a> {
             true => s.text_around(around.get()),
             false => s.replace(&binds).text_around(around.get()),
         }
+    }
+
+    /// For each variable of `looked` that stands in one place only (not in `twice`) and has a
+    /// lookup, the map type of its lookups: `k -> r` for its one lookup `v[k]` of result `r`,
+    /// and the meet `(k1 -> r1) & (k2 -> r2)` of the arrows for several keys.
+    ///
+    /// Why (DESIGN.md sec:diagnostics, "Types in a message", spec 2238e22, plan row
+    /// PRINT-hidden-var): a printed type never writes `_`, and a parameter that the body uses
+    /// only by lookup at fixed keys prints as the map type of those keys, since lookup is
+    /// application (sec:values_morphisms): `h(p) = p[0] + 1` prints `(0 -> T) -> T for T in
+    /// ...`, where it printed `_ -> U for U in ...`. The rewrite is exact, not a widening:
+    /// (1) such a variable is constrained by its `Component` needs alone (`sig_text_with` drops
+    /// a variable with a need of any other kind, a forward, a bound or a kept name); (2) a
+    /// `Component` need with key `k` and result `r` holds at a call exactly where the argument
+    /// answers at `k` with a value of `r` (check/walk.rs, the `NeedKind::Component` arm of
+    /// `Ck::replay_one`), which is what the exact arrow `k -> r` admits; (3) several needs hold
+    /// together, which is the meet of their arrows; (4) the variable stands in one place, so no
+    /// other part of the type links to it and replacing it loses no link. The result `r` now
+    /// stands in the key's place as well as where it stood before, so where it stood once
+    /// before it prints by a name too, `(0 -> T) -> T`, the link that gives `h([1, 2])` the
+    /// type `int`. A key holding a variable is not fixed, and keeps the variable's printing.
+    /// Time O(l) for the l lookups.
+    // Tests: tests/steps/l01_29_diagnostics/tyvars.rs, `a_parameter_used_only_by_lookup_prints_
+    // as_a_map` (the printed form, read back by `parse_type`, and the negative control on the
+    // old text) and `a_lookup_parameter_keeps_the_link_of_its_result` (`h([1, 2])` is `int`);
+    // tests/steps/l01_26_type_resolution/standing_twice.rs, the key-0 halves of its first two
+    // tests (a result with a bound, counted again after the rewrite: without the second count
+    // it printed its bound in both places, `(xs: 0 -> (x: Part1) ->? int) -> ...`).
+    fn lookups_as_maps(
+        looked: HashMap<Arc<str>, Option<Vec<(Ty, Ty)>>>,
+        twice: &HashSet<Arc<str>>,
+    ) -> Binds {
+        let map_of = |(k, r): (Ty, Ty)| {
+            let p = SParam {
+                name: "".into(),
+                positional: true,
+                default: None,
+                range: None,
+            };
+            Sig::one(vec![p], vec![k], r)
+        };
+        (looked.into_iter())
+            .filter(|(v, _)| !twice.contains(v))
+            .filter_map(|(v, l)| {
+                let mut l = l?.into_iter();
+                let mut sig = map_of(l.next()?);
+                for kr in l {
+                    sig.add_arrows_of(&map_of(kr));
+                }
+                Some((v, Ty::func(Arc::new(sig))))
+            })
+            .collect()
     }
 
     /// [`Ty::sub`], each solved class variable read as its type ([`Self::stale`]).
@@ -12445,6 +12600,44 @@ fn fits(l: &Lit, c: Carrier) -> bool {
 fn adoptable(l: &Lit, c: Carrier) -> bool {
     let own = lit_carrier(&l.value);
     c.numeric() && (c == own || l.bare && !(own == Carrier::F64 && c == Carrier::Int))
+}
+
+/// The carriers the literal `l` may take, as a mask: those it may adopt ([`adoptable`]), and
+/// of those, with `exact`, only the ones that hold it exactly ([`fits`]). Where it joins a
+/// class ([`Ck::join`]), `exact` is whether the literal is generic.
+fn lit_mask(l: &Lit, exact: bool) -> u8 {
+    Carrier::ALL
+        .into_iter()
+        .filter(|&c| adoptable(l, c) && (!exact || fits(l, c)))
+        .fold(0, |m, c| m | c.bit())
+}
+
+/// The carriers an operation on bare literals alone that holds a decimal may take, as a mask,
+/// the meet of the carriers that hold each of its literals exactly ([`lit_mask`] with
+/// `exact`), with those literals, read with the program's text `src`; `None` for another
+/// expression or one of integer literals alone. In a function body the literals are generic
+/// and their class ([`Ck::lits_take`]) meets the same masks, so a step built from this names
+/// the carriers the body's class names (MSG-f32-body-top-agree): `1e40`, which no `f32` holds,
+/// takes `f64 | rat` in both. O(|e|).
+fn open_decimal_carriers(e: &Expr, src: Option<&str>) -> Option<(u8, Vec<Lit>)> {
+    if !open_lits(e)?.decimal {
+        return None;
+    }
+    let mut lits = Vec::new();
+    let mut todo = vec![e];
+    while let Some(x) = todo.pop() {
+        if let Some(l) = literal(x, src) {
+            lits.push(l);
+            continue;
+        }
+        match &x.kind {
+            ExprKind::Binary(_, a, b) => todo.extend([&**b, &**a]),
+            ExprKind::Unary(_, a) => todo.push(a),
+            _ => {}
+        }
+    }
+    let m = lits.iter().fold(u8::MAX, |m, l| m & lit_mask(l, true));
+    Some((m, lits))
 }
 
 /// The literal `l` where a value of one of the types `want` is expected: the carrier it
