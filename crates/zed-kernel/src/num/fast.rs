@@ -1938,21 +1938,50 @@ pub(super) fn scaled_node_precision(
     guard: u64,
     cap: u64,
 ) -> (u64, bool) {
+    let (f, ntt, _) = scaled_node_plan(v, a, b, guard, cap);
+    (f, ntt)
+}
+
+/// [`scaled_node_precision`] with the cost of the step it chooses, in the units of
+/// [`TRANSFORM_COST`] (one word product): the cheaper of the shared transform and the two
+/// products, for [`trees::remainders`]'s choice of method node by node. O(log) in the widths.
+///
+/// [`trees::remainders`]: super::trees::remainders
+pub(super) fn scaled_node_plan(
+    v: &BigUint,
+    a: &BigUint,
+    b: &BigUint,
+    guard: u64,
+    cap: u64,
+) -> (u64, bool, f64) {
     let tight = v.bits() + guard;
     let fw = usize::try_from(tight.div_ceil(64)).expect("words fit in memory");
     let m = fw.next_power_of_two();
     let ntt_bits = 64u64.saturating_mul(m as u64);
     let wa = words(a);
     let wb = words(b);
+    let mul_both = mul_cost(fw, wa) + mul_cost(fw, wb);
     let can_ntt = m <= (1 << 50) && ntt_bits <= cap && wa.min(wb) > 0;
     if can_ntt {
         let ntt_cost = (TRANSFORM_COST + CACHED_COST) * points_cost(m) as f64;
-        let mul_both = mul_cost(fw, wa) + mul_cost(fw, wb);
         if ntt_cost < mul_both {
-            return (ntt_bits, true);
+            return (ntt_bits, true, ntt_cost);
         }
     }
-    (tight, false)
+    (tight, false, mul_both)
+}
+
+/// The cost of [`scaled_root`] for `u` of `uw` words over `p` of `pw` words at precision `f`,
+/// in the units of [`TRANSFORM_COST`]: num-bigint's division of `u 2^f` by `p` at or below
+/// [`RECIP_LEAF`], a word product for each quotient word and divisor word; else
+/// [`approx_reciprocal`], about 5/3 of a product of `f` bits (as [`newton_cost`] counts it),
+/// and its product by `u`. O(log) in the widths.
+pub(super) fn scaled_root_cost(uw: usize, pw: usize, f: u64) -> f64 {
+    let fw = usize::try_from(f.div_ceil(64)).expect("words fit in memory");
+    match f <= RECIP_LEAF {
+        true => (uw + fw).saturating_sub(pw).max(1) as f64 * pw as f64,
+        false => 5.0 * mul_cost(fw, fw) / 3.0 + mul_cost(uw, fw),
+    }
 }
 
 /// Rounded bit-window extraction: given `y` (whose low `f` bits are `Y = y mod 2^f`), returns
@@ -2370,6 +2399,92 @@ pub(crate) fn rem(a: &BigUint, b: &BigUint) -> BigUint {
     }
     div_rem(a, b).1
 }
+
+/// The cost [`rem`] is estimated to take for a dividend of `aw` 64-bit words by `b`, in the
+/// units of [`TRANSFORM_COST`] (one word product), for [`trees::remainders`]'s choice of method
+/// node by node: 1 (a comparison) for a dividend narrower than `b`; num-bigint's long division,
+/// a word product for each quotient word and divisor word, where [`rem`] and [`div_rem`] take it
+/// whatever its cost (a divisor or a quotient of at most [`DIV_LEAF`] bits); otherwise
+/// [`rem_cost_past_leaf`]. O(1) below the leaf, inlined into the loop over a level's nodes
+/// (`trees::descent_cost`, one call a node); O(words(b)) past it.
+///
+/// [`trees::remainders`]: super::trees::remainders
+#[inline]
+pub(super) fn rem_cost(aw: usize, b: &BigUint) -> f64 {
+    let bits = b.bits();
+    let bw = bits.div_ceil(64) as usize;
+    if aw < bw {
+        return 1.0;
+    }
+    let qw = aw - bw + 1;
+    if bits <= DIV_LEAF || 64 * qw as u64 <= DIV_LEAF {
+        return qw as f64 * bw as f64;
+    }
+    rem_cost_past_leaf(qw, b)
+}
+
+/// [`rem_cost`] of a quotient of `qw` words by `b` past [`DIV_LEAF`]: the least of the costs
+/// `rem` chooses by, num-bigint's computed cost and [`past_leaf_cost`], times
+/// [`REM_PAST_LEAF_SCALE`]. The blocks [`rem`] reads for a quotient wider than `b` cost
+/// `newton_cost(qw, words(b))`, already one of the two `past_leaf_cost` takes the least of, so
+/// they are not computed again: [`newton_cost`], through [`transform_cost`]'s choice of points,
+/// took 72% of `rem_cost`'s instructions and 41% of the whole estimate's when computed twice
+/// (callgrind, 2026-11-23, on 2, 4, .., 2^200 with `x` at half of the product).
+/// O(words(b)) for the nonzero words [`sparse_div_cost`] counts. `past_leaf_cost` is the lesser
+/// of [`sparse_div_cost`] and [`newton_cost`]; the latter is computed only when
+/// [`newton_floor`] is below both other costs, since otherwise it cannot be the least, so the
+/// least is the same.
+fn rem_cost_past_leaf(qw: usize, b: &BigUint) -> f64 {
+    let bw = words(b);
+    let cheap = num_bigint_div_cost(qw, bw).min(sparse_div_cost(qw, b));
+    let least = match newton_floor(qw, bw) < cheap {
+        true => cheap.min(newton_cost(qw, bw)),
+        false => cheap,
+    };
+    REM_PAST_LEAF_SCALE * least
+}
+
+/// A lower bound on [`newton_cost`]`(qw, bw)` in O(1): its formula with each
+/// [`transform_cost`]`(c)` replaced by `TRANSFORM_COST h max(1, floor(log2 h))` for
+/// `h = floor(c / 2)`. Proof that this is at most `transform_cost(c)`: `transform_cost(c)` is
+/// `TRANSFORM_COST points_cost(n)` plus a wrap term that is a sum of [`WRAP_COST`] `>= 0` times
+/// points and of `transform_cost` of fewer coefficients, so at least 0 by induction; `n` comes
+/// from [`points`]`(ceil(c / 2), floor(c / 2) + 1)`, whose `la + lb - 1` is `c`, as the power of
+/// two at or above `c` or its half, so `n >= c / 2 >= h`; and `points_cost(n) = n max(1,
+/// log2 n)` (`n` is a power of two, so `trailing_zeros(n) = log2 n`) only grows with `n`, so it
+/// is at least `h max(1, log2 h) >= h max(1, floor(log2 h))`. Each `transform_cost` in
+/// `newton_cost` has a nonnegative coefficient, so the bound carries over. Measured on 2, 4,
+/// .., 2^200 (callgrind, 2026-11-23): `newton_cost`'s choice of points took 7,700 instructions
+/// of the 49,500 the descent's estimate took, for divisors (powers of 2) whose sparse long
+/// division the bound shows cheaper.
+fn newton_floor(qw: usize, bw: usize) -> f64 {
+    let floor = |c: usize| -> f64 {
+        let h = c / 2;
+        let log = match h {
+            0 => 0,
+            _ => h.ilog2().max(1),
+        };
+        TRANSFORM_COST * (h as f64) * f64::from(log)
+    };
+    match qw > bw {
+        true => ((qw - 1).div_ceil(bw) as f64 + 3.0) * floor(2 * bw),
+        false => 8.0 * floor(2 * qw) / 3.0 + floor(bw),
+    }
+}
+
+/// The instructions a division past [`DIV_LEAF`] takes for each word product its cost model
+/// ([`num_bigint_div_cost`], [`past_leaf_cost`], [`newton_cost`]) counts, over the instructions
+/// the scaled tree's products take for each of theirs ([`scaled_node_plan`], [`mul_cost`]), for
+/// [`rem_cost`] alone: those models were fitted for the division switch, each against the other
+/// division methods, and not against the products. Measured by
+/// `the_remainders_take_the_cheaper_method` on 32 leaves of 512 words with `x` the top half of
+/// `P` (PERF-remainders-switch-by-cost, 2026-11-23, zed_icount on a Colab VM): the exact
+/// descent, all of it divisions of `2n` by `n` words for `n` = 512 to 4,096, took 571,956,451
+/// instructions for 28,465,995 estimated units (20.09 a unit), and the scaled tree to the leaves
+/// 501,945,635 for 29,492,383 (17.02 a unit): 1.18. Unscaled, the descent was estimated 3.5%
+/// cheaper and took 1.146 times the scaled tree's instructions. The same family with `x` at 7/8
+/// and all of `P` measured 1.12 and 1.09 (a smaller share of their descent is past the leaf).
+const REM_PAST_LEAF_SCALE: f64 = 1.18;
 
 /// Whether [`rem`] reads `a` in blocks through one [`Divisor`]: exactly where [`div_rem`]
 /// would take [`div_rem_blocks`], a quotient wider than the divisor `b`, which is past
@@ -5116,6 +5231,21 @@ pub mod crossover {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `newton_floor` is a lower bound on `newton_cost` at every width pair up to 600 words of
+    /// quotient and 256 of divisor, across each power of two, where `points` changes its count.
+    #[test]
+    fn the_newton_floor_is_at_most_its_cost() {
+        for bw in 1..=256 {
+            for qw in 1..=600 {
+                let (floor, cost) = (newton_floor(qw, bw), newton_cost(qw, bw));
+                assert!(
+                    floor <= cost,
+                    "qw {qw}, bw {bw}: floor {floor} > cost {cost}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn bezout_coefficients_with_unequal_widths() {

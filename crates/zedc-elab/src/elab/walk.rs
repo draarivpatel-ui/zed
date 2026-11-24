@@ -206,8 +206,9 @@ enum Frame<'a> {
     /// `x.foldl(init, f)` or, when the flag is set, `x.foldr(f, init)`, once both arguments are
     /// elaborated, in the order written: `x`'s term (step L3.3).
     FoldDir(Term, bool),
-    /// `x.group(f)`, `f` being elaborated: the term of `x` (`group_term`).
-    Group(Term),
+    /// `x.group(f)`, `f` being elaborated: the term of `x`, and whether its entries are boxed
+    /// (`group_term`).
+    Group(Term, bool),
     /// `x.chunkBy(f)`, `f` being elaborated: the term of `x` (`chunk_by_term`, step L5.3).
     ChunkBy(Term),
     /// `m >< (op)` once `m` is elaborated: the operator and the span of the fold.
@@ -2441,6 +2442,19 @@ impl<'a> Elab<'a> {
             .collect();
         let (p, x) = (self.temp(), self.temp());
         let n = binders.len() - 1;
+        // A value binder that may take a family reads the entry at depth `n` out of the tuple
+        // of one that holds it (`RemapPlan::boxed`).
+        let of = match plan.boxed {
+            true => self.boxed_at(of, n),
+            false => of,
+        };
+        let value = || match plan.boxed {
+            true => Term::Prim(
+                Prim::TupleGet,
+                vec![Term::Var(x.clone()), Term::Lit(Value::Int(0))],
+            ),
+            false => Term::Var(x.clone()),
+        };
         // One kernel name per binder, `_` too: a `_` gets a fresh name (`temp`), so the lets of
         // `lam` bind every key of the keypath, `p[0]` to `p[n - 1]`, and `names[..n]`, which a
         // truncation keys its leaves by, is the whole keypath; a written binder's name is its
@@ -2460,7 +2474,7 @@ impl<'a> Elab<'a> {
                         Prim::PathKey,
                         vec![Term::Var(p.clone()), Term::Lit(Value::Int(i as i64))],
                     ),
-                    false => Term::Var(x.clone()),
+                    false => value(),
                 };
                 t = Term::Let(name.clone(), Shared::new(v), Shared::new(t));
             }
@@ -2534,18 +2548,53 @@ impl<'a> Elab<'a> {
         Some(t)
     }
 
+    /// The family `t` with each entry at depth `depth` held in a tuple of one, so a `reindex`,
+    /// which walks leaves, stops at that depth and binds a row whole (plan row
+    /// REMAP-fewer-binders): `let s = t; fam k in s: …` down to `(s[k],)`, a `fam` per level.
+    /// An empty family above that depth stays empty, a keypath that ends early, as without the
+    /// boxing. The checker gives a family at every level above `depth`.
+    // Complexity tradeoff: one pass over the entries down to `depth`, each read by `Get` in the
+    // ordered map, O(e log e) for e entries, which the `reindex` after it costs too; a reindex
+    // with a depth of its own would skip the pass but needs a new kernel term, read by every
+    // crate that walks terms.
+    fn boxed_at(&mut self, t: Term, depth: usize) -> Term {
+        if depth == 0 {
+            return Term::Prim(Prim::Tuple, vec![t]);
+        }
+        let (s, k) = (self.temp(), self.temp());
+        let entry = Term::Prim(Prim::Get, vec![Term::Var(s.clone()), Term::Var(k.clone())]);
+        let body = self.boxed_at(entry, depth - 1);
+        let fam = Term::Fam {
+            domain: Shared::new(Term::Var(s.clone())),
+            var: k,
+            body: Shared::new(body),
+        };
+        Term::Let(s, Shared::new(t), Shared::new(fam))
+    }
+
     /// `x.group(f)` on a family of one level (DESIGN.md sec:grouping): the widening
     /// `reindex` that sends the entry `k -> v` to the keypath `(f(v), k)` and keeps `v`, one to
-    /// one by tupling, since `k` is kept.
+    /// one by tupling, since `k` is kept. With `boxed`, where an entry `v` may be a family
+    /// (`Info::boxed_groups`, plan row GROUP-nested), the `reindex` takes `x` with each entry
+    /// held in a tuple of one ([`Self::boxed_at`] at depth 1), so it stops there and `f` takes
+    /// `v` whole, read back out of the tuple, and the group keeps it whole.
     // Complexity tradeoff: one `reindex` over the n leaves, O(n log n) into the ordered map,
     // against a hash grouping's O(n) expected; the kernel's families are ordered maps, and the
-    // result is read in key order.
-    fn group_term(&mut self, x: Term, f: Term) -> Term {
+    // result is read in key order. Boxed, one more pass over the n entries, O(n log n).
+    fn group_term(&mut self, x: Term, f: Term, boxed: bool) -> Term {
         let (g, p, v) = (self.temp(), self.temp(), self.temp());
-        let class = Term::App(
-            Shared::new(Term::Var(g.clone())),
-            vec![Term::Var(v.clone())],
-        );
+        let x = match boxed {
+            true => self.boxed_at(x, 1),
+            false => x,
+        };
+        let entry = match boxed {
+            true => Term::Prim(
+                Prim::TupleGet,
+                vec![Term::Var(v.clone()), Term::Lit(Value::Int(0))],
+            ),
+            false => Term::Var(v.clone()),
+        };
+        let class = Term::App(Shared::new(Term::Var(g.clone())), vec![entry.clone()]);
         let k = Term::Prim(
             Prim::PathKey,
             vec![Term::Var(p.clone()), Term::Lit(Value::Int(0))],
@@ -2554,7 +2603,7 @@ impl<'a> Elab<'a> {
             vec![p.clone(), v.clone()],
             Shared::new(Term::Prim(Prim::Path, vec![class, k])),
         );
-        let vf = Term::Lam(vec![p, v.clone()], Shared::new(Term::Var(v)));
+        let vf = Term::Lam(vec![p, v], Shared::new(entry));
         let t = Term::Reindex {
             family: Shared::new(x),
             kf: Shared::new(kf),
@@ -2659,7 +2708,8 @@ impl<'a> Elab<'a> {
                 Some(_) if name == "group" => match call.positional {
                     [f] if call.named.is_empty() && !call.curry => {
                         m.k(Frame::MemberEnd(wrap));
-                        m.k(Frame::Group(receiver));
+                        let boxed = self.info.boxed_groups.contains(&call.span);
+                        m.k(Frame::Group(receiver, boxed));
                         m.stack.push(Job::Expr(f));
                         return;
                     }
@@ -3051,8 +3101,8 @@ impl<'a> Elab<'a> {
                 let t = m.t().map(|y| self.zip_term(x, y));
                 m.give(t);
             }
-            Frame::Group(x) => {
-                let t = m.t().map(|f| self.group_term(x, f));
+            Frame::Group(x, boxed) => {
+                let t = m.t().map(|f| self.group_term(x, f, boxed));
                 m.give(t);
             }
             Frame::ChunkBy(x) => {

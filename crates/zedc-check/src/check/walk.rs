@@ -1426,7 +1426,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             }
             Frame::Group(x, recv, span, rekey) => {
                 let f = m.take_arg();
-                let t = self.group_of(&x, recv, f, span, rekey);
+                let t = self.group_of(&x, recv, f, span, rekey, Some(span));
                 m.ty(t);
             }
             Frame::FlatMap(x, span, kept) => {
@@ -4905,13 +4905,25 @@ impl<'t, 'a> Ck<'t, 'a> {
     // at `Class::resolved` (check/mod.rs), `Ck::class_root` gives no root whose type is its
     // own variable, and any other resolved type holds no variable, so the recursive call
     // meets no class.
-    fn group_of(&mut self, x: &Ty, recv: Span, f: Arg<'a>, span: Span, rekey: bool) -> Ty {
+    ///
+    /// `call` is the call's span where `x` is the receiver's type at the call, the key of
+    /// [`Info::boxed_groups`]; `None` where `x` flowed into a class the call took as a need,
+    /// whose check of the call boxed it already (below).
+    fn group_of(
+        &mut self,
+        x: &Ty,
+        recv: Span,
+        f: Arg<'a>,
+        span: Span,
+        rekey: bool,
+        call: Option<Span>,
+    ) -> Ty {
         // `group_end` (remap.rs) builds the family; its outer keys are checked here, and
         // `Ck::need` is passed in, since a call from remap.rs of a method written in this file
         // would close an import cycle (tests/steps/s_01f_import_graph).
         let calls: (remap::Apply<'t, 'a>, remap::NeedFn<'t, 'a>) = (Self::apply, Self::need);
         if rekey || x.vars.is_empty() {
-            let out = self.group_end(x, recv, f.clone(), span, rekey, calls);
+            let out = self.group_end(x, recv, f.clone(), span, rekey, call, calls);
             self.group_keys_data(&out, &f, span);
             return out;
         }
@@ -4925,7 +4937,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         let mut out = match only_misses {
             true => Ty::empty(),
             false => {
-                let out = self.group_end(&rest, recv, f.clone(), span, false, calls);
+                let out = self.group_end(&rest, recv, f.clone(), span, false, call, calls);
                 self.group_keys_data(&out, &f, span);
                 out
             }
@@ -4933,15 +4945,26 @@ impl<'t, 'a> Ck<'t, 'a> {
         for v in x.vars.iter() {
             let r = self.class_root(v);
             let given = match r.map(|r| (r, self.classes[r].resolved.clone())) {
-                Some((_, Some(t))) => self.group_of(&t, recv, f.clone(), span, false),
+                Some((_, Some(t))) => self.group_of(&t, recv, f.clone(), span, false, call),
                 Some((r, None)) => {
+                    // The entries of a value that flows in later may be families, and the
+                    // need's check does not know this call's span: one need serves every use
+                    // of its kind on the class (`Ck::need`), under the first use's span. So
+                    // the call is boxed here (`Info::boxed_groups`), at the cost of one pass
+                    // over the entries where none is a family.
+                    self.info.boxed_groups.extend(call);
                     let kind = NeedKind::Group {
                         f: f.ty.clone(),
                         recv,
                     };
                     self.need(r, kind, true, span)
                 }
-                None => Ty::dynamic(),
+                // A variable that is not a class is the unknown, whose entries may be
+                // families, as at `group_end` (`Info::boxed_groups`).
+                None => {
+                    self.info.boxed_groups.extend(call);
+                    Ty::dynamic()
+                }
             };
             out = out.union(&given);
         }
@@ -7271,7 +7294,9 @@ impl<'t, 'a> Ck<'t, 'a> {
             if self.trying {
                 continue;
             }
-            self.lit_open.remove(&e.span);
+            if self.lit_open.remove(&e.span) {
+                self.lit_settled.insert(e.span);
+            }
             if let Some((kept @ Some(_), _)) = self.seen.get_mut(&e.span) {
                 *kept = Some(Ty::carrier(c));
             }
@@ -12526,8 +12551,11 @@ fn else_span(of: &Expr, default: &Expr) -> Span {
 }
 
 /// Adds to the witness of the remap plan `b` each catalog entry of `a`'s it lacks, after its
-/// own, in `a`'s order ([`Ck::remap_alone`]).
+/// own, in `a`'s order ([`Ck::remap_alone`]), and marks `b` boxed if `a` is: the remap
+/// elaborates to one term, which boxes when the value binder takes a family at any source
+/// type, and boxing a value that is no family changes nothing it gives ([`RemapPlan::boxed`]).
 fn add_witness(b: &mut RemapPlan, a: &RemapPlan) {
+    b.boxed |= a.boxed;
     let mut entries: Vec<&str> = b.witness.split('+').filter(|w| !w.is_empty()).collect();
     for w in a.witness.split('+').filter(|w| !w.is_empty()) {
         if !entries.contains(&w) {
@@ -16714,7 +16742,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             }
             NeedKind::Group { f, recv } => {
                 let f = Arg::of(self.bound(f, binds));
-                self.group_of(&on, *recv, f, span, false)
+                self.group_of(&on, *recv, f, span, false, None)
             }
             NeedKind::Level { word, f, site } => {
                 let f = Arg::of(self.bound(f, binds));
@@ -17193,17 +17221,35 @@ impl<'t, 'a> Ck<'t, 'a> {
             {
                 let why = got.refused(r);
                 let (got, r) = (self.text(&got), self.text(r));
-                let menu = [format!(
-                    "repair: change the argument, so that {what} gives a value of {r} here"
-                )];
-                self.error_offering(
-                    span,
-                    format!(
-                        "{what} gives {got} here, which is not {r}: the use requires a value \
-                             of {r}{why}"
+                // An `Entries` need gives the entries of the argument to the function of
+                // `map`, `where`, `flatMap` or `group` ([`Self::word_entries`]), and its result
+                // is that function's parameter: `r` is what the function's body requires of an
+                // entry (`String` where it calls `e.trim`), not what is required of the callee's
+                // result, which the generic text below said ("`h` gives 1 | 2 here, which is
+                // not String"; plan row MSG-generic-lambda-result-literal-type, (a)).
+                let (text, menu) = match n.kind {
+                    NeedKind::Entries => (
+                        format!(
+                            "{what} gives each entry of its argument to a function that \
+                                 requires a value of {r}, and an entry here is {got}{why}"
+                        ),
+                        format!(
+                            "repair: change the argument, so that each of its entries is a \
+                                 value of {r}"
+                        ),
                     ),
-                    menu,
-                );
+                    _ => (
+                        format!(
+                            "{what} gives {got} here, which is not {r}: the use requires a \
+                                 value of {r}{why}"
+                        ),
+                        format!(
+                            "repair: change the argument, so that {what} gives a value of {r} \
+                                 here"
+                        ),
+                    ),
+                };
+                self.error_offering(span, text, [menu]);
             }
             for v in &r.vars {
                 binds.or_insert_with(v.clone(), Ty::empty);
@@ -20368,14 +20414,12 @@ impl<'t, 'a> Ck<'t, 'a> {
     /// parameter: the need of `domain` at the use `use_at`, with the link of this call before
     /// the calls `via` that passed it on (CHK-need-bound, CHK-pow-component-bound).
     // Complexity tradeoff: the path is kept as it came, O(1) (`PathSteps` shares its steps),
-    // but the link's text names the part `p`, so it is O(length of `p`) long and made at once;
-    // for `d` needs on the parts at each level of a parameter nested `d` deep, the texts are
-    // Θ(d²) long in all, and this is the one term of that order left in the check of a
-    // parameter's parts (PERF-keyed-part-path-d-squared: of the d² term of a fit
-    // a + b·d + c·d² to callgrind counts of `maps_in_tuples(d, true)` at d = 128, 256 and 512,
-    // 94 M instructions at 512, 51 M are this text). A text made only when an error is
-    // printed would take `Via`'s text, digest (`r10_hash::hash_via_chain`) and equality from
-    // its parts instead of its words (row MSG-passed-on-part-text-eager).
+    // and so is the link's text, as its parts ([`ViaText::PassedOn`]), written only when an
+    // error prints it. Made at once, the text named the part `p`, O(length of `p`) long, so
+    // `d` needs on the parts at each level of a parameter nested `d` deep made Θ(d²) text in
+    // all (PERF-keyed-part-path-d-squared: of the d² term of a fit a + b·d + c·d² to callgrind
+    // counts of `maps_in_tuples(d, true)` at d = 128, 256 and 512, 94 M instructions at 512,
+    // 51 M were this text; row MSG-passed-on-part-text-eager).
     #[allow(clippy::too_many_arguments)]
     fn part_passed_on(
         &mut self,
@@ -20383,21 +20427,23 @@ impl<'t, 'a> Ck<'t, 'a> {
         path: PathSteps,
         e: &'a Expr,
         at: Span,
-        p: &dyn fmt::Display,
+        p: &PartName<'_>,
         what: &str,
         domain: &IntDomain,
         via: &Option<Arc<Via>>,
         use_at: Span,
     ) {
-        let name = match &e.kind {
-            ExprKind::Name(name) => name.to_string(),
-            _ => self.code(Some(e.span)).unwrap_or("this value").to_string(),
+        let name: Arc<str> = match &e.kind {
+            ExprKind::Name(name) => name.as_str().into(),
+            _ => self.code(Some(e.span)).unwrap_or("this value").into(),
         };
-        let link = Via::new(
-            at,
-            format!("`{name}` is passed on as `{p}` of {what} here").into(),
-            via.clone(),
-        );
+        let text = ViaText::PassedOn {
+            name,
+            param: p.name.into(),
+            path: p.path.clone(),
+            what: what.into(),
+        };
+        let link = Via::new(at, text, via.clone());
         let need = Need {
             on: Ty::empty(),
             kind: NeedKind::InDomain {
@@ -20462,7 +20508,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         param: usize,
         a: &Arg<'a>,
         path: &PathSteps,
-        p: &dyn fmt::Display,
+        p: &PartName<'_>,
         what: &str,
         domain: &IntDomain,
         via: &Option<Arc<Via>>,
@@ -20911,8 +20957,13 @@ impl<'t, 'a> Ck<'t, 'a> {
             let Some(r) = r else {
                 // (a2): the unknown, which waits on no class. Read as no value, as an open
                 // class is, so that a value whose rest fails is still refused.
-                cut.insert(v.clone(), Ty::empty());
-                continue;
+                #[cfg(feature = "push-vars-sweep")]
+                panic!("PUSH-VARS-SWEEP: a push reached (a2) with the variable {v}");
+                #[allow(unreachable_code)]
+                {
+                    cut.insert(v.clone(), Ty::empty());
+                    continue;
+                }
             };
             let c = &self.classes[r];
             let own = c
@@ -21250,7 +21301,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 while let Some(l) = v {
                     chain.push(Note {
                         span: l.at,
-                        text: l.text.clone(),
+                        text: l.text.words(),
                     });
                     v = l.next.as_deref();
                 }
@@ -21315,7 +21366,9 @@ impl<'t, 'a> Ck<'t, 'a> {
             let a = if path.is_empty() {
                 a
             } else {
-                match self.part_of(&mut walk, *param, a, path, &p, what, domain, via, n.span) {
+                match self.part_of(
+                    &mut walk, *param, a, path, &named, what, domain, via, n.span,
+                ) {
                     PartOf::Arg(arg) => {
                         part = arg;
                         &part
@@ -21388,7 +21441,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 match self.open_place(e) {
                     Some(_) if self.trying => {}
                     Some((id, pre)) => {
-                        self.part_passed_on(id, pre, e, at, &p, what, domain, via, n.span);
+                        self.part_passed_on(id, pre, e, at, &named, what, domain, via, n.span);
                     }
                     None => self.no_int_vars(&a.ty, &passed, at),
                 }
@@ -21484,7 +21537,7 @@ impl<'t, 'a> Ck<'t, 'a> {
     fn keys_at(
         &mut self,
         what: &str,
-        p: &dyn fmt::Display,
+        p: &PartName<'_>,
         domain: &IntDomain,
         k: &Arc<KeyUse>,
         a: Option<&Arg<'a>>,
@@ -21519,7 +21572,7 @@ impl<'t, 'a> Ck<'t, 'a> {
             while let Some(l) = v {
                 chain.push(Note {
                     span: l.at,
-                    text: l.text.clone(),
+                    text: l.text.words(),
                 });
                 v = l.next.as_deref();
             }
@@ -21590,12 +21643,13 @@ impl<'t, 'a> Ck<'t, 'a> {
             && let Some(id) = self.open_param(e)
         {
             if !self.trying {
-                let name = self.code(Some(e.span)).unwrap_or("this value").to_string();
-                let link = Via::new(
-                    a.at.unwrap_or(e.span),
-                    format!("`{name}` is passed on as `{p}` of {what} here").into(),
-                    use_at.1.clone(),
-                );
+                let text = ViaText::PassedOn {
+                    name: self.code(Some(e.span)).unwrap_or("this value").into(),
+                    param: p.name.into(),
+                    path: p.path.clone(),
+                    what: what.into(),
+                };
+                let link = Via::new(a.at.unwrap_or(e.span), text, use_at.1.clone());
                 let need = Need {
                     on: Ty::empty(),
                     kind: NeedKind::InDomain {

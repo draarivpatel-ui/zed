@@ -277,11 +277,60 @@ fn the_source_must_be_a_family_of_the_pattern_s_depth() {
     );
 }
 
+// ---- An `as` pattern of fewer key levels than its source (plan row REMAP-fewer-binders) ----
+
 #[test]
-fn fewer_binders_than_levels_waits_for_a_later_step() {
-    rejected(
-        &with_m("x = m as (k -> v) into (k -> v);\n"),
-        &["a remap whose `as` pattern names 1 key levels of a source with more"],
+fn fewer_binders_than_levels_bind_the_whole_row() {
+    // `m as (k -> v) into (k -> v)` on a family of two levels binds `v` to the row `m[k]`, so
+    // it gives `m` back; a key that tuples its binder moves each row whole.
+    let src = with_m(
+        "x = m as (k -> r) into (k -> r);\n\
+         y = m as (k -> r) into ((k, 0) -> r);\n\
+         z = m as (k -> r) into (k -> r[1]);\n",
+    );
+    prints(
+        &src,
+        "x",
+        r#"{"a" -> {1 -> 10, 2 -> 20}, "b" -> {1 -> 30}}"#,
+    );
+    prints(
+        &src,
+        "y",
+        r#"{("a", 0) -> {1 -> 10, 2 -> 20}, ("b", 0) -> {1 -> 30}}"#,
+    );
+    prints(&src, "z", r#"{"a" -> 10, "b" -> 30}"#);
+}
+
+#[test]
+fn fewer_binders_keep_rows_apart_in_a_truncation_and_in_a_transpose() {
+    // A truncation keys each row by its outer key alone: the two leaves of row "a" do not
+    // meet. Two binders of a family of three levels transpose the outer two and carry each
+    // innermost row whole.
+    let src = with_m(
+        "s = m as (k -> r) into (k -> _);\n\
+         n = { 1 -> { 2 -> { 3 -> 4, 5 -> 6 } }, 7 -> { 2 -> { 8 -> 9 } } };\n\
+         t = n as (a -> b -> r) into (b -> a -> r);\n",
+    );
+    prints(&src, "s", r#"{"a", "b"}"#);
+    prints(&src, "t", "{2 -> {1 -> {3 -> 4, 5 -> 6}, 7 -> {8 -> 9}}}");
+}
+
+#[test]
+fn a_row_bound_whole_may_be_empty() {
+    // An empty row is a keypath that ends early; bound whole, it is the value `{}`.
+    let src = "e = { \"a\" -> [1, 2], \"b\" -> [3].where(v -> v > 5) };\n\
+               x = e as (k -> r) into (k -> r);\n";
+    prints(src, "x", r#"{"a" -> {0 -> 1, 1 -> 2}, "b" -> {}}"#);
+}
+
+#[test]
+fn as_many_binders_as_levels_bind_no_row() {
+    // Negative control: a pattern of the source's depth walks to the leaves as before.
+    let src = with_m("x = m as (k -> j -> v) into (k -> j -> v + 1);\n");
+    prints(
+        &src,
+        "x",
+        r#"{"a" -> {1 -> 11, 2 -> 21}, "b" -> {1 -> 31}}"#,
     );
 }
 
@@ -412,9 +461,47 @@ fn group_s_own_errors() {
         "xs = [1];\nx = xs.group(v -> v, v -> v);\n",
         &["`group` takes one function, passed by position"],
     );
-    rejected(
-        "xs = [[1]];\nx = xs.group(v -> 0);\n",
-        &["`group` on a family whose entries are families"],
+}
+
+// ---- group of a family whose entries are families (plan row GROUP-nested) ----
+//
+// `f` takes each entry `m[k]` whole and the group keeps it whole: the `reindex` takes `m` with
+// each entry held in a tuple of one (`Info::boxed_groups`, `Elab::boxed_at`), so it stops above
+// the leaves. Until GROUP-nested the checker refused these as a later step.
+
+#[test]
+fn group_a_family_of_families_by_a_fold_of_each() {
+    let src = "m = { \"a\" -> { 1 -> 10 }, \"b\" -> { 1 -> 30, 2 -> 5 } };\n\
+               x = m.group(r -> r >< (+));\n\
+               want = { 10 -> { \"a\" -> { 1 -> 10 } }, 35 -> { \"b\" -> { 1 -> 30, 2 -> 5 } } };\n";
+    same(src, "x", "want");
+}
+
+#[test]
+fn group_a_list_of_lists_keeps_each_entry_whole() {
+    // One group per class, the entries that share a class side by side, and the one-entry
+    // list `[1]` kept whole: with no boxing the walk reaches its leaf `1` instead.
+    same(
+        "xs = [[1]];\nx = xs.group(v -> 0);\nwant = { 0 -> { 0 -> [1] } };\n",
+        "x",
+        "want",
+    );
+    same(
+        "xs = [[1, 2], [3], [4, 5]];\nx = xs.group(r -> r.count);\n\
+         want = { 1 -> { 1 -> [3] }, 2 -> { 0 -> [1, 2], 2 -> [4, 5] } };\n",
+        "x",
+        "want",
+    );
+}
+
+#[test]
+fn group_keeps_an_empty_inner_family() {
+    // An empty entry has no leaf, so a walk to the leaves loses it; boxed, it is an entry.
+    same(
+        "xs = [[1, 2], [], [3]];\nx = xs.group(r -> r.count);\n\
+         want = { 0 -> { 1 -> [] }, 1 -> { 2 -> [3] }, 2 -> { 0 -> [1, 2] } };\n",
+        "x",
+        "want",
     );
 }
 

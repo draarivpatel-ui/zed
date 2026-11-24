@@ -232,14 +232,16 @@ fn pncx_coprime_dense_scale() {
     );
 }
 
-/// Both sides of zed-kernel's `SCALED_TO_EXACT_WORDS` (in `num/trees.rs`), here so that
-/// zed-kernel is built with its own multiplication constants (its own tests build it with the
-/// test ones): `trees::scaled_descend_switch` at switch widths from 0 (the scaled remainder tree
+/// The fixed switches of zed-kernel's scaled remainder tree to the exact descent by the width of
+/// the nodes (`trees::scaled_descend_switch`, before PERF-remainders-switch-by-cost at 128
+/// words), here so that zed-kernel is built with its own multiplication constants (its own
+/// tests build it with the test ones): at switch widths from 0 (the scaled remainder tree
 /// to the leaves) to past every node (the exact descent from the root), on the CRT cofactor sum
 /// `S mod P` over the first 2,048 / 16,384 / 131,072 odd primes and on `x = P - 1 - P / 8` over
 /// word leaves, 8-word, 64-word and 512-word leaves and 2, 4, .., 2^200; prints the instructions
-/// and bytes of each and holds the remainders equal at every width. The measurements and the
-/// switch they give are in the comment at `SCALED_TO_EXACT_WORDS`.
+/// and bytes of each and holds the remainders equal at every width. The measurements of the
+/// fixed switch are in COMPLEXITY.md, "PERF-crt-tree-scaled-remainder"; `trees::remainders`
+/// chooses its turn by cost, measured against these by `the_remainders_take_the_cheaper_method`.
 #[test]
 fn the_scaled_to_exact_switch_axis() {
     use num_bigint::BigUint;
@@ -319,4 +321,120 @@ fn the_scaled_to_exact_switch_axis() {
             }
         }
     }
+}
+
+/// `trees::remainders` takes, within 10%, the instructions of the cheapest of the fixed methods
+/// `trees::scaled_descend_switch` offers: the exact descent from the root (switch past every
+/// node), the scaled tree to the leaves (switch 0) and the scaled tree down to nodes of 128
+/// words, the switch measured best on most families (PERF-crt-tree-scaled-remainder). On word
+/// leaves, 8-word, 64-word and 512-word leaves and 2, 4, .., 2^200, with `x` the top 1/2, 7/8
+/// and all of the bits of `P`, and on the CRT cofactor sum over 2,048 odd primes. Built here, in
+/// a crate that builds zed-kernel with its real multiplication constants. Before
+/// PERF-remainders-switch-by-cost the switch was on the width of `x` alone (from 7/8 of `P` the
+/// scaled tree), and 1,024 word leaves at 7/8 took the scaled tree at 1.5 times the descent's
+/// instructions.
+#[test]
+fn the_remainders_take_the_cheaper_method() {
+    use num_bigint::BigUint;
+    use zed_kernel::num::{rem_uint, trees};
+    let mut meter = scaling::Meter::new();
+    let (mut rng, _seed) = crate::seed::Rng::fresh("remainders_cheaper_method");
+    let mut odd = |words: usize| -> BigUint {
+        let digits: Vec<u32> = (0..2 * words).map(|_| rng.next_u64() as u32).collect();
+        BigUint::new(digits) | BigUint::from(1u32) | (BigUint::from(1u32) << (64 * words - 1))
+    };
+    let mut primes = Vec::with_capacity(2048);
+    let mut c = 3u64;
+    while primes.len() < 2048 {
+        if zed_numtheory::is_prime(c) {
+            primes.push(BigUint::from(c));
+        }
+        c += 2;
+    }
+    let families: Vec<(&str, Vec<BigUint>)> = vec![
+        ("cofactors of 2048 odd primes", primes),
+        ("1024 word leaves", (0..1024).map(|_| odd(1)).collect()),
+        ("512 leaves of 8 words", (0..512).map(|_| odd(8)).collect()),
+        ("32 leaves of 64 words", (0..32).map(|_| odd(64)).collect()),
+        (
+            "32 leaves of 512 words",
+            (0..32).map(|_| odd(512)).collect(),
+        ),
+        (
+            "2, 4, .., 2^200",
+            (1..=200u32).map(|i| BigUint::from(1u32) << i).collect(),
+        ),
+    ];
+    let mut worst = (0.0f64, String::new());
+    let key = match meter.instructions {
+        true => "instr",
+        false => "work",
+    };
+    for (name, leaves) in families {
+        let levels = trees::product_tree(&leaves);
+        let p = trees::tree_product(&leaves, &levels).into_owned();
+        let n = p.bits();
+        let xs: Vec<(String, BigUint)> = match name.starts_with("cofactors") {
+            true => {
+                let ones = vec![BigUint::from(1u32); leaves.len()];
+                let s = trees::linear_combination_up(ones, &leaves, &levels);
+                vec![("S".into(), rem_uint(&s, &p))]
+            }
+            false => [(1u64, 2u64), (7, 8), (1, 1)]
+                .map(|(num, den)| {
+                    let x = &p >> (n - n * num / den);
+                    let x = if x == p { &x - 1u32 } else { x };
+                    (format!("{num}/{den}"), x)
+                })
+                .into(),
+        };
+        for (width, x) in xs {
+            let mut want = Vec::new();
+            let got = meter.work(|| want = trees::remainders(&x, &leaves, &levels));
+            let mut best = f64::INFINITY;
+            for w in [1u64 << 40, 0, 128] {
+                let mut other = Vec::new();
+                let m = meter
+                    .work(|| other = trees::scaled_descend_switch(&x, &p, &leaves, &levels, w));
+                assert_eq!(want, other, "{name} at {width}, switch at {w} words");
+                best = best.min(m.units as f64);
+            }
+            let ratio = got.units as f64 / best;
+            eprintln!(
+                "remainders {name} at {width}: {key}={}, the cheapest fixed method {key}={best}, \
+                 ratio {ratio:.3}",
+                got.units
+            );
+            if ratio > worst.0 {
+                worst = (ratio, format!("{name} at {width}"));
+            }
+        }
+    }
+    // The limit 1.1, from the variation measured on v5e2 (DynamoRIO, 2026-11-23,
+    // PERF-remainders-switch-by-cost): at one seed every count repeats to the instruction
+    // (3 runs at seed 777), so the meter adds nothing. Across 5 fresh seeds and seed 777 the
+    // random families' counts move with the input (32 leaves of 512 words at 1/2: 503.1 M to
+    // 525.7 M for the cheapest fixed method, 4.5 %), but `remainders` moves with it, and no
+    // family's ratio moved by more than 0.002; the deterministic powers of 2 moved by at most 4
+    // instructions. The worst ratio measured is 1.092 to 1.093 (2, 4, .., 2^200 at 1/1, where
+    // the descent is chosen and a turn at level 2 is 5 % cheaper: the cost model counts a
+    // power-of-2 node's products as dense), and 1.083 at 1/2 (the estimate's 38,700
+    // instructions on a descent of 284,000), so 1.1 is 0.007 above the worst, three times the
+    // variation, and below it the test would fail on the cost model's known error alone.
+    // Processor time, the meter of a run not started alone with `--exact` where the hardware
+    // counts no instructions (`scaling::Meter::new`), changes with load, so it is allowed
+    // `scaling::TIME_ALLOWANCE` times the limit, as every check of the harness allows it
+    // (measured: 1.736 on 512 leaves of 8 words at 7/8 in a run of the whole crate with 8
+    // threads, 1.017 in instructions).
+    let limit = match meter.instructions {
+        true => 1.1,
+        false => 1.1 * scaling::TIME_ALLOWANCE,
+    };
+    assert!(
+        worst.0 <= limit,
+        "remainders took {:.3} times the cheapest method's {} on {}, at most {limit}",
+        worst.0,
+        meter.unit,
+        worst.1
+    );
 }
