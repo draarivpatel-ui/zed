@@ -343,8 +343,9 @@ fn built_side(side: &[(u128, u64)]) -> num_bigint::BigUint {
 /// `log2` by at most `2^-53 / ln 2` absolute, so relatively too, since `log2 b >= 1`; `log2`
 /// is within one unit in the last place, 2^-52 relative; the product by `e < 2^53` and each sum
 /// round once, 2^-53 each. With at most 4 terms the sums are within 2^-46 of the larger, so a
-/// pair is counted only where they differ by more than 2^-30 of it, and else skipped. Every near tie is drawn within 2^16 bits, so each is built. The test states how
-/// many pairs each way decided, and fails if fewer than 3,000 were built (2,500 near ties and
+/// pair is counted only where they differ by more than 2^-30 of it, and else skipped. Every near
+/// tie is drawn within 2^16 bits, so each is built. The test states how many pairs each way
+/// decided, and fails if fewer than 3,000 were built (2,500 near ties and
 /// the small independent pairs).
 #[test]
 fn random_products_of_powers_order_as_the_built_numbers() {

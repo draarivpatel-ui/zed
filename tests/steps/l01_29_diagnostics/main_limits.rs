@@ -2,8 +2,8 @@
 //! "`main` may limit its own run", and the sec:diagnostics row "Number too large for the memory
 //! limit of `main`"): `@limits` and `@kill` stand only before `main`, each argument is a
 //! positive constant, and an operation that the operands prove to build more than the memory
-//! limit is rejected, as one larger than the target's address space is (too_large.rs). The runs that hit
-//! each limit are in l01_36a_executables/limits_binary.rs, since a limit holds for a whole
+//! limit is rejected, as one larger than the target's address space is (too_large.rs). The runs
+//! that hit each limit are in l01_36a_executables/limits_binary.rs, since a limit holds for a whole
 //! process.
 
 use zedc::build::Build;

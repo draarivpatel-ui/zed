@@ -124,8 +124,9 @@ fn a_sum_of_kept_powers_is_refused_when_memory_is_short() {
 /// (DESIGN.md step L1.17b), after the base is split into small primes and a least root, for
 /// which four bytes a bit are asked (`Rat::pow`, `SPLIT_ASK_BITS_A_BIT`). At `s = 2^18` that
 /// is 1 MiB, given, and the power is kept; at `s = 2^23` it is 32 MiB, refused with that ask.
-/// The first version asked nothing and aborted the child at `s = 2^22` (a request of 256 KiB failed in the least root, 2026-11-23, Colab std); before
-/// wide atoms the power was built and refused at `7 s` bits.
+/// The first version asked nothing and aborted the child at `s = 2^22` (a request of 256 KiB
+/// failed in the least root, 2026-11-23, Colab std); before wide atoms the power was built and
+/// refused at `7 s` bits.
 #[test]
 fn a_power_of_a_wide_base_is_kept_or_refused_when_memory_is_short() {
     if !in_child("a_power_of_a_wide_base_is_kept_or_refused_when_memory_is_short") {

@@ -51,7 +51,7 @@ pub use fast::crossover;
 pub use fast::method_counts;
 use fast::{LEAF_DIGITS, built, read_digits_by};
 pub use fast::{
-    PRINT_HANDOFF, PRINT_WHOLE, mul as mul_uint, mul_int, pow as pow_uint, to_decimal,
+    PRINT_HANDOFF, PRINT_WHOLE, gcd_uint, mul as mul_uint, mul_int, pow as pow_uint, to_decimal,
     to_decimal_split, to_decimal_split_at,
 };
 pub(crate) use fast::{mul_cost, squares_by_transform};
@@ -63,7 +63,7 @@ pub use room::{
 };
 use room::{least_bits, least_log2};
 use zed_numtheory::m61::{self, P as MERSENNE_61};
-use zed_numtheory::{factor, gcd_big_u64, is_prime, mul_mod, pow_mod_big, rem_big_u64};
+use zed_numtheory::{factor, is_prime, mul_mod, pow_mod_big, rem_big_u64};
 
 /// How [`Rat::round_whole`] rounds a number to a whole one: the rules of `round` (ties to
 /// even), `round(x, ties: #away)`, `floor`, `ceil`, `trunc` and `awayFromZero` (DESIGN.md
@@ -2552,66 +2552,6 @@ pub fn mod_floor_int(a: &BigInt, m: &BigInt) -> BigInt {
 /// O(n^2). Panics with "a modulus above 0" for `m` zero.
 pub fn inverse_mod_uint(a: &BigUint, m: &BigUint) -> Option<BigUint> {
     fast::inverse_mod(a, m)
-}
-
-/// The greatest common divisor of `a` and `b`, for integers held outside a [`Rat`].
-///
-/// One gcd (DRY-number-theory-wide item 3, dryN2, 2026-11-19): `gcd_uint_recursive`, the same
-/// half gcd with no handoff to Stein's gcd at `GCD_LEAF` once what is left is narrow, was
-/// removed. Measured in release (`gcd` against it, best of 5, load 52 to 88, random pairs and
-/// pairs with a common factor): 0.97 to 1.21 times `gcd`'s time from 4 to 310 words, where the
-/// two run the same steps (within the noise at that load), and 1.04 to 1.53 times from 512 to
-/// 16384 words, where `gcd` hands the last 310 words to Stein's gcd; so no width favored it.
-/// Its one client, `Int::gcd_recursive` in zedc-int, now calls `Int::gcd`. Tests:
-/// `completeness::fast` (the gcd cases) and `crossover::gcd` against num-bigint.
-pub fn gcd_uint(a: &BigUint, b: &BigUint) -> BigUint {
-    let (Some(za), Some(zb)) = (a.trailing_zeros(), b.trailing_zeros()) else {
-        return a | b;
-    };
-    let z = za.min(zb);
-    // The powers of 2 come out first, by shifts, so that `2^m` against `2^n 3` costs O(m + n)
-    // and not a division of `m` bits by `n`. When an odd part fits in 64 bits, the other
-    // operand's remainder modulo it is streamed over its words with no shift or allocation (since
-    // `gcd(2^za, d) == 1` for odd `d`) and finished in registers. Otherwise, equal odd parts
-    // return at once, and the wider odd part is reduced modulo the narrower by `fast::rem` (with
-    // no quotient built, O(M(n))) before the half gcd (`fast::gcd`) runs at the narrower width.
-    fn odd_u64(x: &BigUint, zx: u64) -> Option<u64> {
-        if x.bits() - zx > 64 {
-            return None;
-        }
-        let w = (zx / 64) as usize;
-        let sh = (zx % 64) as u32;
-        let mut it = x.iter_u64_digits().skip(w);
-        let lo = it.next().unwrap_or(0);
-        let hi = it.next().unwrap_or(0);
-        Some(if sh == 0 {
-            lo
-        } else {
-            (lo >> sh) | (hi << (64 - sh))
-        })
-    }
-    if let Some(da) = odd_u64(a, za) {
-        return BigUint::from(gcd_big_u64(b, da)) << z;
-    }
-    if let Some(db) = odd_u64(b, zb) {
-        return BigUint::from(gcd_big_u64(a, db)) << z;
-    }
-    fn odd(x: &BigUint, z: u64) -> Cow<'_, BigUint> {
-        match z {
-            0 => Cow::Borrowed(x),
-            _ => Cow::Owned(x >> z),
-        }
-    }
-    let (a, b) = (odd(a, za), odd(b, zb));
-    if *a == *b {
-        return a.into_owned() << z;
-    }
-    let g = match a.bits().cmp(&b.bits()) {
-        Ordering::Greater => fast::gcd(&b, &fast::rem(&a, &b)),
-        Ordering::Less => fast::gcd(&a, &fast::rem(&b, &a)),
-        Ordering::Equal => fast::gcd(&a, &b),
-    };
-    g << z
 }
 
 /// `(g, s, t)` with `s a + t b = g = gcd(a, b) >= 0`.
