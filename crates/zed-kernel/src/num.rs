@@ -140,9 +140,9 @@ pub enum Rounding {
 /// A power of a base wider than 64 bits is kept in `wide` as atoms `(q, f)`, the value then
 /// `num/den * prod p^e * prod q^f` (DESIGN.md sec:domains, "Kept powers"; step L1.17b, plan row
 /// KEPT-power-form), so `(2^64 + 13) ^ (2^64)` is one atom and not `2^70` bits. The atoms keep
-/// these invariants, which [`Rat::normal`] makes: sorted by `q`; each `f` nonzero; each `q`
+/// these invariants, which `Rat::normal` makes: sorted by `q`; each `f` nonzero; each `q`
 /// wider than 64 bits, no perfect power, and divisible by no prime below 2^8
-/// ([`TEXT_PRIMES`]); the `q` pairwise coprime, and each coprime to `num`, `den` and every
+/// (`TEXT_PRIMES`); the `q` pairwise coprime, and each coprime to `num`, `den` and every
 /// listed prime. So the form is in lowest terms, `N = |num| prod_(e > 0) p^e prod_(f > 0) q^f`
 /// and `D` likewise, and the residues of `N` and `D` ([`Rat::residues`]) are those of the value.
 #[derive(Clone)]
@@ -220,7 +220,7 @@ impl Rat {
     /// The number kept as `num/den * prod p^e * prod q^f` ([`Rat::from_kept`] with the wide
     /// atoms of [`Rat::wide`]), when the parts are in that form; `None` otherwise. The atoms
     /// are checked by their own invariants ([`Rat`]): each wider than 64 bits, no perfect power
-    /// ([`fn@least_root`]), divisible by no prime of [`TEXT_PRIMES`], and the natural coprime
+    /// ([`fn@least_root`]), divisible by no prime of `TEXT_PRIMES`, and the natural coprime
     /// base of the atoms, `num`, `den` and the listed primes has each atom as its own element.
     pub fn from_kept_wide(
         num: BigInt,
@@ -2832,13 +2832,13 @@ fn valuation_upto(n: BigInt, p: u64, cap: u64) -> (u64, BigInt) {
 const WHOLE_TEST_BITS: u64 = 64 * 64;
 
 /// What [`Rat::pow`] asks the system for, in bits for each bit of a part wider than a word,
-/// before it splits the part ([`push_part`]): four bytes a bit. Measured, not proved (Colab,
+/// before it splits the part (`push_part`): four bytes a bit. Measured, not proved (Colab,
 /// 2026-11-24, `zed_alloc_count` peaks of the split alone): 3.11 bytes a bit at 4096 bits
-/// (12,749 bytes for `2^4096 - 1`; [`WHOLE_TEST_BITS`] is 4096, so the valuations still test
+/// (12,749 bytes for `2^4096 - 1`; `WHOLE_TEST_BITS` is 4096, so the valuations still test
 /// against the whole part there), and at most 2.0 bytes a bit at 2^16 and 2^20 bits; at 128
 /// bits the split stays within the ask and 1 KiB for the lists of exponents beside it. Two
 /// bytes a bit was short at 4096 bits. A fixed part of 8 KiB instead (b22-kept3, tried
-/// 2026-11-23) also covered it, but the ask is allocated and freed to test it ([`room`]), so
+/// 2026-11-23) also covered it, but the ask is allocated and freed to test it (`room`), so
 /// `(2^64 + 13)^(2^64)` then peaked at 8,360 bytes, past the 1 KiB of DESIGN step L1.17b. Tested
 /// by `l01_17_value_representation::kept_powers::splitting_a_wide_part_stays_within_its_ask`
 /// and `a_wide_power_allocates_under_a_kibibyte`.
