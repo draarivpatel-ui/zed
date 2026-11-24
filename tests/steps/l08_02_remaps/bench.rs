@@ -1015,6 +1015,50 @@ fn group_by_a_function_parameter_runs_in_linear_time() {
     );
 }
 
+/// Row REMAP-dynamic-deep-binder: a generic function's remap over n entries in rows of 10, the
+/// value binder at a class when the body is checked, so the plan may box each row
+/// (`may_be_family`): the cost of the boxing pass on an existing remap whose value type is not
+/// known where it is checked. Small instances:
+/// `dynamic::a_generic_remap_binds_the_row_at_every_depth_of_call`.
+#[test]
+fn a_generic_remap_of_rows_runs_in_linear_time() {
+    let srcs = scaling::inputs(N_ENTRIES, |n| {
+        format!(
+            "g(positional m) = m as (k -> r) into (k + 1 -> r);\nm = {};\nx = g(m);\n\
+             t = x as (i -> j -> v) into (i >< (+) -> j >< (+) -> v);\n",
+            rows(n)
+        )
+    });
+    let run = |n: usize| assert_eq!(value(&srcs[&n], "t"), (n * (n - 1) / 2).to_string());
+    scaling::check(
+        "a generic function's remap of n entries in rows of 10, then both levels folded, whole \
+         path",
+        N_ENTRIES,
+        run,
+    );
+}
+
+/// Row GROUP-nested: `group` of n entries in rows of 10 by each row's sum, every row given whole
+/// to the function: the boxing pass (`Elab::boxed_at` at depth 1) and the `reindex` over the
+/// n / 10 boxed rows, then a fold of every leaf. Small instances:
+/// `rules::group_a_family_of_families_by_a_fold_of_each`.
+#[test]
+fn group_of_rows_by_a_fold_of_each_runs_in_linear_time() {
+    let srcs = scaling::inputs(N_ENTRIES, |n| {
+        format!(
+            "m = {};\ng = m.group(r -> r >< (+));\n\
+             t = g as (s -> i -> j -> v) into (s >< (+) -> i >< (+) -> j >< (+) -> v);\n",
+            rows(n)
+        )
+    });
+    let run = |n: usize| assert_eq!(value(&srcs[&n], "t"), (n * (n - 1) / 2).to_string());
+    scaling::check(
+        "`m.group(r -> r >< (+))` over n entries in rows of 10, then every level folded, whole path",
+        N_ENTRIES,
+        run,
+    );
+}
+
 /// Row FAIL-fold-unknown-fn-known-family: `foldl` over a list of n entries by a parameter with
 /// no written type: one need NeedKind::Fold on `f`'s class, met once at the call, where the
 /// accumulator is found and the kernel folds the n entries. Small instances:
@@ -1249,5 +1293,41 @@ fn n_forwards_with_internal_results_settle_in_linear_time() {
         "n forwards with internal results beside a class solved to n variables",
         n,
         run,
+    );
+}
+
+/// The program of
+/// `recursion::a_chain_of_8000_maps_written_in_reverse_order_checks_on_a_2_mib_stack` at
+/// `n` links: link `h{i}` calls `h{i-1}` and maps its result by `f`, written last link first,
+/// and `a` reads the last link's map at `"k"`, whose value is `n`.
+pub(super) fn reverse_map_chain(n: usize) -> String {
+    let mut src = String::new();
+    for i in (1..n).rev() {
+        src.push_str(&format!(
+            "h{i}(positional f, positional m) = h{}(f, m).map(f);\n",
+            i - 1
+        ));
+    }
+    src.push_str("h0(positional f, positional m) = m.map(f);\n");
+    src.push_str(&format!(
+        "a = h{}(x -> x + 1, {{\"k\" -> 0}})[\"k\"];\n",
+        n - 1
+    ));
+    src
+}
+
+/// Plan row FAIL-l08-02-remaps-recursion-chain-under-load: the correctness test of the chain at
+/// 8,000 links took 6.8 s alone and more than 3 times that under load, so its whole path (parse,
+/// check, elaboration and the reference evaluator's run) is measured here at 1,000 and 8,000
+/// links, on the 2 MiB stack the test runs on.
+#[test]
+fn a_chain_of_n_maps_written_in_reverse_order_takes_linear_time() {
+    scaling::check_inputs(
+        "a chain of n links, each mapping the result of the one before, written last link first",
+        1_000,
+        |n| (n, reverse_map_chain(n)),
+        |(n, src)| {
+            scaling::on_a_stack(2 << 20, || assert_eq!(value(src, "a"), n.to_string()));
+        },
     );
 }

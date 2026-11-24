@@ -452,6 +452,9 @@ fn a_product_of_kept_powers_builds_nothing_and_a_sum_that_writes_it_out_is_rejec
         )) && out.matches("Number too large").count() == 1,
         "{out}"
     );
+    // Row CONST-too-large-products-fix (d501ac3f6) rejected `(b ^ (2^60)) * (b ^ (2^60)) > 0`
+    // with the first power lowered as a repair; that product is now kept and compiles.
+    assert_eq!(built(&pushed("(b ^ (2^60)) * (b ^ (2^60)) > 0")), None);
 }
 
 #[test]

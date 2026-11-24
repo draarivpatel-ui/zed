@@ -103,9 +103,10 @@ fn has_point(f: &Formula, divs: &[Div], xs: impl Iterator<Item = i64>) -> bool {
 }
 
 /// Checks `f` against `want`: [`decide`](crate::presburger::decide), the checker's entry, must
-/// give `want`, and so must [`solve_modular_or_scaled`] with and without a model when it
-/// answers; a model must be a point of `f`. Returns whether [`solve_modular_or_scaled`]
-/// answered. It may decline a formula whose remainders, once rewritten, are of `x` alone:
+/// give `want`, and so must [`sweep::solve_modular_scaled_or_swept`] (the chain the checker
+/// asks: [`solve_modular_or_scaled`], then the period sweep) with and without a model when it
+/// answers; a model must be a point of `f`. Returns whether the chain answered. It may decline
+/// a formula whose remainders, once rewritten, are of `x` alone:
 /// [`solve_modular_whole`] declines some of those, written so from the start, before and after
 /// this row (seed 7293238915329919861 case 40, `x mod 2`, `x mod 4` and `x mod 9` under a
 /// negation), and the general path decides them.
@@ -115,20 +116,20 @@ fn check(f: &Formula, want: bool, what: &str) -> bool {
         Ok(want),
         "{what}: decide\n{f}"
     );
-    match solve_modular_or_scaled(f, true) {
+    match sweep::solve_modular_scaled_or_swept(f, true) {
         Some(Some(m)) => assert!(want && f.holds(&m), "{what}: point {m:?} of\n{f}"),
         Some(None) => assert!(!want, "{what}: no point found, but one exists, in\n{f}"),
         None => return false,
     }
     assert_eq!(
-        solve_modular_or_scaled(f, false).map(|m| m.is_some()),
+        sweep::solve_modular_scaled_or_swept(f, false).map(|m| m.is_some()),
         Some(want),
         "{what} without a model\n{f}"
     );
     true
 }
 
-/// [`check`], and [`solve_modular_or_scaled`] must answer.
+/// [`check`], and the chain it asks must answer.
 fn check_answered(f: &Formula, want: bool, what: &str) {
     assert!(check(f, want, what), "{what}: declined\n{f}");
 }
@@ -351,6 +352,10 @@ fn seed_9563318029921447897_case_272_is_decided() {
     let (divs, f) = seed_9563318029921447897_case_272();
     let period: i64 = divs.iter().map(|d| d.m).product();
     assert!(has_point(&f, &divs, -20 - period..=20 + period), "{f}");
+    // The period sweep (`sweep.rs`) decides `f` itself; `y >= 0` on a symbol of no row keeps it
+    // out, so `f` still reaches the Omega test and its lossless stage.
+    let f = Formula::and(vec![f, Formula::Con(Con::ge(&sym("y"), &Lin::constant(0)))]);
+    assert_eq!(sweep::solve(&f, false), None);
     crate::presburger::CHECK_LOSSLESS.with(|c| c.set(true));
     crate::presburger::LOSSLESS_STEPS.with(|c| c.set(0));
     check(&f, true, "seed 9563318029921447897 case 272");
@@ -507,9 +512,12 @@ fn other_shapes_are_still_declined() {
         ]
         .concat(),
     );
+    // A quotient read by a bound was declined here until FAIL-omega-pairs-4972743790605253739;
+    // the period sweep (`sweep.rs`) now decides it: `3 x div 30 >= 5` with `3 x mod 30 <= 9`
+    // holds at `x = 50`.
+    check_answered(&quotient_bound, true, "a quotient read by a bound");
     for (what, f) in [
         ("two variables", two_vars),
-        ("a quotient read by a bound", quotient_bound),
         (
             "a sum whose remainder may reach the modulus",
             sum_bound_too_high,
@@ -948,6 +956,13 @@ fn the_benchmark_inputs_have_their_answers_at_small_sizes() {
         assert!(!want, "sum modulus {m}: a point");
         check_answered(&f, want, &format!("sum modulus {m}"));
     }
+    for n in [1, 3] {
+        assert_eq!(
+            sweep::solve(&bench_runs(n), true),
+            Some(None),
+            "runs at {n}"
+        );
+    }
 }
 
 /// `(x div 3 + x div 5) mod m == 0` and `(x div 3 + x div 5 + 1) mod m == 0`, two sums with no
@@ -1019,4 +1034,411 @@ fn chain_of_quotients(depth: usize) -> (Vec<Div>, Formula) {
     }
     let f = formula(&divs, Formula::and(lits), vec![]);
     (divs, f)
+}
+
+/// The rows of FAIL-omega-pairs-4972743790605253739: `x - s == m q + r` for `(m, s)` in
+/// `(5, 0), (4, 2), (5, 5), (4, 7)`.
+fn four_pairs() -> Vec<Div> {
+    [(5, 0), (4, 2), (5, 5), (4, 7)]
+        .into_iter()
+        .map(|(m, s)| Div {
+            t: 0,
+            a: 1,
+            k: -s,
+            m,
+            fixed: None,
+        })
+        .collect()
+}
+
+#[test]
+fn four_pairs_with_a_sum_of_their_quotients_are_decided() {
+    // `r3 + q2 + r1 + q0 >= 9`: the quotients grow with `x`, so a large `x` is a point, and the
+    // general path refused it (`Growth`) before the sweep.
+    let divs = four_pairs();
+    let sum = r(3).plus(&q(2)).plus(&r(1)).plus(&q(0));
+    let f = formula(
+        &divs,
+        Formula::Con(Con::ge(&sum, &Lin::constant(9))),
+        vec![],
+    );
+    check_answered(&f, true, "the four pairs");
+    // With `x <= 12`, `q0 <= 2` and `q2 <= 1`; `r1 = (x - 2) mod 4` and `r3 = (x - 7) mod 4`
+    // differ by 1 modulo 4, so they are never both 3 and their sum is at most 5: the sum is at
+    // most 8 (enumerated below as well).
+    let bounded = formula(
+        &divs,
+        Formula::Con(Con::ge(&sum, &Lin::constant(9))),
+        vec![Formula::Con(Con::ge(&Lin::constant(12), &x()))],
+    );
+    let want = has_point(&bounded, &divs, -200..=12);
+    assert!(!want, "the bounded rows have a point");
+    check_answered(&bounded, false, "the four pairs with x <= 12");
+    // Unbounded and empty: `(x + 4) div 4 - x div 4` is 1 at every `x`.
+    let same = vec![
+        Div {
+            t: 0,
+            a: 1,
+            k: 0,
+            m: 4,
+            fixed: None,
+        },
+        Div {
+            t: 0,
+            a: 1,
+            k: 4,
+            m: 4,
+            fixed: None,
+        },
+    ];
+    let apart = formula(
+        &same,
+        Formula::Con(Con::ge(&q(1), &q(0).plus(&Lin::constant(2)))),
+        vec![],
+    );
+    check_answered(&apart, false, "two quotients one apart");
+}
+
+/// `x = p q_i + r_i` for each `p` of `primes`, as rows.
+fn prime_rows(primes: &[i64]) -> Vec<Div> {
+    primes
+        .iter()
+        .map(|&m| Div {
+            t: 0,
+            a: 1,
+            k: 0,
+            m,
+            fixed: None,
+        })
+        .collect()
+}
+
+/// The rows of 101, 103 and 107 with `q0 + q1 + q2 == c` and `extra`.
+fn sum_past_the_old_bound(c: i64, extra: Vec<Formula>) -> (Vec<Div>, Formula) {
+    let divs = prime_rows(&[101, 103, 107]);
+    let sum = q(0).plus(&q(1)).plus(&q(2));
+    let mut lits = vec![Formula::Con(Con::eq(&sum, &Lin::constant(c)))];
+    lits.extend(extra);
+    let f = formula(&divs, Formula::and(lits), vec![]);
+    (divs, f)
+}
+
+/// [`sum_past_the_old_bound`] at `c = 30,000` with `n` constraints `i r0 >= i` for `i` in
+/// `1..=n` (each `r0 >= 1`, written apart so that each is its own part) and `not (r0 >= 1)`: no
+/// point. The period of the rows is 1,113,121, past what the residue sweep runs; the runs
+/// (Lemma E of `sweep.rs`) are the window of the sum and 101 points on each side of it, the same
+/// at every `n`, each folding the formula's `n + 13` or so parts. The benchmark
+/// `bench::the_runs_scale_in_the_constraints`.
+fn bench_runs(n: usize) -> Formula {
+    let ge_one = |i: i64| Formula::Con(Con::ge(&r(0).times(i), &Lin::constant(i)));
+    let mut extra: Vec<Formula> = (1..=n as i64).map(ge_one).collect();
+    extra.push(Formula::negate(ge_one(1)));
+    sum_past_the_old_bound(30_000, extra).1
+}
+
+/// PRES-period-sweep-no-budget: the moduli 101, 103 and 107 have the period
+/// `L = 1,113,121`, so the residue sweep (`sweep.rs`, Lemma C) counts `L` times the constraints,
+/// past `PERIOD_SWEEP_SWITCHOVER`, and declined; the sum of quotients reads the moduli only
+/// through `x`'s size, so the runs (Lemma E) test one window near `x = 1,024,000` (the sum grows
+/// by about `x / 34.3`) and, with `r0 != 5`, the 101 points on each side. Every `x` off the
+/// window has a sum other than `c`, so enumerating `[1,000,000, 1,050,000]` decides each case.
+#[test]
+fn a_sum_of_quotients_past_the_old_bound_is_decided() {
+    let not_five = || Formula::negate(Formula::Con(Con::eq(&r(0), &Lin::constant(5))));
+    for (c, extra) in [
+        (30_000, vec![]),
+        (30_001, vec![not_five()]),
+        // `r0 == 5` with the sum fixed, under a disjunction so that it is not read as a bound
+        // of the row; `x <= -5` gives the sum no value `c` there.
+        (
+            30_000,
+            vec![Formula::or(vec![
+                Formula::Con(Con::eq(&r(0), &Lin::constant(5))),
+                Formula::Con(Con::ge(&Lin::constant(-5), &x())),
+            ])],
+        ),
+    ] {
+        let (divs, f) = sum_past_the_old_bound(c, extra);
+        assert_eq!(
+            sweep::solve_by(
+                &f,
+                false,
+                sweep::Method::Residues,
+                sweep::PERIOD_SWEEP_SWITCHOVER
+            ),
+            None,
+            "the residue sweep is past the switchover\n{f}"
+        );
+        let want = has_point(&f, &divs, 1_000_000..=1_050_000);
+        match sweep::solve(&f, true) {
+            Some(Some(m)) => assert!(want && f.holds(&m), "point {m:?} of\n{f}"),
+            Some(None) => assert!(!want, "no point found, but one exists, in\n{f}"),
+            None => panic!("declined\n{f}"),
+        }
+        assert_eq!(sweep::solve(&f, false).map(|m| m.is_some()), Some(want));
+    }
+}
+
+/// The two exact methods of `sweep.rs`, the residue sweep (Lemma C) and the runs (Lemma E),
+/// give the same answer on random formulas of [`random_part_literals`] over up to four rows
+/// with moduli up to 30, where both answer; each model is a point. Catches a window or a
+/// period `L_P` too narrow (the runs miss a point the sweep finds) and a wrong value at a
+/// point; cannot catch an error both methods share (`point_at`, the shape), which
+/// `quotients_beside_the_variable_match_enumeration` checks against enumeration.
+#[test]
+fn the_runs_agree_with_the_residue_sweep() {
+    let (mut rng, seed) = Rng::fresh("the_runs_agree_with_the_residue_sweep");
+    let mut both = [0usize; 2];
+    for case in 0..1500 {
+        let mut divs = random_divs(&mut rng);
+        while case % 3 == 0 && divs.len() < 4 {
+            divs.extend(random_divs(&mut rng));
+        }
+        divs.truncate(4);
+        for d in &mut divs {
+            if rng.coin() {
+                d.m = rng.int(10, 30);
+                d.fixed = d.fixed.map(|c| c % d.m);
+            }
+        }
+        let lits = random_part_literals(&mut rng, &divs, 3);
+        let f = formula(&divs, lits, vec![]);
+        // 400,000 units, the bound this test ran under before PRES-period-sweep-no-budget, so
+        // each method answers about as often as it did.
+        let runs = sweep::solve_by(&f, true, sweep::Method::Runs, 400_000);
+        let swept = sweep::solve_by(&f, true, sweep::Method::Residues, 400_000);
+        for m in [&runs, &swept].into_iter().flatten().flatten() {
+            assert!(
+                f.holds(m),
+                "seed {seed} case {case}: not a point {m:?}\n{f}"
+            );
+        }
+        if let (Some(a), Some(b)) = (&runs, &swept) {
+            assert_eq!(a.is_some(), b.is_some(), "seed {seed} case {case}\n{f}");
+            both[usize::from(a.is_some())] += 1;
+        }
+    }
+    eprintln!("seed {seed}: both methods answered {both:?} (empty, with a point)");
+    assert!(both[0] > 50 && both[1] > 50, "{both:?}");
+}
+
+/// A random Boolean combination of constraints on sums of `x` and the quotients and
+/// remainders of `divs`, with coefficients in `[-3, 3]`.
+fn random_part_literals(rng: &mut Rng, divs: &[Div], depth: u32) -> Formula {
+    if depth == 0 || rng.below(3) == 0 {
+        let mut parts: Vec<Lin> = vec![x()];
+        for (i, d) in divs.iter().enumerate() {
+            parts.push(q(i));
+            if d.fixed.is_none() {
+                parts.push(r(i));
+            }
+        }
+        let mut sum = Lin::constant(0);
+        for _ in 0..1 + rng.below(3) {
+            let p = rng.pick(&parts);
+            sum = sum.plus(&p.times(rng.int(-3, 3)));
+        }
+        let c = Lin::constant(rng.int(-20, 20));
+        return Formula::Con(if rng.below(5) == 0 {
+            Con::eq(&sum, &c)
+        } else {
+            Con::ge(&sum, &c)
+        });
+    }
+    let kids = (0..2 + rng.below(2))
+        .map(|_| random_part_literals(rng, divs, depth - 1))
+        .collect();
+    match rng.below(3) {
+        0 => Formula::and(kids),
+        1 => Formula::or(kids),
+        _ => Formula::negate(Formula::and(kids)),
+    }
+}
+
+/// Random formulas of [`random_part_literals`] with `x` unbounded, on up to four rows: where the
+/// module and [`decide`](crate::presburger::decide) both answer, they agree (enumeration cannot
+/// check an unbounded `x`). The counts are printed: on seed 16937151135935670534 at 2cf833851,
+/// `decide` refused 7 of 3000 and the module declined 2394 before the period sweep (`sweep.rs`),
+/// and 0 and 100 with it.
+#[test]
+fn unbounded_quotient_formulas_agree_with_decide() {
+    let (mut rng, seed) = Rng::fresh("unbounded_quotient_formulas_agree_with_decide");
+    let mut refused = 0;
+    let mut declined = 0;
+    let n = 3000;
+    for case in 0..n {
+        let mut divs = random_divs(&mut rng);
+        while case % 2 == 0 && divs.len() < 4 {
+            divs.extend(random_divs(&mut rng));
+        }
+        divs.truncate(4);
+        let lits = random_part_literals(&mut rng, &divs, 3);
+        let f = formula(&divs, lits, vec![]);
+        let by_module = sweep::solve_modular_scaled_or_swept(&f, true);
+        if let Some(Some(model)) = &by_module {
+            assert!(f.holds(model), "seed {seed} case {case}: not a point\n{f}");
+        }
+        let by_decide = crate::presburger::decide(&f);
+        declined += usize::from(by_module.is_none());
+        refused += usize::from(by_decide.is_err());
+        if let (Some(m), Ok(want)) = (by_module, by_decide) {
+            assert_eq!(m.is_some(), want, "seed {seed} case {case}\n{f}");
+        }
+    }
+    eprintln!("seed {seed}: decide refused {refused}, the module declined {declined}, of {n}");
+}
+
+#[test]
+fn quotients_beside_the_variable_match_enumeration() {
+    // `x` is bounded to a window, so enumerating the window decides each formula.
+    let (mut rng, seed) = Rng::fresh("quotients_beside_the_variable_match_enumeration");
+    crate::presburger::CHECK_LOSSLESS.with(|c| c.set(true));
+    let mut answered = [0usize; 2];
+    let mut by_solve = [0usize; 2];
+    for case in 0..300 {
+        let divs = random_divs(&mut rng);
+        let lits = random_part_literals(&mut rng, &divs, 2);
+        let lo = rng.int(-60, 60);
+        let hi = lo + rng.int(0, 80);
+        let extra = vec![
+            Formula::Con(Con::ge(&x(), &Lin::constant(lo))),
+            Formula::Con(Con::ge(&Lin::constant(hi), &x())),
+        ];
+        let f = formula(&divs, lits, extra);
+        let want = has_point(&f, &divs, lo..=hi);
+        let by_module = check(&f, want, &format!("seed {seed} case {case} {divs:?}"));
+        answered[usize::from(want)] += 1;
+        by_solve[usize::from(want)] += usize::from(by_module);
+    }
+    // Both answers are met, and the module answers each side often, so neither is checked
+    // vacuously and a module that declined everything would not pass on `decide` alone.
+    assert!(answered[0] > 30 && answered[1] > 30, "{answered:?}");
+    assert!(by_solve[0] > 30 && by_solve[1] > 30, "{by_solve:?}");
+}
+
+/// A random formula of [`random_part_literals`] over one to four rows, each modulus with even
+/// odds a prime from 11 to 113, and with even odds a sum of the quotients equal to or at least
+/// 1,000 to 1,000,000: the formulas of the measurement of `sweep::PERIOD_SWEEP_SWITCHOVER`,
+/// whose periods and windows put the period sweep's count of units from a few hundred to past
+/// 10^7.
+fn prime_part_formula(rng: &mut Rng) -> Formula {
+    let primes = [
+        11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101,
+        103, 107, 109, 113,
+    ];
+    let k = 1 + rng.below(4);
+    let mut divs = random_divs(rng);
+    while divs.len() < k {
+        divs.extend(random_divs(rng));
+    }
+    divs.truncate(k);
+    for d in &mut divs {
+        if rng.coin() {
+            d.m = rng.pick(&primes);
+            d.fixed = d.fixed.map(|c| c % d.m);
+        }
+    }
+    let mut extra = Vec::new();
+    if rng.coin() {
+        let mut sum = Lin::constant(0);
+        for i in 0..divs.len() {
+            sum = sum.plus(&q(i).times(rng.int(1, 3)));
+        }
+        let c = Lin::constant(rng.int(1_000, 1_000_000));
+        extra.push(Formula::Con(if rng.coin() {
+            Con::eq(&sum, &c)
+        } else {
+            Con::ge(&sum, &c)
+        }));
+    }
+    let lits = random_part_literals(rng, &divs, 3);
+    formula(&divs, lits, extra)
+}
+
+/// PRES-period-sweep-no-budget: a formula past `PERIOD_SWEEP_SWITCHOVER` that the general path
+/// refuses is answered by the sweep after the refusal (`presburger::swept_after_refusal`), by
+/// [`decide`](crate::presburger::decide) and by `satisfiable`, with the sweep's answer. Formulas
+/// of [`prime_part_formula`] that the sweep declines at its switchover and `decide` refuses with
+/// the sweep after a refusal switched off (`presburger::NO_SWEEP_AFTER_REFUSAL`): about one in
+/// 15 of those with 32,768 to 500,000 units in the measurement (red at b22-presburger8 with only
+/// that sweep left out). The sweep is bounded here by 500,000 units, so the test stays short;
+/// `decide`'s own bound is `PERIOD_SWEEP_AFTER_REFUSAL_UNITS`.
+#[test]
+fn a_formula_the_general_path_refuses_is_swept_past_the_switchover() {
+    let (mut rng, seed) =
+        Rng::fresh("a_formula_the_general_path_refuses_is_swept_past_the_switchover");
+    let mut found = 0;
+    let mut tried = 0;
+    while found < 3 && tried < 400 {
+        let f = prime_part_formula(&mut rng);
+        if solve_modular_or_scaled(&f, false).is_some() || sweep::solve(&f, false).is_some() {
+            continue;
+        }
+        tried += 1;
+        let refused = {
+            let _off = crate::presburger::SetFor::new(&crate::presburger::NO_SWEEP_AFTER_REFUSAL);
+            crate::presburger::decide(&f).is_err()
+        };
+        if !refused {
+            continue;
+        }
+        let Some(want) = sweep::solve_by(&f, false, sweep::Method::Cheaper, 500_000) else {
+            continue;
+        };
+        found += 1;
+        let want = want.is_some();
+        match crate::presburger::decide(&f) {
+            Ok(b) => assert_eq!(b, want, "seed {seed}\n{f}"),
+            Err(e) => panic!("seed {seed}: refused ({e:?}), the sweep gives {want}\n{f}"),
+        }
+        match crate::presburger::satisfiable(&f) {
+            Ok(Some(m)) => assert!(want && f.holds(&m), "seed {seed}: point {m:?} of\n{f}"),
+            Ok(None) => assert!(
+                !want,
+                "seed {seed}: no point found, the sweep finds one\n{f}"
+            ),
+            Err(e) => panic!("seed {seed}: refused ({e:?}), the sweep gives {want}\n{f}"),
+        }
+    }
+    eprintln!("seed {seed}: {found} refused formulas swept, of {tried} past the switchover");
+    assert!(found > 0, "seed {seed}: no formula refused of {tried}");
+}
+
+/// PRES-period-sweep-no-budget: no formula that 60267344b answered by its sweep (the residue
+/// sweep, first, up to 400,000 units) is refused now, though the sweep now runs first only up to
+/// `PERIOD_SWEEP_SWITCHOVER`: [`decide`](crate::presburger::decide) and `satisfiable` answer
+/// each such formula of [`prime_part_formula`] past the switchover, with the residue sweep's
+/// answer. Formulas 60267344b sent to the general path are sent there now too. Catches a sweep
+/// after a refusal that is missing or bounded below 400,000 units.
+#[test]
+fn what_the_old_switchover_swept_is_answered() {
+    let (mut rng, seed) = Rng::fresh("what_the_old_switchover_swept_is_answered");
+    let mut checked = 0;
+    let mut tried = 0;
+    while checked < 30 && tried < 3000 {
+        tried += 1;
+        let f = prime_part_formula(&mut rng);
+        if solve_modular_or_scaled(&f, false).is_some() || sweep::solve(&f, false).is_some() {
+            continue;
+        }
+        let Some(want) = sweep::solve_by(&f, false, sweep::Method::Residues, 400_000) else {
+            continue;
+        };
+        checked += 1;
+        let want = want.is_some();
+        match crate::presburger::decide(&f) {
+            Ok(b) => assert_eq!(b, want, "seed {seed}\n{f}"),
+            Err(e) => panic!("seed {seed}: refused ({e:?}), the old sweep gives {want}\n{f}"),
+        }
+        match crate::presburger::satisfiable(&f) {
+            Ok(Some(m)) => assert!(want && f.holds(&m), "seed {seed}: point {m:?} of\n{f}"),
+            Ok(None) => assert!(
+                !want,
+                "seed {seed}: no point found, the old sweep finds one\n{f}"
+            ),
+            Err(e) => panic!("seed {seed}: refused ({e:?}), the old sweep gives {want}\n{f}"),
+        }
+    }
+    eprintln!("seed {seed}: {checked} formulas the old switchover swept, of {tried}");
+    assert!(checked >= 10, "seed {seed}: {checked} of {tried}");
 }

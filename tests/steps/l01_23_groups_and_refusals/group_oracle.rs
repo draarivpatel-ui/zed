@@ -1390,67 +1390,20 @@ fn sweep_listed(
 // to 300, listed by TEST-bench-move-l0123 (2026-11-14): 11 more, all layered, all `I` (seeds 0
 // to 200 had been swept with these counted, 4 and 3, not listed). On 2026-11-07 (plan item
 // EMPTY-key-search) the sweep of seeds 300 to 1500 refused 54 members shown inhabited: layered
-// 34, cells 9, X14 7, mixed 4.
+// 34, cells 9, X14 7, mixed 4. Since 2026-11-23 (b22-ref3) every list is empty: seeds 0 to 1500
+// of each family give no refusal.
 
 /// The X14 family: every member decided.
 const LISTED_CLAUDE: &[Listed] = &[];
 /// Partial morphisms: every member decided.
 const LISTED_MIXED: &[Listed] = &[];
-/// Layered groups: each refused member is, or reads, a function type whose value type is a pair
-/// of itself and a difference of two definitions, such as `R3 = (int) -> (R3, (R2 \ R0))` of
-/// seed 799 with `R0 = (int) -> int` and `R2 = ((int) -> R2) | ((R1) -> R0)`; the pool's value
-/// is a closure that returns a pair holding itself. All are refused `NoWitness` (STATUS.md Open
-/// points, GROUP-oracle: the refusals in groups holding `\` or `&`).
-const LISTED_LAYER: &[Listed] = &[
-    (16, 3, 'I', Refusal::NoWitness),
-    (37, 3, 'I', Refusal::NoWitness),
-    (45, 4, 'I', Refusal::NoWitness),
-    (73, 4, 'I', Refusal::NoWitness),
-    (125, 2, 'I', Refusal::NoWitness),
-    (125, 4, 'I', Refusal::NoWitness),
-    (171, 3, 'I', Refusal::NoWitness),
-    (230, 3, 'I', Refusal::NoWitness),
-    (232, 3, 'I', Refusal::NoWitness),
-    (236, 2, 'I', Refusal::NoWitness),
-    (293, 3, 'I', Refusal::NoWitness),
-    (332, 4, 'I', Refusal::NoWitness),
-    (440, 3, 'I', Refusal::NoWitness),
-    (508, 5, 'I', Refusal::NoWitness),
-    (626, 3, 'I', Refusal::NoWitness),
-    (642, 3, 'I', Refusal::NoWitness),
-    (642, 4, 'U', Refusal::NoWitness),
-    (692, 5, 'I', Refusal::NoWitness),
-    (764, 3, 'I', Refusal::NoWitness),
-    (764, 4, 'U', Refusal::NoWitness),
-    (799, 3, 'I', Refusal::NoWitness),
-    (815, 4, 'I', Refusal::NoWitness),
-    (831, 4, 'I', Refusal::NoWitness),
-    (857, 3, 'I', Refusal::NoWitness),
-    (955, 3, 'I', Refusal::NoWitness),
-    (975, 2, 'I', Refusal::NoWitness),
-    (975, 3, 'U', Refusal::NoWitness),
-    (987, 3, 'I', Refusal::NoWitness),
-    (987, 4, 'I', Refusal::NoWitness),
-    (996, 3, 'I', Refusal::NoWitness),
-    (1043, 4, 'I', Refusal::NoWitness),
-    (1048, 2, 'I', Refusal::NoWitness),
-    (1051, 4, 'I', Refusal::NoWitness),
-    (1068, 4, 'I', Refusal::NoWitness),
-    (1068, 5, 'I', Refusal::NoWitness),
-    (1147, 4, 'I', Refusal::NoWitness),
-    (1229, 4, 'I', Refusal::NoWitness),
-    (1241, 4, 'I', Refusal::NoWitness),
-    (1326, 2, 'I', Refusal::NoWitness),
-    (1354, 4, 'I', Refusal::NoWitness),
-    (1421, 2, 'I', Refusal::NoWitness),
-    (1421, 4, 'I', Refusal::NoWitness),
-    (1446, 3, 'I', Refusal::NoWitness),
-    (1454, 4, 'I', Refusal::NoWitness),
-    (1466, 2, 'I', Refusal::NoWitness),
-    (1483, 4, 'I', Refusal::NoWitness),
-    (1485, 4, 'U', Refusal::NoWitness),
-    (1498, 5, 'I', Refusal::NoWitness),
-];
+/// Layered groups: every member decided. The 48 members listed before (seeds 0 to 1500, 44 `I`
+/// and 4 `U`, all `NoWitness`) were each, or read, a function type whose value type is a pair of
+/// itself and a difference of two definitions, such as `R3 = (int) -> (R3, (R2 \ R0))` of seed
+/// 799; `find_rep` now builds a closure for a part with a morphism type refused once it proves
+/// the rest apart from it (GROUP-layered-nowitness, REP-refusals-rest point (1), b22-ref3,
+/// 2026-11-23: 0 refused of 6,725 members of seeds 0 to 1500, measured on v5e4).
+const LISTED_LAYER: &[Listed] = &[];
 /// Meets and differences: seed 1140 (`R0`, `R2` shown inhabited by the pool) is now decided
 /// `Inhabited` by `C_group` / `Π_sym` (XR-group-order-5).
 const LISTED_CELLS: &[Listed] = &[];
@@ -1638,6 +1591,31 @@ fn a_morphism_on_a_cycle() {
         exact(E::Int, E::Union(vec![r(1), r(0)])),
     ];
     assert_eq!(both(&sys, "cyc_e"), [i, i]);
+}
+
+/// Member 3 of layered seed 799, `R3 = (int) -> (R3, (R2 \ R0))` with `R0 = (int) -> int` and
+/// `R2 = ((int) -> R2) | ((R1) -> R0)`: the pool's closure that returns a pair holding itself
+/// is a member, and the kernel refused it before GROUP-layered-nowitness (`find_rep` built no
+/// closure for a part with a morphism type refused).
+#[test]
+fn layered_seed_799_member_3_is_inhabited() {
+    let sys = gen_layer(&mut Rng::new(799));
+    assert_eq!(both(&sys, "layer799")[3], Some((Verdict::Inhabited, 'I')));
+}
+
+/// The smallest case of seed 799: `X = (int) -> X` is inhabited by a closure that returns
+/// itself, which is not in `(int) -> int`, so `X \ ((int) -> int)` is inhabited, and so is
+/// `Y = (int) -> (Y, X \ ((int) -> int))`.
+#[test]
+fn a_difference_of_a_recursive_morphism_type_has_a_closure() {
+    let i = Some((Verdict::Inhabited, 'I'));
+    let sys = [
+        exact(E::Int, E::Int),
+        exact(E::Int, r(1)),
+        exact(E::Int, tup(vec![r(2), diff(r(1), r(0))])),
+        diff(r(1), r(0)),
+    ];
+    assert_eq!(both(&sys, "xdiff"), [i, i, i, i]);
 }
 
 /// A member split across box cells: the product `(#a | #b | L, #a | #b | L)` less the two
@@ -1855,6 +1833,32 @@ fn a_closure_returns_a_member_built_or_decided_inhabited() {
             "{tag}: {tally:?}"
         );
     }
+}
+
+/// Layered seed 45 (REP-refusals-rest point (1)): `R4` holds a closure returning a pair of
+/// itself and a value of `R2 \ R3`, with `R2 = (int) -> R1` and
+/// `R3 = ((R1) -> empty) | ((R0) -> empty)`. The morphism types of `R3` are refused by every
+/// value of the difference; the search drops them and builds a closure of `R2` once it proves
+/// `R2` apart from them (`find_rep`, its morphism branch). `R4` was refused `NoWitness`
+/// before; every member is now decided and none is missed. Seed 799 is
+/// `layered_seed_799_member_3_is_inhabited`.
+#[test]
+fn a_closure_apart_from_the_types_refused_is_a_value_of_a_difference() {
+    let to_empty = |k: E| exact(k, E::Empty);
+    let seed45 = vec![
+        to_empty(E::Int),
+        exact(r(0), r(0)),
+        exact(E::Int, r(1)),
+        E::Union(vec![to_empty(r(1)), to_empty(r(0))]),
+        E::Union(vec![
+            to_empty(r(1)),
+            exact(E::Int, tup(vec![r(4), diff(r(2), r(3))])),
+        ]),
+    ];
+    assert_eq!(seed45, gen_layer(&mut Rng::new(45)));
+    let mut tally = Tally::default();
+    compare(&seed45, "l45", &mut tally);
+    assert_eq!((tally.missed, tally.refused), (0, 0), "{tally:?}");
 }
 
 /// A layered group (seed 1335) whose member `R4 = (R3) -> empty` is a closure never called: its
@@ -4929,4 +4933,173 @@ fn a_morphism_with_a_recursive_key_is_read_by_the_flat_difference_decider() {
 #[test]
 fn x14_6_220_agrees_across_orders() {
     verdicts_agree_across_orders("x14_6_", |g| claude_of(g, 6), &[220], (true, true));
+}
+
+// ---------------------------------------------------------------------------------------------
+// A failed build sought again at once (REP-retry-again-test)
+// ---------------------------------------------------------------------------------------------
+
+/// The verdicts of `sys` written in every `step`-th order of its definitions ([`permutations`]),
+/// both as written and [`undecided`]: each against the pool's, and the same when asked one after
+/// another up and down with the results kept. Returns, for each of the two, how many times the
+/// verdicts asked alone built a type again at once because a type its failed build read as
+/// missing got a value before that build ended (`Searching::rep`, read through
+/// `Type::rebuilds_at_once`), and how many builds they started in all (`Type::rep_builds`).
+fn rebuilt_at_once(sys: &[E], step: usize, tag: &str) -> ([usize; 2], [usize; 2]) {
+    let (mut hits, mut builds) = ([0; 2], [0; 2]);
+    for (vi, sys) in [sys.to_vec(), undecided(sys.to_vec())].iter().enumerate() {
+        let tr = truth(sys, CAP);
+        for (k, order) in permutations(sys.len()).iter().enumerate().step_by(step) {
+            let m = moved(sys, order);
+            let ts = kernel(&m, &format!("{tag}v{vi}p{k}"));
+            let (h0, b0) = (Type::rebuilds_at_once(), Type::rep_builds());
+            let got = alone(&ts);
+            hits[vi] += Type::rebuilds_at_once() - h0;
+            builds[vi] += Type::rep_builds() - b0;
+            for (j, v) in got.iter().enumerate() {
+                let at = || format!("{tag}: R{j} of {}", show_system(&m));
+                // Definition j of `m` is definition order[j] of `sys` ([`moved`]).
+                match (&tr.seen[order[j]], v) {
+                    (Seen::Member(w), Some(Verdict::Empty)) => {
+                        panic!("{}: Empty, but holds {w}", at())
+                    }
+                    (Seen::None, Some(Verdict::Inhabited)) if tr.exhaustive => {
+                        panic!("{}: Inhabited, but the pool shows no value", at())
+                    }
+                    _ => {}
+                }
+            }
+            let up: Vec<usize> = (0..m.len()).collect();
+            let down: Vec<usize> = (0..m.len()).rev().collect();
+            for o in [up, down] {
+                let at = || format!("{tag}: asked in the order {o:?} of {}", show_system(&m));
+                assert_eq!(in_order(&ts, &o), got, "{}", at());
+            }
+        }
+    }
+    (hits, builds)
+}
+
+/// `X = (T) | (C)` and `T = (X) | (C, Z)` with `C = int -> c` and `Z = z`, the arms of each
+/// union in both orders: four systems.
+fn again_family_a(c: E, z: E) -> Vec<Vec<E>> {
+    let mut systems = Vec::new();
+    for swap_x in [false, true] {
+        for swap_t in [false, true] {
+            let mut x = vec![tup(vec![E::Ref(1)]), tup(vec![E::Ref(2)])];
+            let mut t = vec![tup(vec![E::Ref(0)]), tup(vec![E::Ref(2), E::Ref(3)])];
+            if swap_x {
+                x.reverse();
+            }
+            if swap_t {
+                t.reverse();
+            }
+            systems.push(vec![
+                E::Union(x),
+                E::Union(t),
+                exact(E::Int, c.clone()),
+                z.clone(),
+            ]);
+        }
+    }
+    systems
+}
+
+/// In every order of the definitions of
+///
+/// ```text
+/// R0 = (R1) | (R2); R1 = (R0) | (R2, R3); R2 = int -> (R0); R3 = (R3)
+/// ```
+///
+/// and of the three with the arms of `R0` or `R1` the other way round, the build of `R1` fails
+/// while `R0`, which it read as missing, gets a value through the closure `R2`, taken to have a
+/// value while `(R0)` is sought: `Searching::rep` builds `R1` again at once (its `again`
+/// branch), once in each order of the definitions as written, never when undecided (measured
+/// on hm2, 2026-11-23). No test reached that branch
+/// before (REP-retry-again-test). With `R2 = int -> R0` the closure gives nothing, and with
+/// `R3` empty the build of `R1` reads no type that gets a value: neither reaches the branch,
+/// the negative controls of the count.
+#[test]
+fn a_failed_build_whose_read_type_got_a_value_through_a_closure_is_built_again_at_once() {
+    let hits: Vec<[usize; 2]> = again_family_a(tup(vec![E::Ref(0)]), tup(vec![E::Ref(3)]))
+        .iter()
+        .enumerate()
+        .map(|(i, sys)| rebuilt_at_once(sys, 1, &format!("againA{i}")).0)
+        .collect();
+    assert_eq!(
+        hits,
+        vec![[24, 0]; 4],
+        "builds again at once, as written and undecided"
+    );
+    for (name, c, z) in [
+        ("againAplain", E::Ref(0), tup(vec![E::Ref(3)])),
+        ("againAempty", tup(vec![E::Ref(0)]), E::Empty),
+    ] {
+        for (i, sys) in again_family_a(c, z).iter().enumerate() {
+            let at = format!("{name}{i}: {}", show_system(sys));
+            assert_eq!(
+                rebuilt_at_once(sys, 1, &format!("{name}{i}")).0,
+                [0, 0],
+                "{at}"
+            );
+        }
+    }
+}
+
+/// `X = (T) | (C)` or `X = (W) | (C)`, `T = (X) | (C, Z)`, `C = int -> (X)`, `Z = (Z)`,
+/// `W = (T)` and `Q = (X, W)`, the arms of `X` and of `T` in both orders: eight systems, in
+/// every fifteenth order of their six definitions, as written and undecided. The build of `T`
+/// or of `W` fails while `X` gets a value through `C`, so each is built again at once
+/// (REP-retry-again-test): with `X = (T) | (C)` when decided as written, with `X = (W) | (C)`
+/// when undecided.
+#[test]
+fn failed_builds_read_through_a_second_type_are_built_again_at_once() {
+    let (mut hits, mut builds) = (Vec::new(), Vec::new());
+    for swap_x in [false, true] {
+        for swap_t in [false, true] {
+            for through_w in [false, true] {
+                let first = tup(vec![E::Ref(if through_w { 4 } else { 1 })]);
+                let mut x = vec![first, tup(vec![E::Ref(2)])];
+                let mut t = vec![tup(vec![E::Ref(0)]), tup(vec![E::Ref(2), E::Ref(3)])];
+                if swap_x {
+                    x.reverse();
+                }
+                if swap_t {
+                    t.reverse();
+                }
+                let sys = vec![
+                    E::Union(x),
+                    E::Union(t),
+                    exact(E::Int, tup(vec![E::Ref(0)])),
+                    tup(vec![E::Ref(3)]),
+                    tup(vec![E::Ref(1)]),
+                    tup(vec![E::Ref(0), E::Ref(4)]),
+                ];
+                let (h, b) = rebuilt_at_once(&sys, 15, &format!("againB{}", hits.len()));
+                hits.push(h);
+                builds.push(b);
+            }
+        }
+    }
+    let expected: Vec<[usize; 2]> = (0..8)
+        .map(|i| if i % 2 == 0 { [90, 0] } else { [0, 60] })
+        .collect();
+    assert_eq!(
+        hits, expected,
+        "builds again at once, as written and undecided"
+    );
+    // The builds again give the same verdicts and witnesses as returning the failure and
+    // letting a later read build the type (`Some(true) => return r` in `Searching::rep`), but
+    // fewer builds: an undecided system with `X = (W) | (C)` starts 3,358 with that change
+    // (measured on hm2, 2026-11-23), so this count is what tells the two apart.
+    let expected: Vec<[usize; 2]> = (0..8)
+        .map(|i| {
+            if i % 2 == 0 {
+                [1667, 2249]
+            } else {
+                [1486, 3018]
+            }
+        })
+        .collect();
+    assert_eq!(builds, expected, "builds, as written and undecided");
 }

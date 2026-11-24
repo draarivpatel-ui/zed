@@ -1747,6 +1747,21 @@ fn the_projections_by_pendants_and_of_the_whole_part_are_sound() {
     );
 }
 
+/// The run of [`the_projections_by_pendants_and_of_the_whole_part_are_sound`] at seed
+/// 94081993546161772 ends, and its answers are sound. Its part 38 (`a + b + 2c <= 8`,
+/// `2a + 2b + c + 2z1 == -8`, `a + c + 3z0 == 3`, `a` in `[0, inf)`, `c` in `[-6, inf)`, ...)
+/// made the cover's gap of classes (`ClassUnion::minus` of zedc-presburger, uncharged) grow
+/// past 60 s on the branch of PERF-exact-strided-unlisted, where origin/main took 2 s; the
+/// cut is charged to the meter now, as the listed gap was.
+#[test]
+fn the_pendant_run_whose_gap_of_classes_grew_without_a_charge_ends() {
+    pendants_against_whole_drawn(
+        Rng::new(94_081_993_546_161_772),
+        94_081_993_546_161_772,
+        true,
+    );
+}
+
 /// The parts that took the route by pendants, counted by kind: with two disjunctions or
 /// more among their conjuncts (each `Item::Or` and `Item::Ne`), with a pendant whose name's
 /// box has a hole, and with a pendant whose coefficient is not one or minus one. A pendant here
@@ -4286,6 +4301,25 @@ fn a_conjunction_gets_one_answer_for_every_naming() {
 fn a_joined_conjunction_gets_one_answer_for_every_naming() {
     check_refused_case(12527472341280287461, 21, true, (1, 2, 0));
     check_refused_case(18417449267567745209, 5, true, (1, 1, 1));
+}
+
+/// Case 13 of seed 393, each part two joined (PERF-pendants-dnf-hull-sides): seven
+/// disjunctions over six names, whose disjuncts mostly give a name a hull inside the union the
+/// disjuncts read before gave it. One `project_each_boxed` asked 1098 hull sides, 2.3 s of the
+/// 25.2 s of its seed; a name whose union already holds its hull is no longer asked of the
+/// disjuncts after (`Level::start_disjunct`), 840 sides, with the same sets. Every writing
+/// still gives every name its brute-force set, none refused.
+#[test]
+fn seed_393_case_13_asks_fewer_hull_sides() {
+    let (items, bs) = random_case(393, 13, true);
+    presburger::hull_sides_asked();
+    boxed_names(&scope(&bs), &formula(&items), &item_names(&items));
+    let sides = presburger::hull_sides_asked();
+    assert!(
+        sides <= 840,
+        "{sides} hull sides, more than the 840 asked since PERF-pendants-dnf-hull-sides"
+    );
+    check_refused_case(393, 13, true, (0, 0, 0));
 }
 
 /// [`omega`], the oracle every test above relies on, against enumeration: random systems of up

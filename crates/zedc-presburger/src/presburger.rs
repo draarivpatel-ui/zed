@@ -349,8 +349,14 @@ fn satisfiable_written(f: &Formula) -> Result<Option<Model>, Refusal> {
     }
 }
 
-/// [`satisfiable`] on one path ([`or_old`]).
+/// [`satisfiable`] on one path ([`or_old`]); where the solver refuses `f`, the period sweep past
+/// its switchover ([`swept_after_refusal`]), as at [`decide_named`].
 fn satisfiable_named(f: &Formula) -> Result<Option<Model>, Refusal> {
+    satisfiable_named_once(f).or_else(|e| swept_after_refusal(f, true).ok_or(e))
+}
+
+/// [`satisfiable_named`] with no sweep after a refusal.
+fn satisfiable_named_once(f: &Formula) -> Result<Option<Model>, Refusal> {
     // As at [`satisfiable_written`]: a spent question is refused with no retry.
     if meter::spent() {
         return Err(Refusal::Questions);
@@ -588,8 +594,17 @@ fn decide_written(f: &Formula) -> Result<bool, Refusal> {
     }
 }
 
-/// [`decide`] on one path ([`or_old`]).
+/// [`decide`] on one path ([`or_old`]); where the solver refuses `f`, the period sweep past its
+/// switchover ([`swept_after_refusal`]). Here, not in [`decide`], so that a part of a formula
+/// the solver asks on its own (a disjunct, a component) is swept too, as it was when the sweep
+/// ran first up to `SWEEP_SWITCHOVER` (PRES-period-sweep-no-budget).
 fn decide_named(f: &Formula) -> Result<bool, Refusal> {
+    decide_named_once(f)
+        .or_else(|e| swept_after_refusal(f, false).map_or(Err(e), |m| Ok(m.is_some())))
+}
+
+/// [`decide_named`] with no sweep after a refusal.
+fn decide_named_once(f: &Formula) -> Result<bool, Refusal> {
     if let Some(found) = modular_answer(f, false) {
         return Ok(found.is_some());
     }
@@ -1425,6 +1440,10 @@ impl Drop for SetFor {
 thread_local! {
     static OLD_PATH: Cell<bool> = const { Cell::new(false) };
     static REVERSED: Cell<bool> = const { Cell::new(false) };
+    /// Whether [`swept_after_refusal`] gives no answer, for the test that finds the formulas the
+    /// solver refuses (`scaled::tests::a_formula_the_general_path_refuses_is_swept_past_the_switchover`).
+    #[cfg(test)]
+    static NO_SWEEP_AFTER_REFUSAL: Cell<bool> = const { Cell::new(false) };
 }
 
 /// `run` with no check of the empty answers, inside a run under [`with_modular_empty_checked`].
@@ -1435,8 +1454,9 @@ pub fn without_modular_empty_check<T>(run: impl FnOnce() -> T) -> T {
     out
 }
 
-/// [`modular::scaled::solve_modular_or_scaled`]'s answer to `f` ([`modular::solve_modular`]'s,
-/// or on its decline the scaled rewrite's), or `None` when it gives none or is switched off
+/// [`modular::scaled::sweep::solve_modular_scaled_or_swept`]'s answer to `f`
+/// ([`modular::solve_modular`]'s, or on its decline the scaled rewrite's, or on its decline the
+/// period sweep's), or `None` when it gives none or is switched off
 /// ([`with_modular_empty_checked`]). In a run under [`with_modular_empty_checked`], each answer
 /// that `f` has no point is asked again of the path without the modular solver, and the two
 /// answers are recorded.
@@ -1444,7 +1464,7 @@ fn modular_answer(f: &Formula, want_model: bool) -> Option<Option<Model>> {
     if MODULAR_CHECK.with(|c| c.borrow().as_ref().is_some_and(|c| c.off)) {
         return None;
     }
-    let found = modular::scaled::solve_modular_or_scaled(f, want_model)?;
+    let found = modular::scaled::sweep::solve_modular_scaled_or_swept(f, want_model)?;
     if found.is_none() && MODULAR_CHECK.with(|c| c.borrow().is_some()) {
         // The check is off while the path without the modular solver is asked, and on again
         // when `On` is dropped, also when that path is left by an unwind.
@@ -1470,6 +1490,22 @@ fn modular_answer(f: &Formula, want_model: bool) -> Option<Option<Model>> {
         });
     }
     Some(found)
+}
+
+/// [`modular::scaled::sweep::solve_after_refusal`]'s answer to `f`, which [`decide_named`] and
+/// [`satisfiable_named`] ask where the solver refused `f` (PRES-period-sweep-no-budget): the period
+/// sweep past its switchover, where the solver answers most formulas faster, up to its limit.
+/// `None` where it gives none, or in a run under [`with_modular_empty_checked`] while the
+/// modular solvers are switched off. Cost: nothing where the solver answers.
+fn swept_after_refusal(f: &Formula, want_model: bool) -> Option<Option<Model>> {
+    if MODULAR_CHECK.with(|c| c.borrow().as_ref().is_some_and(|c| c.off)) {
+        return None;
+    }
+    #[cfg(test)]
+    if NO_SWEEP_AFTER_REFUSAL.with(Cell::get) {
+        return None;
+    }
+    modular::scaled::sweep::solve_after_refusal(f, want_model)
 }
 
 /// The record of a run under [`with_modular_empty_checked`]: of the answers of
@@ -22750,11 +22786,15 @@ fn project_each_inner(f: &Formula, syms: &[Atom]) -> Result<Each, Refusal> {
 /// projection: where the solver refuses the question or the projection onto a symbol, the
 /// symbol keeps the bounds the box stage gives the rows of the formula ([`row_box`]), which
 /// hold every value it takes at a point of the formula.
+pub type Boxed = BoxedOf<IntervalSet>;
+
+/// [`Boxed`] with each set of the type `S`: [`IntervalSet`] for [`project_each_boxed`],
+/// [`Classed`] for [`project_each_boxed_classed`].
 #[derive(Clone, PartialEq, Debug)]
-pub struct Boxed {
+pub struct BoxedOf<S> {
     /// Each symbol's set: its projection, or where it was refused, the box stage's bounds
     /// and the cause.
-    pub each: Vec<(IntervalSet, Option<Refusal>)>,
+    pub each: Vec<(S, Option<Refusal>)>,
     /// The causes for which a disjunction was left out of the projections.
     pub skipped: Vec<Refusal>,
     /// The cause for which the whole question was refused, when it was; every symbol then
@@ -22762,7 +22802,7 @@ pub struct Boxed {
     pub whole: Option<Refusal>,
 }
 
-impl Boxed {
+impl<S> BoxedOf<S> {
     /// The first cause for which a set is wider than the projection: of the whole question,
     /// then of the first refused symbol, then of the first disjunction left out.
     pub fn cause(&self) -> Option<Refusal> {
@@ -22796,8 +22836,91 @@ impl Boxed {
 /// `l01_39_reduced_product::pendants::a_conjunction_gets_one_answer_for_every_naming`,
 /// `l01_39_reduced_product::pendants::a_joined_conjunction_gets_one_answer_for_every_naming`.
 pub fn project_each_boxed(f: &Formula, syms: &[Atom]) -> Boxed {
+    boxed_by(f, syms, project_each, |b| b)
+}
+
+/// [`project_each_boxed`] with each set kept as ranges met with one class ([`Classed`]) where
+/// the exact projection has that form ([`project_each_classed`]), no value listed; a refused
+/// symbol keeps the box stage's bounds with every integer as its class. Each set is the
+/// projection, exact, where it has no cause, as in [`project_each_boxed`]: a set of ranges
+/// alone is the same set there, and a strided one is the set [`Classed::met`] would list.
+///
+/// Complexity tradeoff (PERF-exact-strided-unlisted, DOMAINS-classed-sets): naive version,
+/// [`project_each_boxed`], whose [`project_each`] lists each value of such a set
+/// ([`Classed::met`], O(v) for v values): once the exact projection kept a stride as one class,
+/// `i mod 10 == 3` over `[0, 10^9]` came back exact and 10^8 values were listed, and
+/// `l01_25_preimage_catalog::entries::euclidean_division_and_remainder_by_a_constant_invert_exactly`
+/// ran past its 20 s limit (every gdb sample in `Classed::met`, 2026-11-23). The first fix,
+/// option (a) of PERF-exact-strided-unlisted (3480ade74), listed values while they fit in the
+/// size of `f` and gave the ranges alone past it, a sound box but not exact, which left two
+/// tests of `l01_25_preimage_catalog::s22` red. Used: the class kept, O(p) for the p ranges of
+/// the answer past the projection's own cost, whatever the number of values, and exact; no size
+/// refuses anything. Tests: `l01_38_presburger::strided::a_boxed_class_keeps_its_class_unlisted`
+/// and `l01_38_presburger::bench::strided::a_boxed_class_is_not_listed_scales`.
+pub fn project_each_boxed_classed(f: &Formula, syms: &[Atom]) -> BoxedOf<Classed> {
+    boxed_by(
+        f,
+        syms,
+        |g, s| project_each_classed(g, s).map(|e| (e.sets, e.causes)),
+        Classed::plain,
+    )
+}
+
+/// The integers a reduced product's interval domain is met with for `set`, a set of
+/// [`project_each_boxed_classed`], and the class its congruence domain is met with, if any:
+/// `set` listed ([`Classed::met`]) and no class where it has a class other than every integer
+/// and its values, at the `meter::LISTED` and `meter::PIECE` units a value the cover charged
+/// for listing one before the classes were kept (23 a value, so about 134,800 values at the
+/// default limit), fit within the cover's work limit (`meter::EXACT_LIMIT`, or the limit a
+/// test set); else its ranges and its class (none for every integer). Each holds every value
+/// of `set`, so each meet is sound, and the listed set alone, or the ranges with the class,
+/// hold exactly `set` (Lemma E of zedc-preimage `Scope::project_part`). A listed set leaves the
+/// congruence as it was, as before the classes were kept: the listed integers hold the set
+/// already, and a class met as well would change what the domains record and print (`2 mod 3`
+/// beside `[-1..=-1, 2..=2, 5..=5]`,
+/// `l01_39_scope_relations::families::audit_seed_4_keeps_its_exact_sets_with_the_cover`) and
+/// how the pendants route frames the name (`D-3` of
+/// `l01_39_reduced_product::pendants::the_parts_of_the_review_are_projected_exactly_by_pendants`).
+///
+/// Complexity tradeoff (DOMAINS-classed-sets): naive version, the ranges alone for every
+/// class, O(p) for p ranges: the interval domain then lost the holes of a small class,
+/// `{0, 10}` read as `[0, 10]`, which `l01_39_scope_relations` (`holes`, `lazy`, `linked`,
+/// `families`) and `l01_39_reduced_product` (`let_terms`, `follow`, `pendants`) read from the
+/// integers alone, and which the checker's messages print. The other naive version, every
+/// class listed, O(v) for v values, is what `project_each_boxed` gave, and lists 10^8 values
+/// for `i mod 10 == 3` over `[0, 10^9]` (the memory exhaustion of
+/// `l01_25_preimage_catalog::entries`, 2026-11-23). Used: listed at the rate and within the
+/// limit at which the cover listed each value before the classes were kept
+/// (PERF-exact-strided-unlisted), so every set the cover gave listed before is listed the same
+/// way here, at the same O(v) cost and bounded by the same limit. The cover's limit was one
+/// total for the call; this one is a set's own, so a set the cover listed (its share of that
+/// total within the limit) is listed here too, and a call lists at most the limit's values for
+/// each name it projects onto, a number the formula fixes. Past it, where the cover was
+/// refused before and the domain kept the box stage's bounds, the ranges and the class, O(p).
+/// No input is refused by this choice; it changes only the form, never the set the domains
+/// hold together.
+pub fn listed_within_limit(
+    set: &Classed,
+) -> (IntervalSet, Option<zedc_lattice::lattice::Congruence>) {
+    let limit = meter::EXACT_LIMIT_SET.get().unwrap_or(meter::EXACT_LIMIT);
+    let rate = meter::LISTED + meter::PIECE;
+    match set.strided() {
+        None => (set.ranges.clone(), None),
+        Some(_) if set.count().saturating_mul(rate) <= limit => (set.met(), None),
+        Some(_) => (set.ranges.clone(), Some(set.class.clone())),
+    }
+}
+
+/// [`project_each_boxed`] with the projections asked of `ask`, a refused symbol's box stage
+/// bounds made a set of `S` by `lift`.
+fn boxed_by<S>(
+    f: &Formula,
+    syms: &[Atom],
+    ask: impl FnOnce(&Formula, &[Atom]) -> Result<(Vec<Result<S, Refusal>>, Vec<Refusal>), Refusal>,
+    lift: impl Fn(IntervalSet) -> S,
+) -> BoxedOf<S> {
     let lean = without_box_true_disjunctions(f);
-    let (each, skipped, whole) = match project_each(lean.as_ref().unwrap_or(f), syms) {
+    let (each, skipped, whole) = match ask(lean.as_ref().unwrap_or(f), syms) {
         Ok((each, skipped)) => (each, skipped, None),
         Err(e) => (
             syms.iter().map(|_| Err(e.clone())).collect(),
@@ -22811,11 +22934,11 @@ pub fn project_each_boxed(f: &Formula, syms: &[Atom]) -> Boxed {
             Ok(s) => (s, None),
             Err(e) => {
                 let b = boxed.get_or_insert_with(|| row_box(f, syms));
-                (b[k].clone(), Some(e))
+                (lift(b[k].clone()), Some(e))
             }
         })
         .collect();
-    Boxed {
+    BoxedOf {
         each,
         skipped,
         whole,
@@ -23267,6 +23390,9 @@ struct Disjunct {
     d: Rc<Parts>,
     roots: Vec<usize>,
     ks: Vec<usize>,
+    /// The symbols it was offered before those its disjunction's hulls already cover were
+    /// dropped from `ks`: the next disjunct is offered these.
+    wanted: Vec<usize>,
     sub: Vec<Atom>,
     pre: Option<Result<Option<Parts>, Refusal>>,
 }
@@ -23806,6 +23932,48 @@ impl Level {
             None if self.tree_handled[j] => Vec::new(),
             None => self.g.touched(atoms, &roots),
         };
+        // Complexity tradeoff (PERF-pendants-dnf-hull-sides): naive version, each disjunct asked
+        // for every symbol it touches, two hull sides a symbol: 1098 sides for one
+        // `project_each_boxed` of seed 393 case 13 of `l01_39_reduced_product::pendants`, most
+        // for symbols whose hull the disjuncts read before had already covered. Used: a symbol
+        // `k` is not asked of this disjunct where the union `u` of the hulls the disjunction's
+        // satisfiable disjuncts gave it so far holds the level's hull `o` of `k`, both ends of
+        // `o` finite, and the disjunct has no disjunctions of its own or the level has one
+        // disjunction: 840 sides there, the same answer. The answer is unchanged, step by step:
+        // (1) [`Level::close_disjunction`] sets `o` to `o ∩ U`, `U` the union over all the
+        // satisfiable disjuncts, when every one of them gave `k` a hull; `U ⊇ u ⊇ o`, so that
+        // meet is `o`, and where some disjunct gave none (not asked, refused, or not touching
+        // `k`) the meet is skipped and `o` stays: `o` either way. (2) A refusal of the disjunct
+        // as a whole is still found, since it is still asked whether it has a point (with no
+        // symbol, as [`ask_disjunct`] asks), and `sat` counts it as before. (3) The hulls a
+        // disjunct gives are read again only by `seen`: by [`summarize`], only for a disjunct
+        // with disjunctions, and as `open` candidates of [`Level::close`], only for an infinite
+        // end of a hull, while `o` has none and only narrows from here; with one disjunction
+        // `seen` is not kept. (4) The next disjunct is offered the symbols before this drop
+        // (`Disjunct::wanted`), so one with disjunctions is still asked for `k`. What changes is
+        // only `skipped`: the causes of a refusal of `k` by this disjunct, which no longer
+        // happens, are not reported. Cost: one `is_subset` of two interval sets for each
+        // symbol, linear in their pieces. Not done: asking only the side of `k` where `u` falls
+        // short of `o` (the other side is not needed), which needs the sides passed down to the
+        // level below; row PERF-pendants-dnf-hull-one-side. Tests:
+        // `l01_39_reduced_product::pendants::seed_393_case_13_asks_fewer_hull_sides` and the
+        // benchmark `pendants::bench::hull_sides_of_a_disjunction_grow_linearly_in_its_disjuncts`.
+        let wanted = ks.clone();
+        let ks: Vec<usize> = if self.ors.len() == 1 || d.ors.is_empty() {
+            let (acc, out) = (&reading.acc, &self.out);
+            ks.into_iter()
+                .filter(|k| {
+                    !matches!(
+                        (acc.get(k), &out[*k]),
+                        (Some((Some(u), _)), Ok(o))
+                            if matches!(o.bounds(), Some((End::Fin(_), End::Fin(_))))
+                                && o.is_subset(u)
+                    )
+                })
+                .collect()
+        } else {
+            ks
+        };
         let sub: Vec<Atom> = ks.iter().map(|&k| self.g.syms[k].clone()).collect();
         // A disjunct asked for no symbol is only asked whether it has a point, as [`decide`]
         // asks it; with `sets` it was asked above.
@@ -23824,6 +23992,7 @@ impl Level {
             d,
             roots,
             ks,
+            wanted,
             sub,
             pre,
         };
@@ -23953,7 +24122,7 @@ impl Level {
             reading.found_here.push((r.d, kept));
         }
         if !self.sets {
-            reading.wanted = Some(r.ks);
+            reading.wanted = Some(r.wanted);
         }
     }
 
@@ -35438,8 +35607,20 @@ mod r6_unary_queue_tests {
         }
     }
 
-    #[test]
-    fn unary_queue_scales() {
+    /// A benchmark, by its path (`bench::`): tools/run_tests.sh runs it alone, `--exact`, so
+    /// its meter counts instructions; among the tests of a correctness piece, 8 at a time, the
+    /// meter measures processor time, which other tests' load moves (BENCH-merge-check-processor-
+    /// time: it failed there at 8 threads).
+    mod bench {
+        use super::*;
+
+        #[test]
+        fn unary_queue_scales() {
+            unary_queue_scaling();
+        }
+    }
+
+    fn unary_queue_scaling() {
         let red = std::env::var_os("PDCX_RED").is_some();
         let (mut counts, mut unit) = (Vec::new(), "");
         for n in [64, 512, 4096] {

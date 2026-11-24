@@ -11,7 +11,7 @@ use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 
 use crate::check::*;
-use zedc_base::rejection::{Row, not_yet};
+use zedc_base::rejection::Row;
 use zedc_syntax::ast::{Blocks, RemapLevel, Target};
 
 /// The step `[k]` of a bracket holding the int literal `k`, or `None` for any other bracket.
@@ -65,14 +65,15 @@ struct Layout {
 }
 
 impl Layout {
-    /// The plan with this layout and `witness`.
-    fn plan(&self, witness: Arc<str>) -> RemapPlan {
+    /// The plan with this layout, `witness` and `boxed` ([`RemapPlan::boxed`]).
+    fn plan(&self, witness: Arc<str>, boxed: bool) -> RemapPlan {
         RemapPlan {
             order: self.kept.iter().chain(&self.folded).copied().collect(),
             kept: self.kept.len(),
             folds: self.folds.clone(),
             leaf: (!self.truncate).then_some(self.last),
             witness,
+            boxed,
         }
     }
 }
@@ -269,19 +270,30 @@ impl<'t, 'a> Ck<'t, 'a> {
             out.push(Ty::union_all(keys));
             cur = Ty::union_all(&next);
         }
-        if cur.fns.iter().any(|g| g.data) {
-            // Plan row REMAP-fewer-binders: binding a whole inner family as the value needs a
-            // reindex over keypaths that stop above the leaves.
-            self.error(
-                s.e.span,
-                not_yet(&format!(
-                    "a remap whose `as` pattern names {n} key levels of a source with more"
-                )),
-            );
-            return None;
-        }
+        // A value that may be a family, the pattern naming fewer key levels than the source
+        // has, binds the whole inner family ([`RemapPlan::boxed`], set by `remap_end`).
         out.push(cur);
         Some(out)
+    }
+
+    /// Whether a value of type `t` may be a family at run time: `t` holds a family, or the
+    /// unknown type, or a class not yet resolved, each class followed as [`Self::remap_level`]
+    /// follows it. A remap's value binder or `group`'s function given such a value takes it
+    /// whole, so the `reindex`, which walks to the leaves, takes each such entry held in a
+    /// tuple of one ([`RemapPlan::boxed`], [`Info::boxed_groups`]). Boxing a value that is no
+    /// family changes nothing it gives, so "may" errs only toward the cost of the boxing pass.
+    /// Before plan row REMAP-dynamic-deep-binder only a family in `t` counted, so a source of the
+    /// unknown type walked to the leaves, and a run-time value deeper than the pattern would
+    /// give the binder a leaf in place of a row, a wrong value with no error. No program was
+    /// found that reaches this (2026-11-23, about 30 programs run on origin/main 7eb8e9291):
+    /// the routes to the unknown, the wildcard type `_`, `match` on an atom's payload and
+    /// recursion, are each refused as a later step, and a generic function's parameter, a
+    /// lambda checked alone (`callee_want`) and a tuple read at a computed index each reach the
+    /// remap at a known type. The check is kept for when one of those routes opens.
+    // Complexity: one `remap_level`, O(the classes reached + the size of their types).
+    pub(in crate::check) fn may_be_family(&self, t: &Ty) -> bool {
+        let t = self.remap_level(t).0;
+        t.dynamic || !t.vars.is_empty() || t.fns.iter().any(|g| g.data)
     }
 
     /// `t`, one level of a remap's source, with each variable at its outer level replaced by
@@ -790,10 +802,15 @@ impl<'t, 'a> Ck<'t, 'a> {
     /// the remap at any source type finds the same ones.
     pub(in crate::check) fn remap_text_plan(&mut self, s: &RemapF<'a>) -> Option<RemapPlan> {
         let l = self.remap_layout(s)?;
-        Some(l.plan(match l.truncate {
-            true => "residue".into(),
-            false => "".into(),
-        }))
+        // Not boxed: each check at a source type then marks the plan boxed if its value binder
+        // may take a family there ([`add_witness`] in walk.rs keeps any check's mark).
+        Some(l.plan(
+            match l.truncate {
+                true => "residue".into(),
+                false => "".into(),
+            },
+            false,
+        ))
     }
 
     /// The layout of the remap `s`'s `into` pattern, or its errors given.
@@ -895,7 +912,9 @@ impl<'t, 'a> Ck<'t, 'a> {
         for &j in outer.iter().rev() {
             inner = family(ty(j), inner);
         }
-        self.info.remaps.insert(s.e.span, l.plan(witness));
+        let value = src.last().expect("the source's value type");
+        let boxed = self.may_be_family(value);
+        self.info.remaps.insert(s.e.span, l.plan(witness, boxed));
         Some(inner)
     }
 
@@ -1340,6 +1359,9 @@ impl<'t, 'a> Ck<'t, 'a> {
     // Complexity tradeoff: the type is built from the union of the family's arrows, O(arrows),
     // as `map` does; the outer level's guarantee, the classes `f(m[k])` known statically, is
     // not computed (empty), which the bound table allows ("else empty").
+    // `call` is not `span`: in `meet` the need's span is where the class's type flowed in, so
+    // it is `None` there ([`Info::boxed_groups`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn group_end(
         &mut self,
         x: &Ty,
@@ -1347,6 +1369,7 @@ impl<'t, 'a> Ck<'t, 'a> {
         f: Arg<'a>,
         span: Span,
         rekey: bool,
+        call: Option<Span>,
         (apply, need): (Apply<'t, 'a>, NeedFn<'t, 'a>),
     ) -> Ty {
         let word = if rekey { "rekey" } else { "group" };
@@ -1378,6 +1401,8 @@ impl<'t, 'a> Ck<'t, 'a> {
             return Ty::empty();
         }
         if x.dynamic && x.fns.is_empty() {
+            // Its entries may be families: `f` takes each whole (`Info::boxed_groups`).
+            self.info.boxed_groups.extend(call);
             return Ty::dynamic();
         }
         // A function not yet known, as a parameter `f` of `h(f) = [1, 2].group(f)` whose type
@@ -1431,15 +1456,16 @@ impl<'t, 'a> Ck<'t, 'a> {
             .map(|g| super::super::family_values(g))
             .collect();
         let values = Ty::union_all(&each);
-        if values.fns.iter().any(|g| g.data) {
-            // Plan row GROUP-nested: the kernel's reindex walks leaves, and `f` takes the whole
-            // inner family `m[k]`; that needs a reindex over keypaths that stop above the
-            // leaves, as REMAP-fewer-binders does.
-            self.error(
-                span,
-                not_yet("`group` on a family whose entries are families"),
-            );
-            return Ty::empty();
+        // An entry that may be a family is given to `f` whole, `m[k]` of `m.group(r -> r ><
+        // (+))`, and kept whole in its group (plan row GROUP-nested): the `reindex`, which
+        // walks to the leaves, takes `x` with each entry held in a tuple of one, as a remap
+        // whose value binder takes a row does (REMAP-fewer-binders, `Elab::boxed_at`). Every
+        // check of the call adds to the set and none removes from it, a trial's too: the call
+        // elaborates to one term, and boxing an entry that is no family changes nothing it
+        // gives, only the cost of one pass over the entries. Where `x` flowed into a class
+        // (`call` is `None`), the call was boxed when the class took it as a need.
+        if self.may_be_family(&values) {
+            self.info.boxed_groups.extend(call);
         }
         let given = "the function given to `group`";
         let w = match (fsig, f_class) {
