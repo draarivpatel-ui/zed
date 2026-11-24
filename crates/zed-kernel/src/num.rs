@@ -3368,7 +3368,7 @@ impl Rat {
                 return Ok(sign);
             }
             return match Rat::ten_pair(self, other) {
-                Tens::Binary(a, b) => a.order(&b, check),
+                Tens::Binary(p) => p.0.order(&p.1, check),
                 Tens::Apart(o) => Ok(match self.is_negative() {
                     true => o.reverse(),
                     false => o,
@@ -3489,8 +3489,8 @@ impl Rat {
         let (ra, rb) = (a.rest(), b.rest());
         if let Some(k) = d.to_i64() {
             return match k >= 0 {
-                true => Tens::Binary(ra.times_ten(&BigInt::from(k)), rb),
-                false => Tens::Binary(ra, rb.times_ten(&-BigInt::from(k))),
+                true => Tens::Binary(Box::new((ra.times_ten(&BigInt::from(k)), rb))),
+                false => Tens::Binary(Box::new((ra, rb.times_ten(&-BigInt::from(k))))),
             };
         }
         match ra.log2_span() + rb.log2_span() < BigInt::from(i64::MAX) {
@@ -3505,8 +3505,10 @@ impl Rat {
 
 /// How [`Rat::ten_pair`] compares two numbers, at least one holding a [`Ten`].
 enum Tens {
-    /// The two with their common power of ten divided out, in binary.
-    Binary(Rat, Rat),
+    /// The two with their common power of ten divided out, in binary. Boxed since the wide
+    /// atoms of KEPT-power-form made a `Rat` about 100 bytes (clippy's `large_enum_variant`):
+    /// one allocation of the pair, beside the two built rests it holds.
+    Binary(Box<(Rat, Rat)>),
     /// Their magnitudes differ, in this order, by more than any form of their rests spans.
     Apart(Ordering),
     /// Neither applies: compare the binary forms.
@@ -3525,7 +3527,7 @@ impl PartialEq for Rat {
                 return false;
             }
             return match Rat::ten_pair(self, other) {
-                Tens::Binary(a, b) => a == b,
+                Tens::Binary(p) => p.0 == p.1,
                 Tens::Apart(_) => false,
                 Tens::Convert => self.bin() == other.bin(),
             };
