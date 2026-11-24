@@ -1683,9 +1683,15 @@ fn split(
             Formula::Con(ref c) => rows.push(c.clone()),
             Formula::And(_) => flat.extend(f.into_parts().expect("a conjunction")),
             Formula::Or(ref gs) if gs.is_empty() => return None,
-            // A call node is kept whole beside the disjunctions; `map_cons` below writes its
-            // clauses where a binding is put into them (LOAD-call-disj-spread).
-            Formula::Or(_) | Formula::Holes(_) => ors.push(f),
+            Formula::Or(_) => ors.push(f),
+            // A call node is read as its clauses, the generic route (META3 H7): kept whole, it
+            // went to the groups below as a disjunction, and a group whose one disjunction it
+            // was split into its parts, of which it has none, so the group read as `false`
+            // (wildcard-arm audit, b22-load10 step 0; test
+            // `tests::a_group_whose_one_disjunction_is_a_call_node_keeps_its_points`). O(runs)
+            // once a node (`BoundHoles::lowered`, through `Formula::opened`, which the imports
+            // tool reads by its one name).
+            Formula::Holes(_) => flat.push(f.opened().clone()),
             Formula::Not(_) => flat.push(nnf(&f, true)),
         }
     }
@@ -6284,6 +6290,22 @@ mod tests {
             .collect();
         assert!(f.holds(&m));
         assert!(g.holds(&m), "the shared remainder was set to zero: {g:?}");
+    }
+
+    /// `x >= 0 && outside({0..3}, x)` projected onto no atom holds (`x == 4`). A group whose one
+    /// disjunction was a call node was split into the node's parts, of which it has none, so
+    /// the group read as a disjunction of no disjuncts, `false` (wildcard-arm audit, b22-load10
+    /// step 0).
+    #[test]
+    fn a_group_whose_one_disjunction_is_a_call_node_keeps_its_points() {
+        let set = super::super::HoleSet::of(vec![(Int::from(0), Int::from(3))]);
+        let items = vec![
+            Formula::Con(con(&[(0, 1)], 0, Rel::Ge)),
+            Formula::outside(&set, Lin::atom(a(0))),
+        ];
+        let (mut keep, mut inside) = (HashSet::new(), HashSet::new());
+        let f = project(items, &mut keep, &mut inside);
+        assert!(f.holds(&Model::new()), "{f:?}");
     }
 
     /// `k1 * a1 + k2 * a2 + ... + c` related to 0 by `rel`.
