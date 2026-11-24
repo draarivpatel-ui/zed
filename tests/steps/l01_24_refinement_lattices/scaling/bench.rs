@@ -196,6 +196,37 @@ fn interval_set_operations_scale() {
     );
 }
 
+/// A set grown at its front by p joins of a one-piece set wholly below it, every other one
+/// touching its first piece (PERF-ref-abs-gap-under-9, zedc-lattice `below_then`): each join
+/// is one `O(log p)` path, so the p of them cost `O(p log p)` (`union` has the same bound with
+/// four splits a level). Measured on hm2 (2026-11-23): 9.782 in instructions (809,655,109 at
+/// 40,000 joins, 7,919,672,499 at 320,000), the same before and after the merge of 27f390c2f.
+///
+/// The prediction for c·n·ln n work, 8 ln(8n) / ln n = 8 · 12.676 / 10.597 = 9.570 at
+/// n = 40,000, is below that, because the work here is not c·n·ln n: join i is made on a set
+/// of p_i = i / 2 pieces, so it costs c·ln(i / 2) + b, and the n joins cost
+/// c·ln(n! / 2^n) + b·n = c·n·(ln n − 1 − ln 2) + b·n by Stirling's formula (up to O(ln n)).
+/// The `− n(1 + ln 2)` term, absent from the plain prediction, raises the ratio at 8n: with
+/// b = 0 it is 8 (ln 8n − 1 − ln 2) / (ln n − 1 − ln 2) = 8 · 10.983 / 8.904 = 9.868, and any
+/// b > 0 lowers it toward 8. The measured 9.782 lies between, and the two sizes give
+/// c = (24,749 − 20,241) / (10.983 − 8.904) = 2,168 and b = 20,241 − 2,168 · 8.904 = 941
+/// instructions per join, both positive (inferred from two sizes, so a fit, not a check).
+/// A ratio under 9 at these sizes needs joins at the front in O(1), not O(log p): a structure
+/// with worst-case O(1) end operations under persistence, the open question of
+/// PERF-ref-abs-gap-under-9. Under the limit 10.5 (COMPLEXITY.md, row INTERVAL-joins-below).
+#[test]
+fn joins_below_a_set_scale() {
+    scaling::check_order(
+        "p joins of a piece below a set of p pieces",
+        40_000,
+        1,
+        |n| {
+            let grown = joins_below(n);
+            assert_eq!(grown.len(), n.div_ceil(2) + 1);
+        },
+    );
+}
+
 #[test]
 fn bounds_on_many_symbols_scale() {
     use zedc::store::lattice::Lattice;

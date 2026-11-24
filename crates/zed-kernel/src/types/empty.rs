@@ -199,6 +199,15 @@ type ForkSave = (Vec<usize>, Vec<(usize, Refusal)>);
 
 thread_local! {
     static MEMO: RefCell<ByType<bool>> = const { RefCell::new(ByType::new()) };
+    /// How many times on this thread [`Searching::rep`] built a type again at once because a
+    /// type its failed build read as missing got a value before that build ended (its `again`
+    /// branch). Read by tests through [`Type::rebuilds_at_once`], so that they show their
+    /// systems reach the branch (REP-retry-again-test); no test reached it before.
+    static REBUILDS_AT_ONCE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many builds [`Searching::rep`] started on this thread, one for each type it sought
+    /// a value for with no kept answer. Read by tests through [`Type::rep_builds`], which count
+    /// the work a search does where its verdicts cannot show a change (REP-retry-again-test).
+    static REP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// For each member of a group decided by [`group_emptiness`]: `Some(b)`, whether the
     /// group's own search proved it empty, when no fork or split refused that search; `None`
     /// when one did. A function of the group alone, so of the member (proof at
@@ -1514,6 +1523,19 @@ impl Type {
     #[doc(hidden)]
     pub fn escape_cell_counts(&self) -> (usize, usize) {
         escape::cell_counts(self)
+    }
+
+    /// For tests: how many times a search on this thread built a type again at once because a
+    /// type it read as missing got a value during its build (`Searching::rep`).
+    #[doc(hidden)]
+    pub fn rebuilds_at_once() -> usize {
+        REBUILDS_AT_ONCE.with(|c| c.get())
+    }
+
+    /// For tests: how many builds of a value a search on this thread started (`Searching::rep`).
+    #[doc(hidden)]
+    pub fn rep_builds() -> usize {
+        REP_BUILDS.with(|c| c.get())
     }
 
     /// The prefix-chain sweep's verdict alone, for tests against an independent oracle.
@@ -4796,7 +4818,8 @@ impl Heights {
     // (`distinct_atoms`, a table of all rows) made a rule of copied components and a heap entry:
     // 395M instructions of `least_height_node` at `fork_by` 512 against 18.4M at 64, 21 times
     // for 8 times the size, as the parts read there hold 141,822 rows in all against 3,390 at
-    // 64 (about n parts of n / 2 + 1 rows, a list type's payload for each class of the fork).
+    // 64 (about n parts of n / 2 + 1 rows, one for each presentation of a renamed component
+    // type in `Searching::region`, before its cells were filed by the name-free digest).
     #[cfg(test)]
     fn least_height(&mut self, t: &Type) -> u64 {
         self.least_height_node(&HeightNode::Type(t.clone()))
@@ -6667,16 +6690,34 @@ impl<'m> Searching<'m> {
         for j in 0..n {
             // Tied types share a hash, so the types of one hash are kept in their order
             // (`TiedMap`, PERF-row-hash-tied-digest).
-            let mut found: TiedMap<&Type, usize> = TiedMap::default();
+            // Complexity tradeoff (PERF-refusals-old-size): the types of a component are filed
+            // by the name-free digest and compared under [`blind`], so renamed copies of one
+            // type are one cell, tested once, as the search's [`Ids`] decides them once. Why
+            // it is exact: a cell's tests (`retest`, `narrow_tuples`) ask whether the box meets
+            // or holds the cell's type, a question of its values alone, and two types equal
+            // under `blind` differ only in definition names, which no rule of the search reads
+            // (`Ids`), so they have the same values and the same answers. Naive version: a cell
+            // per presentation, so `n / 2` renamed copies `P_k` against a box `⋃ P_j` of
+            // `n / 2` rows built `n / 2` differences `⋃ P_j - P_k` of `n / 2` rows each, order
+            // `n^2` (`fork_by` 512 read 141,822 rows in the heights walk, 3,390 at 64; filed by
+            // digest, 2,576 and 336, and the verdict 8.28 times the instructions from 1024 to
+            // 8192, test
+            // `refusals::bench::pairs_less_many_excluded_pairs_are_decided_in_their_size`
+            // of `l01_23_groups_and_refusals`, 33.93 times before). Given
+            // up: copies of one name-free digest are compared in full under `blind`, linear in
+            // their size, once per row.
+            let mut found: TiedMap<Type, usize, NameFree> = TiedMap::default();
             for (k, a) in atoms.iter().enumerate() {
                 let cells = &mut g.cells[j];
-                let c = *found.get_or_insert_with(&a[j], || {
-                    cells.push(Cell {
-                        ty: a[j].clone(),
-                        rows: Vec::new(),
-                        open: true,
-                    });
-                    cells.len() - 1
+                let c = *blind(|| {
+                    found.get_or_insert_with(a[j].clone(), || {
+                        cells.push(Cell {
+                            ty: a[j].clone(),
+                            rows: Vec::new(),
+                            open: true,
+                        });
+                        cells.len() - 1
+                    })
                 });
                 cells[c].rows.push(k);
                 g.cell_of[k * n + j] = c;
@@ -11221,6 +11262,7 @@ impl<'m> Searching<'m> {
         let t = t.clone();
         self.stack.call(move || async move {
             let (mark, resting, outer) = {
+                REP_BUILDS.with(|c| c.set(c.get() + 1));
                 let mut s = self.s();
                 s.reps.insert(t.clone(), None);
                 s.past_failures.remove(&t);
@@ -11314,7 +11356,17 @@ impl<'m> Searching<'m> {
                 }
             };
             match again {
-                Some(true) => return self.rep(&t).await,
+                // The build again gives a value in every case the tests reach (1,000 of 1,000
+                // on hm2, 2026-11-23); returning the failure instead gives the same verdicts and
+                // witnesses there, since `t`'s entry is gone and a later read builds it again,
+                // but costs more builds: 3,358 against 3,018 for each undecided system with
+                // `X = (W) | (C)` in the test
+                // `group_oracle::failed_builds_read_through_a_second_type_are_built_again_at_once`,
+                // which counts them (REP-retry-again-test).
+                Some(true) => {
+                    REBUILDS_AT_ONCE.with(|c| c.set(c.get() + 1));
+                    return self.rep(&t).await;
+                }
                 Some(false) => return r,
                 None => {}
             }

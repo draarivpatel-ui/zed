@@ -4345,9 +4345,11 @@ pub struct Sig {
     /// `a ..= b` whose two ends the checker's read of the text fixes, as `0 ..< 3`, and what
     /// `++` and `zip` make of such families. `None` where its arrows and [`Sig::dense`] say all
     /// that is known of its keys. The empty family is `int[0..=-1]`, so that equal key sets are
-    /// equal values. Its arrows stay `int ->? V` and print so, since no type text the parser
-    /// takes in that place says the keys are an interval (DESIGN.md sec:type_language, the
-    /// `m[k]` row, `lst : int[a..<b]`); `zip` and `++` read these keys as they read the listed
+    /// equal values. Its arrows stay `int ->? V`, and it prints as `int[a..=b] -> V`
+    /// (`Sig::exact_keys`, row RANGE-keys-in-printed-type; DESIGN.md sec:type_language: `[T]`
+    /// is `int[0..<n] -> T`), which the reader of printed types takes back to the same keys
+    /// and arrow (until that row it printed `int ->? V`, and the keys were lost on reading
+    /// back); `zip` and `++` read these keys as they read the listed
     /// keys of an array display. A family with keys fits where one with the same keys or with
     /// none is wanted, and not where other keys are ([`fits_sig`]).
     ///
@@ -11839,15 +11841,36 @@ impl<'m, 's> Comparing<'m, 's> {
     /// this costs a second entry for each answer true, O(1) to make (a persistent map is
     /// copied by its root).
     fn keep(&self, key: Compared, ok: bool, b: &Binds) {
-        // Assumption, not proved (ASSUME-documented): the comparison `key` met again under `b`, the
-        // binding its true answer gave, gives `(true, b)` again, so the second entry may be read
-        // with no comparison. The argument in the doc above covers pieces bound through `accepts`
-        // at `Site::In`. It is not shown for the `Site::Other` fallback, which binds the first
-        // bindable variable without calling `admits`, so under `b` that variable may hold a piece
-        // its bound or ceiling would refuse. Evidence:
+        // Claim (ASSUME-documented; proved, given (F2) at `accepts` and the claim at
+        // `Cx::compared` that the key holds every input the comparison reads): the comparison
+        // `key` met again under `b`, the binding its true answer gave, gives `(true, b)` again,
+        // so the second entry may be read with no comparison. If false, a recalled `true` stands
+        // where the comparison would give false: unsound.
+        // Proof. The doc above covers pieces bound through `accepts` at `Site::In`. For the
+        // `Site::Other` fallback, which binds the first bindable variable without `admits`
+        // (row PROOF-sweep-zedc-types, b22-small11, 2026-11-23):
+        // (1) `admits(w)` (in `accepts`) never turns a refusal into an admit as `w`'s binding
+        //     grows. Its ceiling test reads `p` and the ceiling only. With `w` bound to
+        //     nothing it tests `piece_within(p, m)`, or `mw & !m == 0` for `p = Var(x)` with a
+        //     mask `mw`; bound to something that is not one variable with a mask, it tests
+        //     `piece_within(p, m)`, and refuses every `Var(x)` with a mask ((F1) at `accepts`:
+        //     no carrier); bound to one variable `x0` with a mask, it admits only `Var(x0)`
+        //     (`mask_carrier` is `None` by (F1)). Each test past the empty binding admits a
+        //     subset of what the empty one admits, and the bound and ceiling are part of `b`.
+        // (2) The first comparison reached the fallback at a binding within `b` ((F2): bindings
+        //     only grow), where no variable of `t` admitted `p`; by (1), none admits it under
+        //     `b`, whose binding of each variable holds that one.
+        // (3) So the fallback runs again on the same `t.vars` (the same node) and the same
+        //     bindable set, and picks the same first variable `v`, which `b` already binds to
+        //     a type holding `p`; `Binds::unite` of a piece already held is the same type
+        //     (`Ty::union` drops a piece it holds), so `b` comes back unchanged. Dropping the
+        //     search's pins there (`search.bound`) changes no binding. By induction over the
+        //     pieces in their order, every choice repeats and the answer is `(true, b)`.
+        // What this rests on: the bindable set reads `cx.bind_none` (in the key, `as_is`),
+        // `cx.rigid` and `cx.fns`, which the key does not hold; that they are the same where
+        // the entry is read is the claim at `Cx::compared`. Evidence:
         // `deep_ops::shared_payloads_with_a_variable_a_level_bind_each_once` (n from 1 to 6),
-        // `an_answer_found_after_a_refusal_is_not_read_by_a_later_attempt`, benchmark 8.00x. If
-        // false, a recalled `true` stands where the comparison would give false: unsound.
+        // `an_answer_found_after_a_refusal_is_not_read_by_a_later_attempt`, benchmark 8.00x.
         let mut cx = self.cx.borrow_mut();
         if cx.unchosen.is_none() {
             if ok {
@@ -17191,13 +17214,16 @@ async fn accepts<'m>(
             Piece::Fn(s) => {
                 let index = Rc::clone(search.fns.get_or_insert_with(|| Rc::new(FnIndex::new(t))));
                 let mut ok = false;
-                if let Some(list) = index.list(s) {
+                let lists = index.fit_lists(s);
+                if !lists.is_empty() {
                     let ds = Domains::of(s, &mut Approx::default());
-                    for j in list.tried(&ds, Domains::keyed(s, &ds)) {
-                        let q = &list.fns[j].0;
-                        if c.fits(s.clone(), Env::new(), q.clone(), Env::new()).await {
-                            ok = true;
-                            break;
+                    'lists: for list in lists {
+                        for j in list.tried(&ds, Domains::keyed(s, &ds)) {
+                            let q = &list.fns[j].0;
+                            if c.fits(s.clone(), Env::new(), q.clone(), Env::new()).await {
+                                ok = true;
+                                break 'lists;
+                            }
                         }
                     }
                 }
@@ -17484,10 +17510,11 @@ async fn fits_in<'m>(s: &Sig, se: &Env, q: &Sig, qe: &Env, c: &'m Comparing<'m, 
         return false;
     }
     let same_params = s.params.len() == q.params.len()
-        && s.params
-            .iter()
-            .zip(&q.params)
-            .all(|(a, b)| a.positional == b.positional && (a.positional || a.name == b.name));
+        && (s.one_param_fits(q)
+            || s.params
+                .iter()
+                .zip(&q.params)
+                .all(|(a, b)| a.positional == b.positional && (a.positional || a.name == b.name)));
     if !same_params {
         return false;
     }
@@ -20551,6 +20578,22 @@ impl FnIndex {
     fn list(&self, s: &Sig) -> Option<&FnList> {
         self.lists.get(&s.param_list())
     }
+
+    /// The lists of the functions `s` may fit: its own parameter list's, and for `s` of one
+    /// parameter the list of one parameter of the other kind it fits ([`Sig::one_param_fits`]):
+    /// named as its own parameter for `s` positional, positional for `s` named. At most two
+    /// lookups.
+    fn fit_lists(&self, s: &Sig) -> Vec<&FnList> {
+        let own = s.param_list();
+        let other = match &s.params[..] {
+            [p] if p.positional => Some(vec![(false, Some(p.name.clone()))]),
+            [_] => Some(vec![(true, None)]),
+            _ => None,
+        };
+        (self.lists.get(&own).into_iter())
+            .chain(other.and_then(|k| self.lists.get(&k)))
+            .collect()
+    }
 }
 
 impl FnList {
@@ -23306,6 +23349,26 @@ impl Sig {
             .collect()
     }
 
+    /// Whether it, of one parameter, fits `other`, of one parameter of the other kind: `other`'s
+    /// is positional, or is named as its own is. A function of one parameter takes its argument
+    /// either way, `half(3)` or `half(x: 3)`, so (DESIGN.md sec:values_morphisms) "a function
+    /// with the one parameter `x: T` therefore fits both `(T) -> R` and `(x: T) -> R`, since it
+    /// accepts every call either permits, and not `(y: T) -> R`", with or without `positional`
+    /// in its declaration; and a lambda with no expected type has a positional parameter and
+    /// "its type is `(x: T) -> T`" (sec:diagnostics, row "Function whose parameter kinds do not
+    /// fit the expected function type": a function of one parameter "misfits only by that
+    /// parameter's name, so `xs.map(half)` fits"). So `x -> 1`, passed on through a parameter of
+    /// no written type, fits `(x: int | f64) ->? int` (plan row
+    /// MSG-inner-lambda-unnamed-param-arrow). A type `(int) -> int` names no parameter and
+    /// permits only `f(3)`, so it does not fit `(x: int) -> int`: its parameter's name is no
+    /// written name ([`Self::callable_names`]). The same kind is the general rule's. O(1).
+    pub fn one_param_fits(&self, other: &Sig) -> bool {
+        match (&self.params[..], &other.params[..]) {
+            ([a], [b]) if a.positional != b.positional => b.positional || a.name == b.name,
+            _ => false,
+        }
+    }
+
     /// Whether it has the same parameter names and kinds as `other`.
     pub fn same_kinds(&self, other: &Sig) -> bool {
         self.params.len() == other.params.len()
@@ -24854,6 +24917,9 @@ enum Morphism<'a> {
         key: &'a Ty,
         range: Option<&'a ParamRange>,
         arrow: &'a Arrow,
+        /// The keys exactly ([`Sig::keys`]), where the family has them: then it is written
+        /// `int[a..=b] -> V`, not `int ->? V` (row RANGE-keys-in-printed-type).
+        keys: Option<&'a WrittenRange>,
     },
     /// `L .. U -> V`: the guarantee, the permission and the value type.
     Bounded {
@@ -24868,7 +24934,26 @@ impl<'a> Morphism<'a> {
     /// so that `((int, int)) ->? V` is not read as two parameters.
     fn parts(&self, parts: &mut Vec<Print<'a>>) {
         match *self {
-            Morphism::Partial { key, range, arrow } => {
+            // A family whose keys are exactly the ints `a` through `b` is written with them as
+            // an exact arrow, `int[2..=4] -> V` (DESIGN.md sec:type_language: `[T]` is
+            // `int[0..<n] -> T`, its lookup at a key within the range `T`), which the reader
+            // of printed types takes back to the same family (`read::parse_type` in
+            // zedc-check). Its lookup at a key outside the range misses, as for any family;
+            // the value type is written as after `->?` ([`Sig::value_part`]), since the arrow
+            // within the range answers it with no miss. Two ints of text, O(log(b - a))
+            // digits, not the O(b - a) keys an array display lists (see [`Sig::keys`]).
+            Morphism::Partial {
+                arrow,
+                keys: Some(k),
+                ..
+            } => parts.extend([
+                Print::Text(&k.text),
+                Print::Text(" -> "),
+                Sig::value_part(arrow),
+            ]),
+            Morphism::Partial {
+                key, range, arrow, ..
+            } => {
                 ParamRange::parts(range, key, PrintAt::Key, parts);
                 parts.extend([Print::Text(" ->? "), Sig::value_part(arrow)]);
             }
@@ -25598,8 +25683,25 @@ impl Sig {
                     if several {
                         parts.push(Print::Text("("));
                     }
-                    ParamRange::parts(self.params[0].range.as_ref(), key, PrintAt::Key, parts);
-                    parts.extend(result(a));
+                    // A family with its keys known, of a built signature whose positional
+                    // parameter has a name (`x0`), is written as [`Morphism::Partial`] writes
+                    // one whose parameter has none: `int[2..=4] -> V`.
+                    match self.exact_keys(a).filter(|_| !several) {
+                        Some(k) => parts.extend([
+                            Print::Text(&k.text),
+                            Print::Text(" -> "),
+                            Sig::value_part(a),
+                        ]),
+                        None => {
+                            ParamRange::parts(
+                                self.params[0].range.as_ref(),
+                                key,
+                                PrintAt::Key,
+                                parts,
+                            );
+                            parts.extend(result(a));
+                        }
+                    }
                     if several {
                         parts.push(Print::Text(")"));
                     }
@@ -25649,10 +25751,31 @@ impl Sig {
         let bare = p.positional && p.range.is_none();
         (ranks
             && bare
+            && self.exact_keys(a).is_none()
             && a.partial
             && a.params[0] == Ty::carrier(Carrier::Int)
             && Sig::writes_value(a))
         .then_some(a)
+    }
+
+    /// The keys of the family exactly ([`Sig::keys`]), where it is written with them as
+    /// `int[a..=b] -> V` (row RANGE-keys-in-printed-type): a family whose one arrow `a`, of one
+    /// positional parameter with no range written on it, is the partial `int ->? V`, so that
+    /// the reader of printed types makes the same family of the text. A family of the ranks
+    /// with known keys is written so too, not `[V]`, which says less: `0 ..< 3` is
+    /// `int[0..=2] -> int`. O(1).
+    fn exact_keys(&self, a: &Arrow) -> Option<&WrittenRange> {
+        let [p] = &self.params[..] else {
+            return None;
+        };
+        let k = self.keys.as_ref()?;
+        (self.data
+            && p.positional
+            && p.range.is_none()
+            && a.partial
+            && a.params[..] == [Ty::carrier(Carrier::Int)]
+            && Sig::writes_value(a))
+        .then_some(k)
     }
 
     /// Whether `->?` can write the partial arrow `a`: its lookup holds the `#notFound` of a miss
@@ -25737,6 +25860,7 @@ impl Sig {
                 key: &a.params[0],
                 range: p.range.as_ref(),
                 arrow: a,
+                keys: self.exact_keys(a),
             }),
             [a, b] => {
                 let (lower, upper) = (&a.params[0], &b.params[0]);
