@@ -130,8 +130,9 @@ pub(super) fn a_tangent_chain(n: usize) -> Vec<Formula> {
 fn a_chain_whose_points_move_keeps_few_rows() {
     // The point found for f{i-1} is below the new row, so no point extends, and each f{i} was
     // decided whole, 56.9 times slower at 400 links than at 50 (LOAD-chain-move). Each is now
-    // decided from the rows that bound its region over Q, at most 3 at every link, and each
-    // answer is still the one the whole has. The base rows are `x >= y + 1, y >= 0`.
+    // decided from the integer hull of its rows (design B, META3 H2), the part's hull with one
+    // row added, at most 4 sides at every link (design D11), and each answer is still the one
+    // the whole has. The base rows are `x >= y + 1, y >= 0`.
     let mut e = Extending::new();
     for (i, f) in a_moving_chain(40).iter().enumerate() {
         counts::take();
@@ -145,10 +146,19 @@ fn a_chain_whose_points_move_keeps_few_rows() {
             i + 1
         );
         assert!(
-            c[counts::PLANE_ROWS] <= 3,
-            "link {}: {} rows kept",
+            c[counts::PLANE_ROWS] <= 4,
+            "link {}: {} sides",
             i + 1,
             c[counts::PLANE_ROWS]
+        );
+        assert_eq!(c[counts::HULL_UPDATES], 1, "link {}: one row added", i + 1);
+        // The base, not in the list, is decided in link 1's call and seeds the hull once.
+        let fresh = u64::from(i == 0);
+        assert_eq!(
+            c[counts::PLANE_FRESH],
+            fresh,
+            "link {}: no hull rebuilt",
+            i + 1
         );
         assert_eq!(c[counts::WHOLE], 0, "link {}: nothing decided whole", i + 1);
     }
@@ -156,17 +166,51 @@ fn a_chain_whose_points_move_keeps_few_rows() {
 
 #[test]
 fn a_tangent_chain_keeps_every_row() {
-    // Every row of the tangent chain bounds its region, so every row is kept: n at link n.
+    // Every row of the tangent chain bounds its region, so the integer hull at link n has
+    // n + 3 sides: `y >= 0`, `y >= x`, the n - 1 chords `y >= (2k + 1) x - k (k + 1)`, the
+    // last tangent and `x <= 1000000` (design D11). Each link adds its one row to the part's
+    // hull and asks nothing of the solver (META3 H2).
     let mut e = Extending::new();
     for (i, f) in a_tangent_chain(30).iter().enumerate() {
         counts::take();
         let got = e.answers(f);
         let c = counts::take();
         assert_eq!(got, decided(f), "{f}");
-        if c[counts::PLANE] == 1 {
-            // The tangents so far, `y >= 0` (the tangent at 0) and `x <= 1000000`.
-            assert_eq!(c[counts::PLANE_ROWS], i as u64 + 3, "link {}", i + 1);
-        }
+        assert_eq!(c[counts::HULL_UPDATES], 1, "link {}: one row added", i + 1);
+        assert_eq!(c[counts::PLANE], 1, "link {}: decided from its hull", i + 1);
+        assert_eq!(c[counts::PLANE_ROWS], i as u64 + 4, "link {}", i + 1);
+        assert_eq!(c[counts::WHOLE], 0, "link {}: nothing decided whole", i + 1);
+    }
+}
+
+#[test]
+fn a_translated_quadrant_keeps_its_rays() {
+    // META3 H1, Codex B1: the quadrant `x >= 0, y >= 0` cut by `x >= 5` keeps one vertex,
+    // (5, 0), and two rays, so it is not a Point; a hull read as the Point (5, 0) answers the
+    // next links (`y >= 1`, the point (5, 1)) empty. Each link is answered from the hull
+    // (`counts::PLANE`) and each answer is the one the whole has, both polarities.
+    let (x, y, k) = (sym("x"), sym("y"), Lin::constant);
+    let quadrant = Formula::and(vec![ge(x.clone(), k(0)), ge(y.clone(), k(0))]);
+    let moved = extend(&quadrant, vec![ge(x.clone(), k(5))]);
+    let links = [
+        extend(&moved, vec![ge(y.clone(), k(1))]),
+        extend(&moved, vec![ge(k(5), x.clone())]),
+        extend(
+            &extend(&moved, vec![ge(k(5), x.clone())]),
+            vec![ge(k(3), y.clone())],
+        ),
+        extend(&moved, vec![ge(k(4), x.clone())]),
+        extend(&moved, vec![ge(k(4), x.clone().plus(&y.clone()))]),
+    ];
+    let mut e = Extending::new();
+    assert_eq!(e.answers(&moved), decided(&moved), "{moved}");
+    for f in &links {
+        counts::take();
+        let got = e.answers(f);
+        let c = counts::take();
+        assert_eq!(got, decided(f), "{f}");
+        assert!(c[counts::PLANE] >= 1, "{f}: decided from its hull");
+        assert_eq!(c[counts::WHOLE], 0, "{f}: nothing decided whole");
     }
 }
 
@@ -251,6 +295,214 @@ fn each_region_over_two_symbols_is_decided_as_its_rows() {
     let f2 = extend(&quadrant, vec![ge(k(-1), y.clone())]);
     let f3 = extend(&f1, vec![ge(k(4), x.clone())]);
     for f in [&quadrant, &f1, &f2, &f3, &f1] {
+        assert_eq!(e.answers(f), decided(f), "{f}");
+    }
+}
+
+#[test]
+fn the_step_controls_of_the_integer_hull_are_answered_as_their_rows() {
+    // LOAD-chain-move-tangent, META1 D12 and D13 of XR-load-call-node: the controls of the steps
+    // of design B (/home/luke/Work/wt/design-b22-load5.md), each link's answer checked against
+    // `decide` of the whole. They pass on design A, which decides each link from its rows over
+    // Z; design B must keep them passing, and each names the step whose mutant it catches.
+    let (x, y, k) = (sym("x"), sym("y"), Lin::constant);
+    let and = Formula::and;
+    let box_ = |x0: i64, x1: i64, y0: i64, y1: i64| {
+        and(vec![
+            ge(x.clone(), k(x0)),
+            ge(k(x1), x.clone()),
+            ge(y.clone(), k(y0)),
+            ge(k(y1), y.clone()),
+        ])
+    };
+    let lin = |a: i64, c: i64| x.times(a).plus(&y.times(c));
+    let quadrant = and(vec![ge(x.clone(), k(0)), ge(y.clone(), k(0))]);
+    // `l` times 10^40, past i128.
+    let wide = |l: &Lin| {
+        l.times(1_000_000_000_000_000_000i64)
+            .times(1_000_000_000_000_000_000i64)
+            .times(10_000)
+    };
+    let chains: Vec<(&str, Formula, Vec<Vec<Formula>>)> = vec![
+        // Step 1 (D12): `1 <= 2x - 2y <= 1` has rational points and no integer point; the
+        // tightening alone finds it.
+        (
+            "step 1: 2x - 2y = 1",
+            box_(0, 9, 0, 9),
+            vec![vec![ge(lin(2, -2), k(1))], vec![ge(k(1), lin(2, -2))]],
+        ),
+        // Step 1 (D1): a negative constant, 2x + 4y - 3 >= 0 is x + 2y >= floor(3/2) + 1 = 2
+        // and not x + 2y >= 1 as truncation gives, so beside x + 2y <= 1 it is empty.
+        (
+            "step 1: floor of a negative constant",
+            box_(-5, 5, -5, 5),
+            vec![vec![ge(lin(2, 4), k(3))], vec![ge(k(1), lin(1, 2))]],
+        ),
+        // Constant rows (D1, D13): true, zero, false.
+        (
+            "constant rows",
+            box_(0, 3, 0, 3),
+            vec![
+                vec![ge(k(1), k(0))],
+                vec![ge(k(0), k(0))],
+                vec![ge(k(0), k(1))],
+            ],
+        ),
+        // Step 5 (D12), Gemini: 2x - y <= 1, 2x + y >= 1, y <= 0 meet in (1/2, 0) alone.
+        (
+            "step 5: Gemini",
+            and(vec![ge(k(1), lin(2, -1)), ge(lin(2, 1), k(1))]),
+            vec![vec![ge(k(0), y.clone())]],
+        ),
+        // Step 5 (D12), Claude: 3x + 2y <= -4, 3y >= x - 1, y <= 3x + 4.
+        (
+            "step 5: Claude",
+            and(vec![ge(k(-4), lin(3, 2)), ge(lin(-1, 3), k(-1))]),
+            vec![vec![ge(lin(3, -1), k(-4))]],
+        ),
+        // The corner repair (D12), Codex: the triangle (0,0), (0,1), (2,0) cut by x >= 1 is the
+        // segment [(1,0), (2,0)] (a Line), then 3y >= x leaves it empty (META2 G10, Gemini
+        // Q6.1). Without the repair the hull keeps (1, 1/2), where 3y >= x holds, and answers
+        // that it holds (prototype proto-r3/hull.rs, mutant NoCuts; the last link before,
+        // y >= 1, is empty over Q as well, so it could not tell).
+        (
+            "corner repair",
+            and(vec![
+                ge(x.clone(), k(0)),
+                ge(y.clone(), k(0)),
+                ge(k(2), lin(1, 2)),
+            ]),
+            vec![vec![ge(x.clone(), k(1))], vec![ge(lin(-1, 3), k(0))]],
+        ),
+        // Case 1 with C redundant (D13): [0,1]×[0,2] and 3x + y <= 2.
+        (
+            "case 1, C redundant",
+            box_(0, 1, 0, 2),
+            vec![vec![ge(k(2), lin(3, 1))], vec![ge(x.clone(), k(1))]],
+        ),
+        // Case 2 with C' redundant (D13): 0 <= y <= 1 and 3x - y <= 1, then 2x >= 1, which has
+        // rational points (x in [1/2, 2/3] at y = 1) and no integer point.
+        (
+            "case 2, C' redundant",
+            and(vec![ge(y.clone(), k(0)), ge(k(1), y.clone())]),
+            vec![vec![ge(k(1), lin(3, -1))], vec![ge(lin(2, 0), k(1))]],
+        ),
+        // Codex's case-2 triangle (D5): (-2,0), (-2,1), (1,2) cut by x <= 0, whose section on
+        // x = 0 holds y in [4/3, 5/3] and no integer: case 1 there gives a fractional vertex.
+        // The hull is then (-2,0), (-2,1), (-1,1), and x + y >= 1 leaves it empty (META2 G10,
+        // Gemini Q6.1); a hull that skipped step 5 keeps (-1/2, 3/2), where x + y = 1, and
+        // answers that it holds (prototype proto-r3/hull.rs, mutant NoCuts). The link before,
+        // x >= 0, is empty over Q on that hull as well, so it could not tell.
+        (
+            "case 2 triangle",
+            and(vec![
+                ge(x.clone(), k(-2)),
+                ge(lin(-2, 3), k(4)),
+                ge(lin(1, -3), k(-5)),
+            ]),
+            vec![vec![ge(k(0), x.clone())], vec![ge(lin(1, 1), k(1))]],
+        ),
+        // Unbounded (D3): every vertex cut off and not empty; no vertex cut off and not implied.
+        (
+            "quadrant, x >= 5",
+            quadrant.clone(),
+            vec![vec![ge(x.clone(), k(5))]],
+        ),
+        (
+            "quadrant, x <= 5",
+            quadrant.clone(),
+            vec![vec![ge(k(5), x.clone())]],
+        ),
+        // Ties (D2): rows through a vertex, min f = c (implied, twice), then max f = c (the
+        // point (0,0)).
+        (
+            "ties",
+            box_(0, 3, 0, 3),
+            vec![
+                vec![ge(lin(1, 1), k(0))],
+                vec![ge(k(6), lin(1, 1))],
+                vec![ge(k(0), lin(1, 1))],
+            ],
+        ),
+        // Ties (Gemini N1): a row through two vertices with min f < c < max f elsewhere, and a
+        // quadrant cut to its ray x = 0.
+        (
+            "ties: x + y >= 1 on the unit square",
+            box_(0, 1, 0, 1),
+            vec![vec![ge(lin(1, 1), k(1))]],
+        ),
+        (
+            "quadrant, x <= 0",
+            quadrant.clone(),
+            vec![vec![ge(k(0), x.clone())]],
+        ),
+        // The states of D4: a half-plane, a strip, a ray, a segment, a point, empty.
+        (
+            "states",
+            and(vec![ge(lin(1, 2), k(0)), ge(lin(1, 2), k(-5))]),
+            vec![
+                vec![ge(k(3), lin(1, 2))],
+                vec![ge(lin(1, 2), k(3))],
+                vec![ge(x.clone(), k(1))],
+                vec![ge(k(7), x.clone())],
+                vec![ge(k(1), x.clone())],
+                vec![ge(y.clone(), k(2))],
+            ],
+        ),
+        // A long continued fraction (D13): consecutive Fibonacci coefficients.
+        (
+            "Fibonacci",
+            box_(-1000, 1000, -1000, 1000),
+            vec![
+                vec![ge(lin(89, 144), k(1000))],
+                vec![ge(k(1003), lin(89, 144))],
+                vec![ge(lin(-55, 89), k(1))],
+                vec![ge(k(2), lin(-55, 89))],
+            ],
+        ),
+        // Coefficients past i128 (D13): 10^40 x + (10^40 + 1) y in [1, 10^40].
+        (
+            "past i128",
+            box_(-9, 9, -9, 9),
+            vec![
+                vec![ge(wide(&lin(1, 1)).plus(&y), k(1))],
+                vec![ge(wide(&k(1)), wide(&lin(1, 1)).plus(&y))],
+            ],
+        ),
+    ];
+    for (name, base, links) in chains {
+        let mut e = Extending::new();
+        let mut f = base;
+        assert_eq!(e.answers(&f), decided(&f), "{name}: {f}");
+        for rows in links {
+            f = extend(&f, rows);
+            assert_eq!(e.answers(&f), decided(&f), "{name}: {f}");
+        }
+    }
+    // Persistence (D13, META2 G10): three callers extend one region, the base never asked
+    // itself, so no answer of it is remembered. Each extension holds and they are pairwise
+    // disjoint, so a hull the first one cut in place (x <= 2) would make the next two (3 <= x
+    // <= 4, x >= 5) answer empty; each is compared with the whole decided, and at least two
+    // of them must be decided from the region (`counts::PLANE`), so that the hull is the one
+    // read. Then the first again and the base.
+    let base = extend(&box_(0, 6, 0, 6), vec![ge(k(9), lin(1, 1))]);
+    let mut e = Extending::new();
+    let left = extend(&base, vec![ge(k(2), x.clone())]);
+    let mid = extend(&base, vec![ge(x.clone(), k(3)), ge(k(4), x.clone())]);
+    let right = extend(&base, vec![ge(x.clone(), k(5))]);
+    counts::take();
+    for f in [&left, &mid, &right] {
+        let got = e.answers(f);
+        assert_eq!(got, decided(f), "{f}");
+        assert_eq!(got.holds, Ok(true), "each caller's region holds: {f}");
+    }
+    let c = counts::take();
+    assert!(
+        c[counts::PLANE] >= 2,
+        "{} of the three callers decided from the region",
+        c[counts::PLANE]
+    );
+    for f in [&left, &base] {
         assert_eq!(e.answers(f), decided(f), "{f}");
     }
 }
