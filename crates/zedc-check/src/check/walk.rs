@@ -21213,26 +21213,7 @@ impl<'t, 'a> Ck<'t, 'a> {
                 && let Some(&(_, span)) = self.param_ints.get(id)
             {
                 let name = sig.params[j].name.clone();
-                needs.push(Need {
-                    on: Ty::empty(),
-                    kind: NeedKind::InDomain {
-                        domain: IntDomain {
-                            what: format!("`{name}` is declared {}", r.text).into(),
-                            name,
-                            below_two_pow: None,
-                            written: Some(r),
-                            key: None,
-                        },
-                        param: j,
-                        via: None,
-                        bits: None,
-                        path: PathSteps::default(),
-                    },
-                    result: None,
-                    span,
-                    alike: Arc::from([]),
-                    via: CallPath::default(),
-                });
+                needs.push(Need::declared_range(j, name, r, span));
             }
         }
         if needs.is_empty() {
