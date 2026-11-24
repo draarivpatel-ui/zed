@@ -17689,6 +17689,12 @@ impl<'t, 'a> Ck<'t, 'a> {
             }
             None => match piece {
                 Piece::Fn(s) if let Some(ok) = self.fn_into_classes(s, ty, what, span) => ok,
+                Piece::Fn(s)
+                    if s.holds_needs()
+                        && let Some(ok) = self.fit_needs_member(s, ty, what, span) =>
+                {
+                    ok
+                }
                 Piece::Fn(s) if s.holds_needs() => {
                     self.fit_needs(s, ty, &mut Binds::new(), what, span)
                 }
@@ -17718,6 +17724,42 @@ impl<'t, 'a> Ck<'t, 'a> {
         span: Span,
     ) -> bool {
         self.fits_bare(s, p, binds) && self.needs_fit(s, p, binds, what, span)
+    }
+
+    /// Whether a function of `s`, which holds needs, may be passed, by `what` at `span`, at a
+    /// parameter `p` of two or more function types, none holding a variable, nor `s`: where
+    /// it fits one of them by [`Self::fit_needs`]. DESIGN.md sec:values_morphisms: "A union
+    /// of function types takes a function that fits one of its members". `None` where `p`
+    /// is not such a union, for the caller's other cases.
+    ///
+    /// `f(positional x: int[2..=4])` at `h: int[2..=4] -> String`, which reads as the family
+    /// and the function with that declared range (row PRINT-positional-range-ambiguous,
+    /// option A), fits the function (row FAIL-declared-range-fn-into-written-arrow: the one
+    /// function type [`Self::fits_bare`] asks refused it before).
+    ///
+    /// Proof that the answer does not depend on the order of the members (DESIGN's exact
+    /// answers; CHECK-fn-member-same-order-ambiguity). Each member is tried alone
+    /// ([`Self::tried`]), which restores the checker's state, so each trial's answer is the
+    /// same in every order. With no variable in `s` or in any member, [`Self::fit_needs`]
+    /// binds nothing, and a class of `s` would be a variable, so it narrows none; so the
+    /// fit run for good on the first member that fits changes nothing a fit on another
+    /// would not, and the answer is whether some member fits.
+    ///
+    /// Complexity tradeoff: one trial and at most one fit for good per member, each the cost
+    /// of [`Self::fit_needs`], O(m) of them for m members. The naive way, refusing every
+    /// union, costs nothing and refuses what fits.
+    fn fit_needs_member(&mut self, s: &Arc<Sig>, p: &Ty, what: &str, span: Span) -> Option<bool> {
+        if p.fns.len() < 2 || !s.holds_no_var() || !p.fns.iter().all(|q| q.holds_no_var()) {
+            return None;
+        }
+        let fits = |c: &mut Self, q: &Arc<Sig>| {
+            c.fit_needs(s, &Ty::func(q.clone()), &mut Binds::new(), what, span)
+        };
+        let found = (p.fns.iter()).find(|q| self.tried(|c| fits(c, q)) == Some(true));
+        Some(match found.cloned() {
+            Some(q) => fits(self, &q),
+            None => false,
+        })
     }
 
     /// The first half of [`Self::fit_needs`]: `s` without its needs fits `p`, whose function
@@ -25370,6 +25412,33 @@ impl<'t, 'a> Ck<'t, 'a> {
                     // scalar, atom or kind-wide part beside it.
                     let one =
                         |t: &Ty| t.set.is_empty() && t.payloads.is_empty() && t.family.is_empty();
+                    // One function within an exact member `e` of `w`, beside a partial member,
+                    // needs no test of its domain (row FAIL-declared-range-fn-into-written-arrow:
+                    // `f(positional x: int[2..=4])` at `h: int[2..=4] -> String`, read as the
+                    // family and the function with that declared range, row
+                    // PRINT-positional-range-ambiguous, option A). Proof: (1) a call through
+                    // `w` is checked against every member of `w`, so the need of `e`'s declared
+                    // range holds at each call, and a key outside it is refused when checked
+                    // (test: `h(7)` in `g` refused, l01_29
+                    // `a_function_of_a_positional_range_and_a_family_print_alike_and_read_back`);
+                    // (2) `f`'s type is within `e`, so `f`'s domain holds `e`'s declared range;
+                    // so no key outside `f`'s domain reaches it through `w`. Passing `w` on to a
+                    // partial slot comes back here with `t` = `w`, two functions, which this
+                    // case does not take, and is refused as untestable below.
+                    if one(&t)
+                        && t.tuples.is_empty()
+                        && w.fns.len() > 1
+                        && let Some(s) = t.fns.only()
+                        && !s.data
+                        && w.fns.iter().any(|e| {
+                            !e.data
+                                && !partial(e)
+                                && self.sub(&t, &Ty::func(e.clone()), &mut Binds::new())
+                        })
+                    {
+                        out.push(None);
+                        continue;
+                    }
                     if let (true, Some(s), Some(e)) =
                         (one(&t) && t.tuples.is_empty(), t.fns.only(), w.fns.only())
                     {
@@ -30095,6 +30164,12 @@ impl<'t, 'a> Ck<'t, 'a> {
                             if s.holds_no_var() && !s.holds_needs() && p.fns.contains(s) =>
                         {
                             true
+                        }
+                        Piece::Fn(s)
+                            if s.holds_needs()
+                                && let Some(ok) = self.fit_needs_member(s, p, what, span) =>
+                        {
+                            ok
                         }
                         Piece::Fn(s) if s.holds_needs() && !p.fns.is_empty() => {
                             let ok = self.fits_bare(s, p, &mut binds);

@@ -1045,8 +1045,8 @@ fn a_tuple_of_families_with_their_keys_reads_back() {
 /// declared a range, `f(positional x: int[2..=4])`, and a family with those keys exactly,
 /// `(2 ..= 4).map(k -> "${k}")`, print alike, `int[2..=4] -> String` (DESIGN.md's one
 /// morphism type), and the reader reads that text as the union of the two, so each value lies
-/// within the type its text reads back to. A parameter written with the text takes the family;
-/// the function is still refused there (row FAIL-declared-range-fn-into-written-arrow).
+/// within the type its text reads back to and is taken by a parameter written with the text
+/// (row FAIL-declared-range-fn-into-written-arrow).
 /// A function is still not data: `.count` on one is refused (rule (2), kept). The map
 /// `{2 -> "a", 3 -> "b", 4 -> "c"}` prints by its entries, `(2 | 3 | 4) -> "a" | "b" | "c"`,
 /// so it is not the family of this text.
@@ -1065,25 +1065,33 @@ fn a_function_of_a_positional_range_and_a_family_print_alike_and_read_back() {
         );
         assert_eq!(mismatch(&t, &text), None, "{name}");
     }
-    // A parameter written with the text takes the family. The function is still refused there
-    // ("no arrow of `g` takes these types"), though `Ty::sub` holds for the two types: the
-    // checker's own test of the argument differs, row FAIL-declared-range-fn-into-written-arrow.
-    // This asserts that refusal, so the test fails when the row is fixed and must then be
-    // changed to assert the program loads.
-    let program = |arg: &str| {
+    // A parameter written with the text takes both (row
+    // FAIL-declared-range-fn-into-written-arrow: the function was refused, "no arrow of `g`
+    // takes these types", as a function with needs was fitted to one function type alone).
+    let program = |body: &str, arg: &str| {
         format!(
-            "{unit}g(positional h: {shown}) = h(3);\nmain(a: MainArgs) {{\n  a.stdout <- \
-             \"${{g({arg})}}\";\n}}\n"
+            "{unit}k(positional j: int ->? String) = j(7);\ng(positional h: {shown}) = \
+             {body};\nmain(a: MainArgs) {{\n  a.stdout <- \"${{g({arg})}}\";\n}}\n"
         )
     };
-    if let Err(why) = zedc::run::load(program("m").as_bytes()) {
-        panic!("{}\n{why}", program("m"));
+    for arg in ["f", "m"] {
+        let p = program("h(3)", arg);
+        if let Err(why) = zedc::run::load(p.as_bytes()) {
+            panic!("{p}\n{why}");
+        }
+        // A call through the parameter outside the declared range is refused at the call, so
+        // `f` needs no test of its domain there (`Ck::coercion`).
+        let outside = program("h(7)", arg);
+        let why = zedc::run::load(outside.as_bytes()).err();
+        eprintln!("TMPDEBUG outside {arg}: {why:?}");
+        assert!(why.is_some(), "{outside}");
     }
-    assert!(
-        zedc::run::load(program("f").as_bytes()).is_err(),
-        "{}",
-        program("f")
-    );
+    // The parameter passed on to a partial slot is refused, as no test of its domain can be
+    // put on a union holding a function beside a family.
+    let onward = program("k(h)", "f");
+    let why = zedc::run::load(onward.as_bytes()).err();
+    eprintln!("TMPDEBUG onward: {why:?}");
+    assert!(why.is_some(), "{onward}");
     let count = format!("{unit}main(a: MainArgs) {{\n  a.stdout <- \"${{f.count}}\";\n}}\n");
     assert!(zedc::run::load(count.as_bytes()).is_err(), "{count}");
 }
