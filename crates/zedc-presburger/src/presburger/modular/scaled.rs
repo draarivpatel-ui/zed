@@ -32,6 +32,7 @@
 
 use super::*;
 
+pub(crate) mod sweep;
 #[cfg(test)]
 mod tests;
 
@@ -661,7 +662,8 @@ fn remainder_values(c: &Con, m: &Int) -> ResidueSet {
 /// [`solve_modular`]'s answer to `f`, or, when it declines, [`solve`]'s. [`solve`] runs only
 /// when [`solve_modular`] declines, so every formula that one accepts is answered as before.
 /// The fallback is written here, not in [`solve_modular`], so that `modular.rs` names nothing
-/// of this file and the two files form no import cycle (test `s_01f_import_graph`).
+/// of this file and the two files form no import cycle (test `s_01f_import_graph`). The period
+/// sweep (`sweep.rs`) is the next fallback, written there for the same reason.
 pub(crate) fn solve_modular_or_scaled(f: &Formula, want_model: bool) -> Option<Option<Model>> {
     solve_modular(f, want_model).or_else(|| solve(f, want_model))
 }
@@ -686,6 +688,8 @@ pub(crate) fn point_by_structure(f: &Formula) -> Option<Model> {
 /// [`def_row`]); each quotient and remainder is defined by one row; the dividend `t` of every
 /// row is one variable `x` (defined by no row); a quotient occurs in no other constraint; a
 /// remainder occurs only in one-term constraints; every other constraint names at most `x`.
+/// A formula declined here goes on to the period sweep (`sweep.rs`), which takes constraints of
+/// any number of terms on `x` and the rows' quotients and remainders.
 ///
 /// Rewrite. Each definition row becomes `true`; each one-term constraint on a remainder becomes
 /// the residues of `x` [`pull_back`] gives, written on a new remainder `s_n` of `x` for each
