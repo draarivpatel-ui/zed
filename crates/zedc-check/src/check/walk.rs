@@ -17728,9 +17728,11 @@ impl<'t, 'a> Ck<'t, 'a> {
 
     /// Whether a function of `s`, which holds needs, may be passed, by `what` at `span`, at a
     /// parameter `p` of two or more function types, none holding a variable, nor `s`: where
-    /// it fits one of them by [`Self::fit_needs`]. DESIGN.md sec:values_morphisms: "A union
-    /// of function types takes a function that fits one of its members". `None` where `p`
-    /// is not such a union, for the caller's other cases.
+    /// it fits one of them by [`Self::fit_needs`]. DESIGN.md sec:type_language, "Relation to
+    /// semantic subtyping": "a type denotes a set of values, the connectives are the set
+    /// operations", so a union holds every value of each member, and a function that fits
+    /// one member is a value of the union. `None` where `p` is not such a union, for the
+    /// caller's other cases.
     ///
     /// `f(positional x: int[2..=4])` at `h: int[2..=4] -> String`, which reads as the family
     /// and the function with that declared range (row PRINT-positional-range-ambiguous,
